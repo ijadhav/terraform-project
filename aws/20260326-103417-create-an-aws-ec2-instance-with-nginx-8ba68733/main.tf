@@ -28,9 +28,9 @@ resource "aws_instance" "nginx" {
 }
 
 resource "aws_s3_bucket" "storage_bucket" {
-  bucket = "my-storage-bucket-1234"
+  bucket = "test-storage"
   acl    = "private"
   tags = {
-    Name = "StorageBucket"
+    Name = "test-storage"
   }
 }
