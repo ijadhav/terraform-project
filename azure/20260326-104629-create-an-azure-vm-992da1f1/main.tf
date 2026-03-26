@@ -33,12 +33,13 @@ resource "azurerm_network_interface" "main" {
   }
 }
 
-resource "azurerm_linux_virtual_machine" "main" {
-  name                = "Ishika"
+resource "azurerm_windows_virtual_machine" "main" {
+  name                = "test-vm"
   resource_group_name = azurerm_resource_group.main.name
   location            = azurerm_resource_group.main.location
   size                = "Standard_B1s"
   admin_username      = "azureuser"
+  admin_password      = "P@ssw0rd12345!"
 
   network_interface_ids = [azurerm_network_interface.main.id]
 
@@ -49,14 +50,9 @@ resource "azurerm_linux_virtual_machine" "main" {
   }
 
   source_image_reference {
-    publisher = "Canonical"
-    offer     = "UbuntuServer"
-    sku       = "18.04-LTS"
+    publisher = "MicrosoftWindowsServer"
+    offer     = "WindowsServer"
+    sku       = "2019-Datacenter"
     version   = "latest"
-  }
-
-  admin_ssh_key {
-    username   = "azureuser"
-    public_key = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQD..."
   }
 }
