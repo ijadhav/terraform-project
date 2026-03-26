@@ -71,6 +71,14 @@ resource "azurerm_network_security_group" "nsg" {
   }
 }
 
+resource "azurerm_public_ip" "public_ip" {
+  name                = "pip-basic-vm"
+  location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
+  allocation_method   = "Static"
+  sku                 = "Standard"
+}
+
 resource "azurerm_network_interface" "nic" {
   name                = "nic-basic-vm"
   location            = azurerm_resource_group.rg.location
@@ -82,14 +90,6 @@ resource "azurerm_network_interface" "nic" {
     private_ip_address_allocation = "Dynamic"
     public_ip_address_id          = azurerm_public_ip.public_ip.id
   }
-}
-
-resource "azurerm_public_ip" "public_ip" {
-  name                = "pip-basic-vm"
-  location            = azurerm_resource_group.rg.location
-  resource_group_name = azurerm_resource_group.rg.name
-  allocation_method   = "Static"
-  sku                 = "Standard"
 }
 
 resource "azurerm_network_interface_security_group_association" "nic_nsg" {
@@ -117,9 +117,9 @@ resource "azurerm_linux_virtual_machine" "vm" {
   }
 
   source_image_reference {
-    publisher = "Canonical"
-    offer     = "0001-com-ubuntu-server-jammy"
-    sku       = "22_04-lts"
+    publisher = "Oracle"
+    offer     = "Oracle-Linux"
+    sku       = "9"
     version   = "latest"
   }
 
