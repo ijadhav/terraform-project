@@ -26,3 +26,11 @@ resource "aws_instance" "nginx" {
     Name = "Ishika"
   }
 }
+
+resource "aws_s3_bucket" "storage_bucket" {
+  bucket = "my-storage-bucket-1234"
+  acl    = "private"
+  tags = {
+    Name = "StorageBucket"
+  }
+}
