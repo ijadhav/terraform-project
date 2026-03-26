@@ -58,6 +58,10 @@ resource "aws_instance" "example" {
   }
 }
 
+resource "aws_s3_bucket" "test" {
+  bucket = "test"
+}
+
 output "instance_id" {
   description = "ID of the EC2 instance"
   value       = aws_instance.example.id
