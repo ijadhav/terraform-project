@@ -16,6 +16,6 @@ resource "aws_instance" "example" {
   instance_type = "t3.micro"
 
   tags = {
-    Name = "example-ec2-instance"
+    Name = "Ishika-test"
   }
 }
