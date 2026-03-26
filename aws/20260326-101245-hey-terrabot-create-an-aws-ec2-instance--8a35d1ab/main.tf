@@ -14,6 +14,6 @@ resource "aws_instance" "nginx" {
               EOF
 
   tags = {
-    Name = "nginx-server"
+    Name = "Ishika-test"
   }
 }
