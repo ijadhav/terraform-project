@@ -16,6 +16,12 @@ data "azurerm_resource_group" "rg" {
   name = "1-2b6114da-playground-sandbox"
 }
 
+# New resource group in South Central US
+resource "azurerm_resource_group" "southcentral_rg" {
+  name     = "rg-southcentral-us"
+  location = "South Central US"
+}
+
 # Example usage of the existing resource group
 # Other resources can reference:
 #   data.azurerm_resource_group.rg.name
