@@ -42,6 +42,6 @@ resource "aws_instance" "example" {
   vpc_security_group_ids = [aws_security_group.ec2_sg.id]
 
   tags = {
-    Name = "example-ec2-instance"
+    Name = "ishi-test"
   }
 }
