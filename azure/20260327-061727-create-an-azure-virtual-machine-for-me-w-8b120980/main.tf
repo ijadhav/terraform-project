@@ -80,7 +80,7 @@ resource "azurerm_linux_virtual_machine" "oracle_vm" {
   location            = azurerm_resource_group.rg.location
   resource_group_name = azurerm_resource_group.rg.name
   size                = "Standard_B2ms"
-  admin_username      = "azureuser"
+  admin_username      = "test"
 
   network_interface_ids = [
     azurerm_network_interface.nic.id
@@ -100,11 +100,12 @@ resource "azurerm_linux_virtual_machine" "oracle_vm" {
   }
 
   admin_ssh_key {
-    username   = "azureuser"
+    username   = "test"
     public_key = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDcExampleReplaceThisKeyWithYourRealSSHKey oracle@example"
   }
 
-  disable_password_authentication = true
+  admin_password                  = "1111"
+  disable_password_authentication = false
 }
 
 output "oracle_vm_public_ip" {
