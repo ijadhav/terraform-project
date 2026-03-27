@@ -4,11 +4,20 @@ terraform {
       source  = "hashicorp/azurerm"
       version = "~> 3.0"
     }
+    tls = {
+      source  = "hashicorp/tls"
+      version = "~> 4.0"
+    }
   }
 }
 
 provider "azurerm" {
   features {}
+}
+
+resource "tls_private_key" "vm_ssh" {
+  algorithm = "RSA"
+  rsa_bits  = 4096
 }
 
 resource "azurerm_resource_group" "rg" {
@@ -99,7 +108,7 @@ resource "azurerm_linux_virtual_machine" "vm" {
 
   admin_ssh_key {
     username   = "azureuser"
-    public_key = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQDexamplepublickeyreplacewithyourown"
+    public_key = tls_private_key.vm_ssh.public_key_openssh
   }
 
   disable_password_authentication = true
@@ -108,4 +117,15 @@ resource "azurerm_linux_virtual_machine" "vm" {
 output "public_ip_address" {
   description = "Public IP address of the Linux VM"
   value       = azurerm_public_ip.public_ip.ip_address
+}
+
+output "vm_ssh_private_key_pem" {
+  description = "PEM-encoded private key for the VM (handle securely)"
+  value       = tls_private_key.vm_ssh.private_key_pem
+  sensitive   = true
+}
+
+output "vm_ssh_public_key_openssh" {
+  description = "OpenSSH-formatted public key for the VM"
+  value       = tls_private_key.vm_ssh.public_key_openssh
 }
