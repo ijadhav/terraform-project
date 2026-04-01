@@ -31,6 +31,21 @@ variable "project" {
   default     = "example-app"
 }
 
+variable "vnet_id" {
+  description = "ID of the virtual network hosting the Application Gateway subnets"
+  type        = string
+}
+
+variable "appgw_subnet_id" {
+  description = "Subnet ID dedicated to the Application Gateway"
+  type        = string
+}
+
+variable "frontend_public_ip_id" {
+  description = "Resource ID of the public IP address used by the Application Gateway frontend"
+  type        = string
+}
+
 locals {
   location            = "westeurope"
   resource_group_name = "rg-${var.business_unit}-${var.project}-${var.environment}-${local.location}"
@@ -51,12 +66,34 @@ resource "azurerm_resource_group" "main" {
   tags = local.common_tags
 }
 
-output "resource_group_name" {
-  description = "Name of the created resource group"
-  value       = azurerm_resource_group.main.name
+module "app_gateway" {
+  source = "github.com/your-org/terraform-azurerm-application-gateway//modules/web_app_gw?ref=v1.0.0"
+
+  resource_group_name = azurerm_resource_group.main.name
+  location            = azurerm_resource_group.main.location
+
+  vnet_id        = var.vnet_id
+  subnet_id      = var.appgw_subnet_id
+  public_ip_id   = var.frontend_public_ip_id
+
+  application_gateway_name = "agw-${var.business_unit}-${var.project}-${var.environment}-${local.location}"
+
+  frontend_port  = 80
+  backend_port   = 80
+  protocol       = "Http"
+
+  enable_waf     = true
+  waf_mode       = "Prevention"
+
+  tags = local.common_tags
 }
 
-output "resource_group_location" {
-  description = "Location of the created resource group"
-  value       = azurerm_resource_group.main.location
+output "application_gateway_id" {
+  description = "ID of the created Application Gateway"
+  value       = module.app_gateway.id
+}
+
+output "application_gateway_frontend_ip" {
+  description = "Frontend public IP of the Application Gateway (if exposed)"
+  value       = module.app_gateway.frontend_public_ip
 }
