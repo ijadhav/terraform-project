@@ -31,24 +31,21 @@ variable "project" {
   default     = "example-app"
 }
 
-variable "vnet_id" {
-  description = "ID of the virtual network hosting the Application Gateway subnets"
-  type        = string
-}
-
-variable "appgw_subnet_id" {
-  description = "Subnet ID dedicated to the Application Gateway"
-  type        = string
-}
-
-variable "frontend_public_ip_id" {
-  description = "Resource ID of the public IP address used by the Application Gateway frontend"
-  type        = string
-}
-
 locals {
   location            = "westeurope"
   resource_group_name = "rg-${var.business_unit}-${var.project}-${var.environment}-${local.location}"
+
+  vnet_name = "vnet-${var.business_unit}-${var.project}-${var.environment}-${local.location}"
+
+  subnet_app_name              = "snet-app-${var.environment}"
+  subnet_data_name             = "snet-data-${var.environment}"
+  subnet_private_endpoints_name = "snet-pe-${var.environment}"
+
+  # Example CIDR plan; adjust as needed per environment standards
+  vnet_address_space       = ["10.10.0.0/16"]
+  subnet_app_address_space = "10.10.1.0/24"
+  subnet_data_address_space = "10.10.2.0/24"
+  subnet_pe_address_space   = "10.10.3.0/24"
 
   common_tags = {
     environment   = var.environment
@@ -66,34 +63,61 @@ resource "azurerm_resource_group" "main" {
   tags = local.common_tags
 }
 
-module "app_gateway" {
-  source = "github.com/your-org/terraform-azurerm-application-gateway//modules/web_app_gw?ref=v1.0.0"
-
-  resource_group_name = azurerm_resource_group.main.name
+resource "azurerm_virtual_network" "main" {
+  name                = local.vnet_name
+  address_space       = local.vnet_address_space
   location            = azurerm_resource_group.main.location
-
-  vnet_id        = var.vnet_id
-  subnet_id      = var.appgw_subnet_id
-  public_ip_id   = var.frontend_public_ip_id
-
-  application_gateway_name = "agw-${var.business_unit}-${var.project}-${var.environment}-${local.location}"
-
-  frontend_port  = 80
-  backend_port   = 80
-  protocol       = "Http"
-
-  enable_waf     = true
-  waf_mode       = "Prevention"
+  resource_group_name = azurerm_resource_group.main.name
 
   tags = local.common_tags
 }
 
-output "application_gateway_id" {
-  description = "ID of the created Application Gateway"
-  value       = module.app_gateway.id
+# Application subnet (for web/app tiers)
+resource "azurerm_subnet" "app" {
+  name                 = local.subnet_app_name
+  resource_group_name  = azurerm_resource_group.main.name
+  virtual_network_name = azurerm_virtual_network.main.name
+  address_prefixes      = [local.subnet_app_address_space]
+
+  # Typically app subnet allows outbound to internet via firewall/NVA; no private endpoint policies here
 }
 
-output "application_gateway_frontend_ip" {
-  description = "Frontend public IP of the Application Gateway (if exposed)"
-  value       = module.app_gateway.frontend_public_ip
+# Data subnet (for DB, caches, stateful services)
+resource "azurerm_subnet" "data" {
+  name                 = local.subnet_data_name
+  resource_group_name  = azurerm_resource_group.main.name
+  virtual_network_name = azurerm_virtual_network.main.name
+  address_prefixes      = [local.subnet_data_address_space]
+
+  # Often used with NSGs restricting inbound to app subnet only
+}
+
+# Dedicated private endpoint subnet (no other resources)
+resource "azurerm_subnet" "private_endpoints" {
+  name                 = local.subnet_private_endpoints_name
+  resource_group_name  = azurerm_resource_group.main.name
+  virtual_network_name = azurerm_virtual_network.main.name
+  address_prefixes      = [local.subnet_pe_address_space]
+
+  enforce_private_link_endpoint_network_policies = true
+}
+
+output "vnet_id" {
+  description = "ID of the created Virtual Network"
+  value       = azurerm_virtual_network.main.id
+}
+
+output "subnet_app_id" {
+  description = "ID of the application subnet"
+  value       = azurerm_subnet.app.id
+}
+
+output "subnet_data_id" {
+  description = "ID of the data subnet"
+  value       = azurerm_subnet.data.id
+}
+
+output "subnet_private_endpoints_id" {
+  description = "ID of the private endpoints subnet"
+  value       = azurerm_subnet.private_endpoints.id
 }
