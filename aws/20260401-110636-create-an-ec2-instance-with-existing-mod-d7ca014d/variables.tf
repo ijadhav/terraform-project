@@ -21,3 +21,9 @@ variable "ec2_module_source" {
   type        = string
   default     = "./modules/ec2-instance"
 }
+
+variable "ec2_user_data" {
+  description = "User data script to run on EC2 instance bootstrap"
+  type        = string
+  default     = "#!/bin/bash\n\nyum update -y || apt-get update -y\n\n# Install nginx for Amazon Linux / RHEL-based\nyum install -y nginx || apt-get install -y nginx\n\n# Enable and start nginx\nsystemctl enable nginx || true\nsystemctl start nginx || service nginx start\n"
+}
