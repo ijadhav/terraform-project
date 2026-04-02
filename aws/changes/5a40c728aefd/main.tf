@@ -20,7 +20,7 @@ variable "aws_region" {
 }
 
 variable "instance_type" {
-  description = "EC2 instance type for the server"
+  description = "EC2 instance type"
   type        = string
   default     = "t3.micro"
 }
@@ -30,8 +30,8 @@ variable "public_key" {
   type        = string
 }
 
-resource "aws_key_pair" "nginx_key" {
-  key_name   = "nginx-server-key"
+resource "aws_key_pair" "default" {
+  key_name   = "ec2-server-key"
   public_key = var.public_key
 }
 
@@ -82,7 +82,7 @@ resource "aws_route_table_association" "public_assoc" {
   route_table_id = aws_route_table.public.id
 }
 
-resource "aws_security_group" "nginx_sg" {
+resource "aws_security_group" "server_sg" {
   name        = "server-sg"
   description = "Allow SSH"
   vpc_id      = aws_vpc.main.id
@@ -107,15 +107,6 @@ resource "aws_security_group" "nginx_sg" {
   }
 }
 
-locals {
-  # NGINX removed: keep minimal user data or none
-  nginx_user_data = <<-EOF
-    #!/bin/bash
-    set -e
-    apt-get update -y
-  EOF
-}
-
 data "aws_ami" "ubuntu" {
   most_recent = true
 
@@ -132,22 +123,19 @@ data "aws_ami" "ubuntu" {
   owners = ["099720109477"]
 }
 
-resource "aws_instance" "nginx" {
+resource "aws_instance" "server" {
   ami                    = data.aws_ami.ubuntu.id
   instance_type          = var.instance_type
   subnet_id              = aws_subnet.public.id
-  vpc_security_group_ids = [aws_security_group.nginx_sg.id]
-  key_name               = aws_key_pair.nginx_key.key_name
-
-  # NGINX removed from user data
-  user_data = local.nginx_user_data
+  vpc_security_group_ids = [aws_security_group.server_sg.id]
+  key_name               = aws_key_pair.default.key_name
 
   tags = {
-    Name = "ishika"
+    Name = "basic-ec2-instance"
   }
 }
 
 output "instance_public_ip" {
   description = "Public IP of the EC2 instance"
-  value       = aws_instance.nginx.public_ip
+  value       = aws_instance.server.public_ip
 }
