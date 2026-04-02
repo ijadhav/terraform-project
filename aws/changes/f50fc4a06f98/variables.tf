@@ -3,13 +3,8 @@ variable "aws_region" {
   type        = string
 }
 
-variable "vpc_id" {
-  description = "VPC ID where the EC2 instance will be created"
-  type        = string
-}
-
 variable "subnet_id" {
-  description = "Subnet ID for the EC2 instance"
+  description = "Subnet ID for the EC2 instance (must belong to VPC ij-test)"
   type        = string
 }
 
