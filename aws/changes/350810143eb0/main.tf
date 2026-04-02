@@ -92,11 +92,11 @@ resource "aws_security_group" "ec2_sg" {
   }
 }
 
-# EC2 instance t2.micro in us-east-2
+# EC2 instance updated to t3.small in us-east-2
 # Note: Replace ami with a valid us-east-2 Linux AMI for your account/region if needed.
 resource "aws_instance" "t2_micro" {
   ami                    = var.ami_id
-  instance_type          = "t2.micro"
+  instance_type          = "t3.small"
   subnet_id              = aws_subnet.public.id
   vpc_security_group_ids = [aws_security_group.ec2_sg.id]
   key_name               = var.key_name
