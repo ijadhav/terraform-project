@@ -13,6 +13,14 @@ provider "aws" {
   region = var.aws_region
 }
 
+# Look up the custom VPC named "ij-test"
+data "aws_vpc" "ij_test" {
+  filter {
+    name   = "tag:Name"
+    values = ["ij-test"]
+  }
+}
+
 resource "aws_key_pair" "ec2_key" {
   key_name   = var.key_pair_name
   public_key = var.public_key
@@ -21,7 +29,7 @@ resource "aws_key_pair" "ec2_key" {
 resource "aws_security_group" "ec2_sg" {
   name        = "ec2_basic_sg"
   description = "Security group for basic EC2 instance"
-  vpc_id      = var.vpc_id
+  vpc_id      = data.aws_vpc.ij_test.id
 
   ingress {
     description = "Allow SSH"
@@ -44,8 +52,10 @@ resource "aws_security_group" "ec2_sg" {
 }
 
 resource "aws_instance" "ec2" {
-  ami                    = var.ami_id
-  instance_type          = var.instance_type
+  ami           = var.ami_id
+  instance_type = var.instance_type
+
+  # You still need to supply a subnet in this VPC via var.subnet_id
   subnet_id              = var.subnet_id
   vpc_security_group_ids = [aws_security_group.ec2_sg.id]
   key_name               = aws_key_pair.ec2_key.key_name
