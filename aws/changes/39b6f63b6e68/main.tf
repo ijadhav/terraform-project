@@ -49,6 +49,24 @@ locals {
     Environment = "dev"
     ManagedBy   = "terraform"
   }
+
+  nginx_user_data = <<-EOF
+              #!/bin/bash
+              set -euo pipefail
+
+              # Update packages
+              dnf update -y
+
+              # Install nginx
+              dnf install -y nginx
+
+              # Enable and start nginx
+              systemctl enable nginx
+              systemctl start nginx
+
+              # Simple index page
+              echo "<h1>Welcome from nginx on Amazon Linux 2023</h1>" > /usr/share/nginx/html/index.html
+          EOF
 }
 
 resource "tls_private_key" "this" {
@@ -77,6 +95,14 @@ resource "aws_security_group" "ec2_sg" {
     cidr_blocks = [var.allowed_ssh_cidr]
   }
 
+  ingress {
+    description = "HTTP from anywhere for nginx"
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
   egress {
     from_port   = 0
     to_port     = 0
@@ -95,6 +121,8 @@ resource "aws_instance" "this" {
   instance_type          = var.instance_type
   key_name               = aws_key_pair.this.key_name
   vpc_security_group_ids = [aws_security_group.ec2_sg.id]
+
+  user_data = local.nginx_user_data
 
   tags = merge(local.common_tags, {
     Name = var.instance_name
