@@ -59,6 +59,26 @@ resource "azurerm_network_security_group" "nsg" {
     source_address_prefix      = "*"
     destination_address_prefix = "*"
   }
+
+  security_rule {
+    name                       = "HTTP"
+    priority                   = 1010
+    direction                  = "Inbound"
+    access                     = "Allow"
+    protocol                   = "Tcp"
+    source_port_range          = "*"
+    destination_port_range     = "80"
+    source_address_prefix      = "*"
+    destination_address_prefix = "*"
+  }
+}
+
+resource "azurerm_public_ip" "vm_pip" {
+  name                = "pip-mongo-vm-example"
+  location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
+  allocation_method   = "Static"
+  sku                 = "Standard"
 }
 
 resource "azurerm_network_interface" "nic" {
@@ -74,17 +94,22 @@ resource "azurerm_network_interface" "nic" {
   }
 }
 
-resource "azurerm_public_ip" "vm_pip" {
-  name                = "pip-mongo-vm-example"
-  location            = azurerm_resource_group.rg.location
-  resource_group_name = azurerm_resource_group.rg.name
-  allocation_method   = "Static"
-  sku                 = "Standard"
-}
-
 resource "azurerm_network_interface_security_group_association" "nic_nsg" {
   network_interface_id      = azurerm_network_interface.nic.id
   network_security_group_id = azurerm_network_security_group.nsg.id
+}
+
+locals {
+  nginx_cloud_init = <<-EOT
+    #cloud-config
+    package_update: true
+    package_upgrade: true
+    packages:
+      - nginx
+    runcmd:
+      - systemctl enable nginx
+      - systemctl start nginx
+  EOT
 }
 
 resource "azurerm_linux_virtual_machine" "vm" {
@@ -118,6 +143,8 @@ resource "azurerm_linux_virtual_machine" "vm" {
 
   computer_name                   = "mongovm"
   disable_password_authentication = true
+
+  custom_data = base64encode(local.nginx_cloud_init)
 }
 
 resource "azurerm_storage_account" "mongodb_sa" {
@@ -148,7 +175,7 @@ resource "azurerm_storage_container" "mongodb_data" {
 }
 
 output "vm_public_ip" {
-  description = "Public IP address of the MongoDB VM"
+  description = "Public IP address of the VM (Nginx accessible on port 80)"
   value       = azurerm_public_ip.vm_pip.ip_address
 }
 
