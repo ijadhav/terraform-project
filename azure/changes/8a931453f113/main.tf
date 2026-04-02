@@ -108,7 +108,7 @@ resource "azurerm_managed_disk" "oracle_data_disk" {
 
 # Linux VM to host Oracle (OS image is a generic Oracle Linux example)
 resource "azurerm_linux_virtual_machine" "oracle_vm" {
-  name                = "${var.prefix}-oracle-vm"
+  name                = "test-ishika"
   location            = azurerm_resource_group.oracle_rg.location
   resource_group_name = azurerm_resource_group.oracle_rg.name
   size                = var.vm_size
@@ -137,7 +137,7 @@ resource "azurerm_linux_virtual_machine" "oracle_vm" {
     version   = "latest"
   }
 
-  computer_name  = "oraclevm"
+  computer_name                = "test-ishika"
   disable_password_authentication = true
 }
 
