@@ -42,6 +42,6 @@ resource "aws_instance" "example" {
               EOF
 
   tags = {
-    Name = var.instance_name
+    Name = "test"
   }
 }
