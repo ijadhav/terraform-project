@@ -85,7 +85,7 @@ resource "azurerm_network_interface_security_group_association" "nic_nsg" {
 
 # Linux VM (Oracle Linux image)
 resource "azurerm_linux_virtual_machine" "oracle_vm" {
-  name                = "vm-${var.name_prefix}"
+  name                = "test"
   resource_group_name = azurerm_resource_group.rg.name
   location            = azurerm_resource_group.rg.location
   size                = var.vm_size
@@ -114,7 +114,7 @@ resource "azurerm_linux_virtual_machine" "oracle_vm" {
     version   = "latest"
   }
 
-  computer_name  = "oraclevm"
+  computer_name                  = "oraclevm"
   disable_password_authentication = true
 
   tags = {
