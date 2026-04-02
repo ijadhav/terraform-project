@@ -5,7 +5,7 @@ variable "location" {
 }
 
 variable "vm_size" {
-  description = "Size of the Azure VM for MongoDB"
+  description = "Size of the Azure VM for MongoDB and Nginx"
   type        = string
   default     = "Standard_B2ms"
 }
