@@ -16,7 +16,7 @@ variable "instance_type" {
 }
 
 variable "instance_name" {
-  description = "Name tag for the EC2 instance"
+  description = "Name tag for the EC2 instance (unused now that Name is hardcoded to test)"
   type        = string
   default     = "example-ec2"
 }
