@@ -14,3 +14,8 @@ variable "instance_type" {
   type        = string
   default     = "t3.micro"
 }
+
+variable "s3_bucket_name" {
+  description = "Name of the S3 bucket (must be globally unique)"
+  type        = string
+}
