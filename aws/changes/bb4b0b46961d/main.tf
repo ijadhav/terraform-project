@@ -97,6 +97,35 @@ resource "aws_instance" "example" {
   }
 }
 
+# S3 bucket
+resource "aws_s3_bucket" "example" {
+  bucket = var.s3_bucket_name
+
+  tags = {
+    Name = var.s3_bucket_name
+  }
+}
+
+# Enable bucket versioning
+resource "aws_s3_bucket_versioning" "example" {
+  bucket = aws_s3_bucket.example.id
+
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+# Default server-side encryption using AES256
+resource "aws_s3_bucket_server_side_encryption_configuration" "example" {
+  bucket = aws_s3_bucket.example.id
+
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+
 output "ec2_instance_id" {
   description = "ID of the EC2 instance"
   value       = aws_instance.example.id
@@ -105,4 +134,9 @@ output "ec2_instance_id" {
 output "ec2_public_ip" {
   description = "Public IP of the EC2 instance"
   value       = aws_instance.example.public_ip
+}
+
+output "s3_bucket_name" {
+  description = "Name of the S3 bucket"
+  value       = aws_s3_bucket.example.bucket
 }
