@@ -20,7 +20,7 @@ variable "aws_region" {
 }
 
 variable "instance_type" {
-  description = "EC2 instance type for the NGINX server"
+  description = "EC2 instance type for the server"
   type        = string
   default     = "t3.micro"
 }
@@ -41,7 +41,7 @@ resource "aws_vpc" "main" {
   enable_dns_hostnames = true
 
   tags = {
-    Name = "nginx-vpc"
+    Name = "main-vpc"
   }
 }
 
@@ -49,7 +49,7 @@ resource "aws_internet_gateway" "igw" {
   vpc_id = aws_vpc.main.id
 
   tags = {
-    Name = "nginx-igw"
+    Name = "main-igw"
   }
 }
 
@@ -60,7 +60,7 @@ resource "aws_subnet" "public" {
   availability_zone       = "${var.aws_region}a"
 
   tags = {
-    Name = "nginx-public-subnet"
+    Name = "public-subnet"
   }
 }
 
@@ -73,7 +73,7 @@ resource "aws_route_table" "public" {
   }
 
   tags = {
-    Name = "nginx-public-rt"
+    Name = "public-rt"
   }
 }
 
@@ -83,17 +83,9 @@ resource "aws_route_table_association" "public_assoc" {
 }
 
 resource "aws_security_group" "nginx_sg" {
-  name        = "nginx-sg"
-  description = "Allow HTTP and SSH"
+  name        = "server-sg"
+  description = "Allow SSH"
   vpc_id      = aws_vpc.main.id
-
-  ingress {
-    description = "HTTP from anywhere"
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
 
   ingress {
     description = "SSH from anywhere (tighten in production)"
@@ -111,19 +103,16 @@ resource "aws_security_group" "nginx_sg" {
   }
 
   tags = {
-    Name = "nginx-sg"
+    Name = "server-sg"
   }
 }
 
 locals {
+  # NGINX removed: keep minimal user data or none
   nginx_user_data = <<-EOF
     #!/bin/bash
     set -e
     apt-get update -y
-    apt-get install -y nginx
-    systemctl enable nginx
-    systemctl start nginx
-    echo "<h1>NGINX on EC2 via Terraform</h1>" > /var/www/html/index.nginx-debian.html
   EOF
 }
 
@@ -150,19 +139,15 @@ resource "aws_instance" "nginx" {
   vpc_security_group_ids = [aws_security_group.nginx_sg.id]
   key_name               = aws_key_pair.nginx_key.key_name
 
+  # NGINX removed from user data
   user_data = local.nginx_user_data
 
   tags = {
-    Name = "nginx-ec2-instance"
+    Name = "ec2-instance"
   }
 }
 
-output "nginx_public_ip" {
-  description = "Public IP of the NGINX EC2 instance"
+output "instance_public_ip" {
+  description = "Public IP of the EC2 instance"
   value       = aws_instance.nginx.public_ip
-}
-
-output "nginx_http_url" {
-  description = "HTTP URL to reach the NGINX server"
-  value       = "http://${aws_instance.nginx.public_ip}"
 }
