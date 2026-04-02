@@ -20,3 +20,20 @@ variable "instance_name" {
   type        = string
   default     = "example-ec2-instance"
 }
+
+variable "s3_bucket_name" {
+  description = "Name of the S3 bucket to create (must be globally unique)"
+  type        = string
+}
+
+variable "s3_bucket_environment" {
+  description = "Environment tag for the S3 bucket"
+  type        = string
+  default     = "dev"
+}
+
+variable "s3_bucket_versioning_enabled" {
+  description = "Whether to enable versioning on the S3 bucket"
+  type        = bool
+  default     = true
+}
