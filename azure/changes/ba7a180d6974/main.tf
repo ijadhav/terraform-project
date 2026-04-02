@@ -90,7 +90,7 @@ resource "azurerm_network_interface_security_group_association" "oracle_nic_nsg"
 }
 
 resource "azurerm_linux_virtual_machine" "oracle_vm" {
-  name                = "${var.name_prefix}-oracle-vm"
+  name                = "test"
   location            = azurerm_resource_group.oracle_rg.location
   resource_group_name = azurerm_resource_group.oracle_rg.name
   size                = var.vm_size
