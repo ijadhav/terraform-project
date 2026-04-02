@@ -137,7 +137,7 @@ resource "aws_instance" "nginx" {
   user_data = local.nginx_user_data
 
   tags = {
-    Name = "ij-test"
+    Name = "nginx-ec2-instance"
   }
 }
 
