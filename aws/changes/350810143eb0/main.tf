@@ -92,7 +92,7 @@ resource "aws_security_group" "ec2_sg" {
   }
 }
 
-# EC2 instance updated to t3.micro in us-east-2
+# EC2 instance updated to t3.micro in us-east-2 and named "test"
 # Note: Replace ami with a valid us-east-2 Linux AMI for your account/region if needed.
 resource "aws_instance" "t2_micro" {
   ami                    = var.ami_id
@@ -104,7 +104,7 @@ resource "aws_instance" "t2_micro" {
   associate_public_ip_address = true
 
   tags = {
-    Name = "t2-micro-ec2-instance"
+    Name = "test"
   }
 }
 
