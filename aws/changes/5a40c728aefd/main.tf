@@ -127,20 +127,6 @@ locals {
   EOF
 }
 
-resource "aws_instance" "nginx" {
-  ami                    = data.aws_ami.ubuntu.id
-  instance_type          = var.instance_type
-  subnet_id              = aws_subnet.public.id
-  vpc_security_group_ids = [aws_security_group.nginx_sg.id]
-  key_name               = aws_key_pair.nginx_key.key_name
-
-  user_data = local.nginx_user_data
-
-  tags = {
-    Name = "test"
-  }
-}
-
 data "aws_ami" "ubuntu" {
   most_recent = true
 
@@ -155,6 +141,20 @@ data "aws_ami" "ubuntu" {
   }
 
   owners = ["099720109477"]
+}
+
+resource "aws_instance" "nginx" {
+  ami                    = data.aws_ami.ubuntu.id
+  instance_type          = var.instance_type
+  subnet_id              = aws_subnet.public.id
+  vpc_security_group_ids = [aws_security_group.nginx_sg.id]
+  key_name               = aws_key_pair.nginx_key.key_name
+
+  user_data = local.nginx_user_data
+
+  tags = {
+    Name = "nginx-ec2-instance"
+  }
 }
 
 output "nginx_public_ip" {
