@@ -19,6 +19,6 @@ resource "aws_instance" "example" {
   associate_public_ip_address = true
 
   tags = {
-    Name = "example-ec2-instance"
+    Name = "test"
   }
 }
