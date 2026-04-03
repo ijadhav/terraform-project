@@ -13,7 +13,7 @@ variable "resource_group_name" {
 variable "vm_name" {
   description = "Name of the virtual machine"
   type        = string
-  default     = "vm-example"
+  default     = "test"
 }
 
 variable "vm_size" {
