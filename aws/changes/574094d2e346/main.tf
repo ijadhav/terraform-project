@@ -33,7 +33,7 @@ resource "aws_instance" "test" {
               EOF
 
   tags = {
-    Name = "test"
+    Name = "test-2"
   }
 }
 
