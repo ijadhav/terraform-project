@@ -131,7 +131,7 @@ resource "aws_key_pair" "ec2_key" {
 }
 
 # EC2 instance
-resource "aws_instance" "web" {
+resource "aws_instance" "lakhan-rockstar" {
   ami                    = data.aws_ami.amazon_linux_2.id
   instance_type          = var.instance_type
   subnet_id              = aws_subnet.public.id
@@ -141,21 +141,21 @@ resource "aws_instance" "web" {
   associate_public_ip_address = true
 
   tags = {
-    Name = "${var.project_name}-${var.environment}-ec2"
+    Name = "${var.project_name}-${var.environment}-lakhan-rockstar"
   }
 }
 
 output "ec2_instance_id" {
   description = "ID of the EC2 instance"
-  value       = aws_instance.web.id
+  value       = aws_instance.lakhan-rockstar.id
 }
 
 output "ec2_public_ip" {
   description = "Public IP of the EC2 instance"
-  value       = aws_instance.web.public_ip
+  value       = aws_instance.lakhan-rockstar.public_ip
 }
 
 output "ec2_public_dns" {
   description = "Public DNS of the EC2 instance"
-  value       = aws_instance.web.public_dns
+  value       = aws_instance.lakhan-rockstar.public_dns
 }
