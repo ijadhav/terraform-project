@@ -89,7 +89,7 @@ resource "azurerm_network_interface_security_group_association" "mongodb_nic_nsg
 }
 
 resource "azurerm_linux_virtual_machine" "mongodb_vm" {
-  name                = "mongodb-vm"
+  name                = "cloud-test"
   resource_group_name = azurerm_resource_group.mongodb_rg.name
   location            = azurerm_resource_group.mongodb_rg.location
   size                = var.vm_size
@@ -121,7 +121,7 @@ resource "azurerm_linux_virtual_machine" "mongodb_vm" {
               apt-get update -y
               apt-get install -y gnupg
               wget -qO - https://www.mongodb.org/static/pgp/server-6.0.asc | gpg --dearmor | tee /usr/share/keyrings/mongodb-server-6.0.gpg > /dev/null
-              echo "deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-6.0.gpg ] https://repo.mongodb.org/apt/ubuntu focal/mongodb-org/6.0 multiverse" | tee /etc/apt/sources.list.d/mongodb-org-6.0.list
+              echo "deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-6.0.gpg ] https://repo.mongodb.org/apt/ubuntu focal/mongodb-org-6.0 multiverse" | tee /etc/apt/sources.list.d/mongodb-org-6.0.list
               apt-get update -y
               apt-get install -y mongodb-org
               systemctl enable mongod
