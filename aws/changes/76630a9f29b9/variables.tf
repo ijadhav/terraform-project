@@ -21,7 +21,7 @@ variable "subnet_id" {
 }
 
 variable "security_group_ids" {
-  description = "List of security group IDs to associate with the EC2 instance"
+  description = "List of existing security group IDs to associate with the EC2 instance"
   type        = list(string)
   default     = []
 }
@@ -30,4 +30,9 @@ variable "instance_name" {
   description = "Name tag for the EC2 instance"
   type        = string
   default     = "example-ec2-instance"
+}
+
+variable "vpc_id" {
+  description = "VPC ID where the HTTP security group will be created"
+  type        = string
 }
