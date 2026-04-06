@@ -18,7 +18,7 @@ resource "azurerm_resource_group" "main" {
   location = var.location
 }
 
-# Storage account for general-purpose storage
+# Storage account for general-purpose blob/file storage (Azure equivalent to S3)
 resource "azurerm_storage_account" "main" {
   name                     = var.storage_account_name
   resource_group_name      = azurerm_resource_group.main.name
