@@ -64,16 +64,25 @@ resource "aws_route_table_association" "public" {
   route_table_id = aws_route_table.public.id
 }
 
-# Security group allowing SSH
+# Security group allowing SSH and HTTP for nginx
 resource "aws_security_group" "ssh" {
   name        = "example-ec2-ssh"
-  description = "Allow SSH inbound traffic"
+  description = "Allow SSH and HTTP inbound traffic"
   vpc_id      = aws_vpc.main.id
 
   ingress {
     description      = "SSH from anywhere"
     from_port        = 22
     to_port          = 22
+    protocol         = "tcp"
+    cidr_blocks      = ["0.0.0.0/0"]
+    ipv6_cidr_blocks = ["::/0"]
+  }
+
+  ingress {
+    description      = "HTTP for nginx"
+    from_port        = 80
+    to_port          = 80
     protocol         = "tcp"
     cidr_blocks      = ["0.0.0.0/0"]
     ipv6_cidr_blocks = ["::/0"]
@@ -103,7 +112,7 @@ resource "aws_key_pair" "default" {
   public_key = file(var.public_key_path)
 }
 
-# EC2 instance
+# EC2 instance with user data to install nginx
 resource "aws_instance" "example" {
   ami                    = "ami-0fc5d935ebf8bc3bc" # Ubuntu 22.04 LTS in us-east-1 (update as needed)
   instance_type          = "t3.micro"
@@ -112,6 +121,24 @@ resource "aws_instance" "example" {
   key_name               = aws_key_pair.default.key_name
 
   associate_public_ip_address = true
+
+  user_data = <<-EOF
+              #!/bin/bash
+              set -xe
+
+              # Update package index
+              apt-get update -y
+
+              # Install nginx
+              apt-get install -y nginx
+
+              # Enable and start nginx
+              systemctl enable nginx
+              systemctl start nginx
+
+              # Simple index page
+              echo "<h1>nginx installed via Terraform user_data</h1>" > /var/www/html/index.nginx-debian.html
+              EOF
 
   tags = {
     Name = "example-ec2-instance"
