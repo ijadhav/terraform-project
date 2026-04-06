@@ -7,31 +7,31 @@
   "resource": {
     "azurerm_resource_group": {
       "rg": {
-        "name": "rg-default",
+        "name": "rg-sandbox",
         "location": "eastus"
       }
     },
     "azurerm_virtual_network": {
       "vnet": {
-        "name": "vnet-default",
-        "address_space": ["10.10.0.0/16"],
+        "name": "vnet-sandbox",
+        "address_space": ["10.20.0.0/16"],
         "location": "eastus",
-        "resource_group_name": "rg-default"
+        "resource_group_name": "rg-sandbox"
       }
     },
     "azurerm_subnet": {
       "subnet": {
-        "name": "subnet-default",
-        "resource_group_name": "rg-default",
-        "virtual_network_name": "vnet-default",
-        "address_prefixes": ["10.10.1.0/24"]
+        "name": "subnet-sandbox",
+        "resource_group_name": "rg-sandbox",
+        "virtual_network_name": "vnet-sandbox",
+        "address_prefixes": ["10.20.1.0/24"]
       }
     },
     "azurerm_network_interface": {
       "nic": {
-        "name": "nic-default",
+        "name": "nic-sandbox",
         "location": "eastus",
-        "resource_group_name": "rg-default",
+        "resource_group_name": "rg-sandbox",
         "ip_configuration": [{
           "name": "internal",
           "subnet_id": "${azurerm_subnet.subnet.id}",
@@ -41,8 +41,8 @@
     },
     "azurerm_linux_virtual_machine": {
       "vm": {
-        "name": "vm-default",
-        "resource_group_name": "rg-default",
+        "name": "vm-sandbox",
+        "resource_group_name": "rg-sandbox",
         "location": "eastus",
         "size": "Standard_B2ms",
         "admin_username": "azureuser",
