@@ -13,6 +13,11 @@
           "Name": "ec2"
         }
       }
+    },
+    "aws_s3_bucket": {
+      "s3_storage": {
+        "bucket": "s3-storage"
+      }
     }
   }
 }
