@@ -15,7 +15,7 @@ provider "aws" {
 module "ec2" {
   source = "../../modules/ec2"
 
-  name     = var.name
+  name     = "test"
   ssh_key  = var.ssh_key
   user_tag = var.user_tag
   tags     = var.tags
