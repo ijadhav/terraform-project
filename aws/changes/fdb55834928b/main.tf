@@ -29,3 +29,12 @@ module "s3" {
   user_tag  = var.user_tag
   tags      = var.tags
 }
+
+module "vpc" {
+  source = "../../modules/vpc"
+
+  name        = "vpc"
+  aws_region  = var.aws_region
+  user_tag    = var.user_tag
+  tags        = var.tags
+}
