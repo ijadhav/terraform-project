@@ -15,8 +15,13 @@
       }
     },
     "aws_s3_bucket": {
-      "s3_storage": {
-        "bucket": "s3-storage"
+      "prod": {
+        "bucket": "tf-devops-prod",
+        "tags": {
+          "env": "prod",
+          "managed_by": "terraform",
+          "repository": "tf-devops"
+        }
       }
     }
   }
