@@ -18,3 +18,20 @@ variable "ebs_block_device" {}
 variable "user_data" {}
 variable "ami" {}
 variable "tags" {}
+
+variable "cluster_identifier" {}
+variable "node_type" {}
+variable "master_username" {}
+variable "master_password" {}
+variable "cluster_type" {}
+variable "publicly_accessible" {}
+variable "skip_final_snapshot" {}
+variable "iam_roles" {}
+variable "vpc_security_group_ids" {}
+variable "cluster_subnet_group_name" {}
+variable "encrypted" {}
+variable "kms_key_id" {}
+variable "deletion_protection" {}
+variable "automated_snapshot_retention_period" {}
+variable "availability_zone_relocation_enabled" {}
+variable "copy_grants" {}
