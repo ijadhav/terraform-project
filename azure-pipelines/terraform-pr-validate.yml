@@ -1,0 +1,102 @@
+pr:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - aws/**
+      - azure/**
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - aws/**
+      - azure/**
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  TERRAFORM_VERSION: '1.8.5'
+
+stages:
+- stage: ValidateTerraform
+  jobs:
+  - job: TerraformPlan
+    displayName: Terraform plan validation
+    steps:
+    - checkout: self
+      fetchDepth: 0
+
+    - bash: |
+        set -euo pipefail
+
+        echo "Build reason: $(Build.Reason)"
+
+        if [ "$(Build.Reason)" = "PullRequest" ]; then
+          git fetch origin "$(System.PullRequest.TargetBranch)" --depth=1
+          TARGET_BRANCH_CLEAN=$(echo "$(System.PullRequest.TargetBranch)" | sed 's#refs/heads/##')
+          CHANGED_FILES=$(git diff --name-only "origin/${TARGET_BRANCH_CLEAN}"...HEAD)
+        else
+          CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD || true)
+        fi
+
+        echo "Changed files:"
+        echo "$CHANGED_FILES"
+
+        TF_DIR=$(echo "$CHANGED_FILES" | grep -E '^(aws|azure)/.*/.*\.tf$' | head -n 1 | xargs dirname || true)
+
+        if [ -z "$TF_DIR" ]; then
+          echo "No Terraform directory found under aws/ or azure/."
+          exit 1
+        fi
+
+        echo "Terraform directory: $TF_DIR"
+        echo "##vso[task.setvariable variable=TF_DIR]$TF_DIR"
+
+        CLOUD=$(echo "$TF_DIR" | cut -d'/' -f1)
+        echo "Detected cloud: $CLOUD"
+        echo "##vso[task.setvariable variable=CLOUD]$CLOUD"
+      displayName: Detect Terraform folder
+
+    - bash: |
+        set -euo pipefail
+        VERSION="$(TERRAFORM_VERSION)"
+        curl -fsSL -o terraform.zip "https://releases.hashicorp.com/terraform/${VERSION}/terraform_${VERSION}_linux_amd64.zip"
+        unzip -o terraform.zip
+        sudo mv terraform /usr/local/bin/terraform
+        terraform version
+      displayName: Install Terraform
+
+    - task: AzureCLI@2
+      displayName: Azure login
+      condition: eq(variables['CLOUD'], 'azure')
+      inputs:
+        azureSubscription: 'terrabot-azure-connection'
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          az account show
+
+    - bash: |
+        set -euo pipefail
+        cd "$(TF_DIR)"
+        terraform init -input=false
+      displayName: Terraform init
+
+    - bash: |
+        set -euo pipefail
+        cd "$(TF_DIR)"
+        terraform plan -input=false -out=tfplan | tee plan.txt
+        terraform show -json tfplan > tfplan.json
+      displayName: Terraform plan
+
+    - task: PublishPipelineArtifact@1
+      displayName: Publish Terraform plan artifact
+      inputs:
+        targetPath: '$(Build.SourcesDirectory)/$(TF_DIR)'
+        artifactName: 'terraform-plan-$(Build.BuildId)'
+        publishLocation: 'pipeline'
