@@ -3,7 +3,7 @@ module "azurerm_linux_virtual_machine" {
 
   resource_group_name            = azurerm_resource_group.hub_rg.name
   location                       = var.location
-  vm_name                        = var.vm_name
+  vm_name                        = "Ishika-test-vm"
   network_interface_id           = module.azurerm_network_interface.primary_nic_id
   size                           = var.size
   custom_data                    = var.custom_data
@@ -12,7 +12,7 @@ module "azurerm_linux_virtual_machine" {
   os_disk                        = var.os_disk
   source_image_reference         = var.source_image_reference
   identity                       = var.identity
-  tags                           = var.tags
+  tags                           = merge(var.tags, { environment = "sandbox" })
   eviction_policy                = var.eviction_policy
   priority                       = var.priority
   billing_profile                = var.billing_profile
