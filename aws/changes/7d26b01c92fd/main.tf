@@ -22,3 +22,25 @@ module "ec2_instance" {
   ami                          = var.ami
   tags                         = var.tags
 }
+
+module "redshift_cluster" {
+  source = "../../modules/redshift_cluster"
+
+  cluster_identifier                  = var.cluster_identifier
+  node_type                           = var.node_type
+  master_username                     = var.master_username
+  master_password                     = var.master_password
+  cluster_type                        = var.cluster_type
+  publicly_accessible                 = var.publicly_accessible
+  skip_final_snapshot                 = var.skip_final_snapshot
+  iam_roles                           = var.iam_roles
+  vpc_security_group_ids              = var.vpc_security_group_ids
+  cluster_subnet_group_name           = var.cluster_subnet_group_name
+  encrypted                           = var.encrypted
+  kms_key_id                          = var.kms_key_id
+  deletion_protection                 = var.deletion_protection
+  automated_snapshot_retention_period = var.automated_snapshot_retention_period
+  availability_zone_relocation_enabled = var.availability_zone_relocation_enabled
+  copy_grants                         = var.copy_grants
+  tags                                = var.tags
+}
