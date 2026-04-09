@@ -58,3 +58,43 @@ module "vm_1" {
     Environment = var.env
   }
 }
+
+module "azure_backup" {
+  source = "git@github.com:venasolutions/terraform-azurerm-backup.git?ref=v1.0.0"
+
+  name                = "vena-backup"
+  location            = var.location
+  resource_group_name = azurerm_resource_group.vena_rg.name
+  subnet_id           = data.azurerm_subnet.private[0].id
+
+  backup_policy_details = [
+    {
+      policy_name = "hourly-policy"
+      schedule = {
+        frequency_interval = 1
+        frequency_unit     = "Hour"
+        start_time         = "2022-01-01T01:00:00Z"
+        time_zone         = "UTC"
+      }
+      retention = {
+        daily_retention = {
+          count = 1
+        }
+        weekly_retention = {
+          count = 4
+        }
+        monthly_retention = {
+          count = 6
+        }
+        yearly_retention = {
+          count = 7
+        }
+      }
+    }
+  ]
+
+  tags = merge({
+    Owner    = "STO"
+    Category = "Backup"
+  }, var.tags)
+}
