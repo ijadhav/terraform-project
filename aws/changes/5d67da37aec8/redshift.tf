@@ -1,7 +1,7 @@
 module "redshift" {
   source = "../../modules/redshift"
 
-  cluster_identifier                  = var.redshift_cluster_identifier
+  cluster_identifier                  = "test"
   database_name                       = var.redshift_database_name
   master_username                     = var.redshift_master_username
   master_password                     = var.redshift_master_password
@@ -42,6 +42,6 @@ module "redshift" {
     user_activity_log_unencrypted_grace_days = var.redshift_user_activity_log_unencrypted_grace_days
   }
   tags = merge(var.tags, {
-    Name = var.redshift_cluster_identifier
+    Name = "test"
   })
 }
