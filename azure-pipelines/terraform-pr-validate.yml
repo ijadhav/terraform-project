@@ -75,7 +75,7 @@ stages:
       displayName: Azure login
       condition: eq(variables['CLOUD'], 'azure')
       inputs:
-        azureSubscription: 'ijadhav'
+        azureSubscription: 'terrabot-arm-service-connection'
         scriptType: bash
         scriptLocation: inlineScript
         inlineScript: |
