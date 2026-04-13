@@ -17,7 +17,7 @@ trigger:
       - azure/**
 
 pool:
-  name: Azure Pipelines
+  name: Terrabot-pool
 
 variables:
   TERRAFORM_VERSION: '1.8.5'
