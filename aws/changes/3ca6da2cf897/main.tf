@@ -1,3 +1,4 @@
-resource "aws_elasticache_cluster" "this" {
-  # implementation based on vena_repos module conventions and tf-devops style
+module "aws_elasticache" {
+  source = "../../modules/aws_elasticache"
+  # fill required inputs from retrieved_value_context or ask for clarification
 }
