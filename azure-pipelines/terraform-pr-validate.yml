@@ -17,7 +17,7 @@ trigger:
       - azure/**
 
 pool:
-  vmImage: MyPool
+  name: MyPool
 
 variables:
   TERRAFORM_VERSION: '1.8.5'
