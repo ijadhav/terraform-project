@@ -1,7 +1,7 @@
 module "s3" {
   source = "../../modules/s3"
 
-  bucket_name = var.bucket_name
+  bucket_name = "test"
   glacier_transition_days = var.glacier_transition_days
   expiration_days = var.expiration_days
   sse_enabled = var.sse_enabled
