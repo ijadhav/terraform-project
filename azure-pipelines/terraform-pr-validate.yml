@@ -63,13 +63,15 @@ stages:
       displayName: Detect Terraform folder
 
     - bash: |
-        set -euo pipefail
-        VERSION="$(TERRAFORM_VERSION)"
-        curl -fsSL -o terraform.zip "https://releases.hashicorp.com/terraform/${VERSION}/terraform_${VERSION}_linux_amd64.zip"
-        unzip -o terraform.zip
-        sudo mv terraform /usr/local/bin/terraform
-        terraform version
-      displayName: Install Terraform
+
+       set -euo pipefail
+       echo "Terraform location: $(which terraform)"
+       terraform version
+       echo "Git location: $(which git)"
+       git --version
+       echo "Azure CLI location: $(which az)"
+       az version
+       displayName: Verify tools
 
     - task: AzureCLI@2
       displayName: Azure login
