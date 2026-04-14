@@ -37,8 +37,8 @@ stages:
         echo "Build reason: $(Build.Reason)"
 
         if [ "$(Build.Reason)" = "PullRequest" ]; then
-          git fetch origin "$(System.PullRequest.TargetBranch)" --depth=1
           TARGET_BRANCH_CLEAN=$(echo "$(System.PullRequest.TargetBranch)" | sed 's#refs/heads/##')
+          git fetch origin "$TARGET_BRANCH_CLEAN" --depth=1
           CHANGED_FILES=$(git diff --name-only "origin/${TARGET_BRANCH_CLEAN}"...HEAD)
         else
           CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD || true)
@@ -63,15 +63,14 @@ stages:
       displayName: Detect Terraform folder
 
     - bash: |
-
-       set -euo pipefail
-       echo "Terraform location: $(which terraform)"
-       terraform version
-       echo "Git location: $(which git)"
-       git --version
-       echo "Azure CLI location: $(which az)"
-       az version
-       displayName: Verify tools
+        set -euo pipefail
+        echo "Terraform location: $(which terraform)"
+        terraform version
+        echo "Git location: $(which git)"
+        git --version
+        echo "Azure CLI location: $(which az)"
+        az version
+      displayName: Verify tools
 
     - task: AzureCLI@2
       displayName: Azure login
