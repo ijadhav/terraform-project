@@ -1,11 +1,9 @@
-module "redshift_cluster" {
-  source = "../../modules/redshift_cluster"
-  cluster_identifier = var.cluster_identifier
-  database_name = var.database_name
-  master_username = var.master_username
-  master_password = var.master_password
-  node_type = var.node_type
-  cluster_subnet_group_name = var.cluster_subnet_group_name
+module "linux_virtual_machine" {
+  source = "../../modules/linux_virtual_machine"
+  ami = var.ami
+  instance_type = var.instance_type
+  subnet_id = var.subnet_id
   vpc_security_group_ids = var.vpc_security_group_ids
-  iam_roles = var.iam_roles
+  key_name = var.key_name
+  tags = local.common_tags
 }
