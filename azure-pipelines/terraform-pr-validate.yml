@@ -101,6 +101,4 @@ stages:
         targetPath: '$(Build.SourcesDirectory)/$(TF_DIR)'
         artifactName: 'terraform-plan-$(Build.BuildId)'
         publishLocation: 'pipeline'
-        targetPath: '$(Build.SourcesDirectory)/$(TF_DIR)'
-        artifactName: 'terraform-plan-$(Build.BuildId)'
-        publishLocation: 'pipeline'
+       
