@@ -1,0 +1,122 @@
+{
+  "name": "terrabot-vscode",
+  "displayName": "Terrabot",
+  "description": "Repo-aware infrastructure code generation using the current workspace as context.",
+  "version": "0.1.0",
+  "publisher": "terrabot",
+  "engines": {
+    "vscode": "^1.92.0"
+  },
+  "categories": [
+    "AI",
+    "Other"
+  ],
+  "activationEvents": [
+    "onCommand:terrabot.scanRepository",
+    "onCommand:terrabot.explainWorkflow",
+    "onCommand:terrabot.askInfrastructure",
+    "onCommand:terrabot.openStandaloneChat",
+    "onCommand:terrabot.connectGitHub",
+    "onCommand:terrabot.disconnectGitHub"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "Terrabot",
+      "properties": {
+        "terrabot.cliPath": {
+          "type": "string",
+          "default": "terrabot",
+          "description": "Path to the Terrabot CLI executable."
+        },
+        "terrabot.aiEndpoint": {
+          "type": "string",
+          "default": "https://terrabot-ai.azurewebsites.net/api/generate",
+          "description": "Hosted Terrabot Azure Functions generate endpoint. Users normally do not need to change this. Example: https://terrabot-ai.azurewebsites.net/api/generate"
+        },
+        "terrabot.apiToken": {
+          "type": "string",
+          "default": "",
+          "description": "Optional API token sent as Bearer auth to the hosted Terrabot backend."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "terrabot.scanRepository",
+        "title": "Scan Repository",
+        "category": "Terrabot"
+      },
+      {
+        "command": "terrabot.explainWorkflow",
+        "title": "Explain Detected Workflow",
+        "category": "Terrabot"
+      },
+      {
+        "command": "terrabot.askInfrastructure",
+        "title": "Ask Infrastructure Request",
+        "category": "Terrabot"
+      },
+      {
+        "command": "terrabot.openSettings",
+        "title": "Open Settings",
+        "category": "Terrabot"
+      },
+      {
+        "command": "terrabot.openStandaloneChat",
+        "title": "Terrabot: Generate Infrastructure Changes",
+        "category": "Terrabot"
+      },
+      {
+        "command": "terrabot.connectGitHub",
+        "title": "Connect GitHub Account",
+        "category": "Terrabot"
+      },
+      {
+        "command": "terrabot.disconnectGitHub",
+        "title": "Disconnect Stored GitHub Token",
+        "category": "Terrabot"
+      }
+    ],
+    "chatParticipants": [
+      {
+        "id": "terrabot.infra",
+        "name": "terrabot",
+        "fullName": "Terrabot",
+        "description": "Generate infrastructure changes using the current repository as context.",
+        "isSticky": true,
+        "commands": [
+          {
+            "name": "plan",
+            "description": "Create a repo-aware infrastructure change plan"
+          },
+          {
+            "name": "explain-workflow",
+            "description": "Explain how Terrabot thinks this repo deploys infrastructure"
+          }
+        ]
+      }
+    ]
+  },
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": "limited",
+      "description": "Scanning is allowed in limited mode. Generation, validation, and command execution require workspace trust."
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.43",
+    "@types/vscode": "^1.92.0",
+    "@vscode/vsce": "^3.2.2",
+    "typescript": "^5.4.5"
+  },
+  "allowScripts": {
+    "@vscode/vsce-sign@2.0.9": true,
+    "keytar@7.9.0": true
+  }
+}

@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "terrabot"
+version = "0.1.0"
+description = "Repo-aware infrastructure assistant core and CLI"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+terrabot = "terrabot_cli.main:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["terrabot_core*", "terrabot_cli*", "shared_code*"]
+exclude = ["static*", "templates*", "tests*", "vscode-terrabot*", "docs*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

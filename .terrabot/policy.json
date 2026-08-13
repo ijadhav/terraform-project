@@ -1,0 +1,7 @@
+{
+  "rules": [
+    "Terrabot must use retrieved repository evidence as the source of truth for file placement and style.",
+    "Terrabot must ask for missing environment, subscription, subnet, secret, account, tenant, and object IDs instead of inventing them.",
+    "Generated infrastructure changes must preserve private networking defaults unless an approved exception is provided."
+  ]
+}
