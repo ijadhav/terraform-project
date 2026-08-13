@@ -58,6 +58,9 @@ from shared_code.aws_workflow import (
     should_suppress_azure_pending_for_aws,
 )
 import shared_code.azure_workflow as azure_workflow_state
+from shared_code import agent_memory_store
+from shared_code import pr_context as agent_pr_context
+from shared_code import repo_chat_context
 from datetime import datetime, timezone
 from pathlib import PurePosixPath
 from typing import Any, List, Dict, Optional
@@ -23213,6 +23216,14 @@ def _handle_teams_chat_request_safe(data: dict):
         "existing_branch": branch,
         "create_pr_requested": create_pr_requested,
         "fresh_infra_generation": _teams_truthy(request_data.get("fresh_infra_generation")),
+        # Carried so the agent-memory cache (see shared_code.agent_memory_store)
+        # can key centralized context by cloud/repo-target instead of only by
+        # this one conversation.
+        "cloud": str(
+            request_data.get("cloud") or request_data.get("requested_cloud") or state.get("cloud") or ""
+        ).strip().lower(),
+        "repo_target": str(state.get("repo_target") or request_data.get("repo_target") or "").strip().lower(),
+        "requester": str(request_data.get("teams_requester") or "").strip(),
     }
     context_token = _ACTIVE_TEAMS_FLOW_CONTEXT.set(flow_context)
     try:
@@ -28950,13 +28961,122 @@ def _teams_message_is_protocol_control(request_data: dict, state: dict, prompt: 
     return False
 
 
-def _teams_plain_chat_reply(prompt: str) -> tuple[dict, int]:
-    """Answer non-infra natural language without entering generation code."""
+def _teams_chat_repo_targets(cloud: str) -> dict:
+    """Map a resolved cloud to its GitHub owner/repo/branch for chat grounding."""
+    cloud = str(cloud or "").strip().lower()
+    if cloud == "aws" and GITHUB_AWS_REPO:
+        return {"owner": GITHUB_OWNER, "repo": GITHUB_AWS_REPO, "branch": GITHUB_AWS_BASE_BRANCH}
+    if cloud == "azure" and GITHUB_AZURE_REPO:
+        return {"owner": GITHUB_OWNER, "repo": GITHUB_AZURE_REPO, "branch": GITHUB_AZURE_BASE_BRANCH}
+    return {}
+
+
+def _teams_build_chat_grounding_context(
+    prompt: str,
+    teams_conversation_id: str,
+    cloud_hint: str,
+    repo_target_hint: str,
+) -> dict:
+    """Gather live-repository, pull-request, and cached-memory context for a
+    plain-language question so Teams chat can answer infrastructure
+    questions the same way the VS Code extension answers questions about the
+    open workspace (feature: repo-aware Q&A), grounded in already-raised
+    pull requests (feature: PR-aware answers), and long-term agent memory.
+
+    Best effort throughout: any failure yields an empty section rather than
+    blocking the chat reply.
+    """
+    cloud = safe_normalize_cloud(cloud_hint) or safe_normalize_cloud(infer_cloud_from_prompt(prompt)) or ""
+    repo_info = _teams_chat_repo_targets(cloud)
+
+    repo_paths: List[str] = []
+    repo_context_block = ""
+    pr_matches: List[dict] = []
+    pr_context_block = ""
+
+    if repo_info:
+        try:
+            repo_result = repo_chat_context.build_live_repo_chat_context(
+                prompt,
+                repo_info["owner"],
+                repo_info["repo"],
+                branch=repo_info["branch"],
+                token=GITHUB_TOKEN,
+            )
+            repo_paths = repo_result.get("paths") or []
+            repo_context_block = repo_result.get("context_block") or ""
+        except Exception:
+            LOGGER.debug("Skipping live repo chat context", exc_info=True)
+
+        try:
+            pr_result = agent_pr_context.build_pr_context_block(
+                prompt,
+                repo_info["owner"],
+                repo_info["repo"],
+                token=GITHUB_TOKEN,
+                cloud=cloud,
+            )
+            pr_matches = pr_result.get("matches") or []
+            pr_context_block = pr_result.get("context_block") or ""
+        except Exception:
+            LOGGER.debug("Skipping pull request chat context", exc_info=True)
+    else:
+        # Cloud/repo could not be resolved from the question. Still check
+        # both configured repositories for a relevant open pull request so a
+        # cloud-agnostic infra question can find matching in-flight work.
+        try:
+            pr_result = agent_pr_context.build_multi_repo_pr_context_block(
+                prompt,
+                GITHUB_OWNER,
+                {"aws": GITHUB_AWS_REPO, "azure": GITHUB_AZURE_REPO},
+                token=GITHUB_TOKEN,
+            )
+            pr_matches = pr_result.get("matches") or []
+            pr_context_block = pr_result.get("context_block") or ""
+        except Exception:
+            LOGGER.debug("Skipping multi-repo pull request chat context", exc_info=True)
+
+    memory_context = agent_memory_store.get_combined_memory_context(
+        conversation_id=teams_conversation_id,
+        cloud=cloud,
+        repo_target=repo_target_hint,
+    )
+
+    return {
+        "cloud": cloud,
+        "repo_paths": repo_paths,
+        "repo_context_block": repo_context_block,
+        "pr_matches": pr_matches,
+        "pr_context_block": pr_context_block,
+        "memory_context": memory_context,
+    }
+
+
+def _teams_plain_chat_reply(
+    prompt: str,
+    teams_conversation_id: str = "",
+    cloud_hint: str = "",
+    repo_target_hint: str = "",
+    requester: str = "",
+) -> tuple[dict, int]:
+    """Answer non-infra natural language without entering generation code.
+
+    Ordinary questions ("what environments does this module support?", "has
+    anyone raised a PR for the checkout storage account yet?") are answered
+    using live repository evidence, already-raised pull requests, and cached
+    agent memory — the same repository-aware ability VS Code already has for
+    the open workspace — while still refusing to generate Terraform, files,
+    branches, commits, or pull requests from this path.
+    """
     normalized = normalize_yes_no_reply(prompt)
     greetings = {"hi", "hello", "hey", "good morning", "good afternoon", "good evening"}
+    grounding: dict = {}
     if normalized in greetings:
         reply = "Hello. Send an infrastructure change when you are ready, or ask a repository/workflow question."
     else:
+        grounding = _teams_build_chat_grounding_context(
+            prompt, teams_conversation_id, cloud_hint, repo_target_hint
+        )
         chat_input = json.dumps({
             "task": "Answer a Microsoft Teams user conversationally without generating infrastructure.",
             "user_message": prompt,
@@ -28965,7 +29085,11 @@ def _teams_plain_chat_reply(prompt: str) -> tuple[dict, int]:
                 "Do not return JSON, Terraform, files, branches, commits, or pull requests.",
                 "Do not reuse or summarize a previous infrastructure request unless the user explicitly asks about it.",
                 "If the message is unclear, ask one concise clarifying question.",
+                "When repository_context, pull_request_context, or agent_memory_context is provided below, use it to answer infrastructure/repository questions accurately and cite the specific file or PR you relied on. Live repository_context and pull_request_context are ground truth; agent_memory_context is a cache and must be reconciled with them, never trusted alone for current state.",
             ],
+            "repository_context": grounding.get("repo_context_block") or "",
+            "pull_request_context": grounding.get("pr_context_block") or "",
+            "agent_memory_context": grounding.get("memory_context") or "",
         })
         try:
             _thread, candidate = _TEAMS_MULTICLOUD_PREVIOUS_CALL_AGENT(None, chat_input)
@@ -28974,6 +29098,34 @@ def _teams_plain_chat_reply(prompt: str) -> tuple[dict, int]:
                 reply = "I did not detect a new infrastructure change request. Please state the change explicitly when you want Terraform generated."
         except Exception:
             reply = "I did not detect a new infrastructure change request. Please state the change explicitly when you want Terraform generated."
+
+    if teams_conversation_id:
+        try:
+            files_searched = list(grounding.get("repo_paths") or [])
+            pr_matches = grounding.get("pr_matches") or []
+            context_pieces = []
+            if files_searched:
+                context_pieces.append(f"{len(files_searched)} repository file(s) retrieved for grounding")
+            if pr_matches:
+                context_pieces.append(f"{len(pr_matches)} related open pull request(s) found")
+                files_searched.extend(
+                    f"PR #{item.get('number')}: {item.get('title')}" for item in pr_matches if isinstance(item, dict)
+                )
+            agent_memory_store.record_agent_turn(
+                conversation_id=teams_conversation_id,
+                cloud=str(grounding.get("cloud") or cloud_hint or ""),
+                repo_target=repo_target_hint,
+                workflow="chat",
+                requester=requester,
+                source="teams",
+                prompt=prompt,
+                files_searched=files_searched,
+                context_retrieved_summary="; ".join(context_pieces),
+                response_summary=reply,
+            )
+        except Exception:
+            LOGGER.debug("Skipping chat agent memory recording", exc_info=True)
+
     return {"ok": True, "mode": "chat", "reply": reply}, 200
 
 
@@ -29119,8 +29271,146 @@ def _teams_is_context_length_error(exc: Exception) -> bool:
     return "context_length_exceeded" in text or "context window" in text or "maximum context" in text
 
 
+def _teams_extract_files_searched(payload: dict) -> List[str]:
+    """Best-effort extraction of the repository paths supplied to the agent.
+
+    Looks across the shapes used by the various Teams/VS Code agent-input
+    builders so the cached memory entry's "files_searched" is populated
+    regardless of which workflow built the payload.
+    """
+    paths: List[str] = []
+
+    def _collect(value: Any) -> None:
+        if isinstance(value, dict):
+            path = value.get("path") or value.get("filename") or value.get("input")
+            if isinstance(path, str) and path.strip():
+                if path.strip() not in paths:
+                    paths.append(path.strip())
+            for nested_key in ("existing_files", "matched_files"):
+                nested = value.get(nested_key)
+                if isinstance(nested, list):
+                    for item in nested:
+                        _collect(item)
+        elif isinstance(value, list):
+            for item in value:
+                _collect(item)
+
+    for key in ("existing_pr_context", "retrieved_value_context", "retrieved_module_context", "repository_files"):
+        _collect(payload.get(key))
+    return paths[:20]
+
+
+def _teams_attach_agent_memory_context(agent_input: str, active: dict) -> str:
+    """Attach the cached memory block (see agent_memory_store) to the payload.
+
+    This lets the agent reuse context from earlier turns instead of relying
+    solely on a freshly rebuilt live-repository payload every request. It is
+    additive: on any failure the original ``agent_input`` is returned
+    unchanged so memory caching can never break generation.
+    """
+    try:
+        memory_context = agent_memory_store.get_combined_memory_context(
+            conversation_id=str(active.get("teams_conversation_id") or ""),
+            cloud=str(active.get("cloud") or ""),
+            repo_target=str(active.get("repo_target") or ""),
+        )
+        if not memory_context:
+            return agent_input
+        payload = json.loads(agent_input)
+        if not isinstance(payload, dict):
+            return agent_input
+        payload["agent_memory_context"] = memory_context
+        return json.dumps(payload, ensure_ascii=False)
+    except Exception:
+        LOGGER.debug("Skipping agent memory context attachment", exc_info=True)
+        return agent_input
+
+
+def _teams_record_agent_memory_turn(active: dict, agent_input: str, reply: str) -> None:
+    """Append this Foundry turn to the durable agent memory cache.
+
+    Called after every successful Teams Foundry call (chat, infrastructure
+    generation, and validation reruns) so the cache reflects every request
+    and response, per the long-term-context requirement.
+    """
+    try:
+        payload: dict = {}
+        try:
+            parsed = json.loads(agent_input)
+            if isinstance(parsed, dict):
+                payload = parsed
+        except Exception:
+            payload = {}
+
+        prompt = str(
+            payload.get("user_request")
+            or payload.get("prompt")
+            or payload.get("user_message")
+            or active.get("effective_prompt")
+            or ""
+        ).strip()
+        files_searched = _teams_extract_files_searched(payload)
+
+        reply_payload = _extract_json_payload_for_memory(reply)
+        code_generated_summary = ""
+        if reply_payload:
+            files = reply_payload.get("files")
+            if isinstance(files, list) and files:
+                file_paths = [
+                    str(item.get("path") or item.get("filename") or "").strip()
+                    for item in files
+                    if isinstance(item, dict)
+                ]
+                code_generated_summary = "generated/modified files: " + ", ".join(
+                    path for path in file_paths if path
+                )
+
+        agent_memory_store.record_agent_turn(
+            conversation_id=str(active.get("teams_conversation_id") or ""),
+            cloud=str(active.get("cloud") or ""),
+            repo_target=str(active.get("repo_target") or ""),
+            workflow=str(payload.get("mode") or payload.get("workflow") or ""),
+            requester=str(active.get("requester") or ""),
+            source="teams",
+            prompt=prompt,
+            files_searched=files_searched,
+            context_retrieved_summary=(
+                f"{len(files_searched)} repository file(s) supplied as context"
+                if files_searched
+                else ""
+            ),
+            code_generated_summary=code_generated_summary,
+            response_summary=str(reply or "")[:1500],
+        )
+    except Exception:
+        LOGGER.debug("Skipping agent memory turn recording", exc_info=True)
+
+
+def _extract_json_payload_for_memory(value: str) -> dict:
+    raw = str(value or "").strip()
+    if not raw:
+        return {}
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            parsed = json.loads(raw[start:end + 1])
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+    return {}
+
+
 def call_agent(conversation_id: Optional[str], agent_input: str):
-    """Run Teams generation with bounded live-GitHub context and one safe retry."""
+    """Run Teams generation with bounded live-GitHub context and one safe retry.
+
+    Every call is additionally: (1) enriched with cached long-term agent
+    memory (see ``shared_code.agent_memory_store``) so the agent does not
+    have to re-derive context it already retrieved, and (2) recorded back
+    into that cache together with the agent's response, so the next request
+    for this conversation or repository area can reuse it.
+    """
     active = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
     teams_active = bool(active.get("active"))
     first_fresh = bool(
@@ -29133,17 +29423,28 @@ def call_agent(conversation_id: Optional[str], agent_input: str):
         conversation_id = None
 
     context_budget = max(90000, int(os.getenv("TERRABOT_TEAMS_AGENT_CONTEXT_MAX_CHARS", "180000")))
-    bounded_input = _teams_compact_agent_input(agent_input, context_budget) if teams_active else agent_input
+    memory_enriched_input = (
+        _teams_attach_agent_memory_context(agent_input, active) if teams_active else agent_input
+    )
+    bounded_input = (
+        _teams_compact_agent_input(memory_enriched_input, context_budget)
+        if teams_active
+        else memory_enriched_input
+    )
     try:
-        return _TEAMS_MULTICLOUD_PREVIOUS_CALL_AGENT(conversation_id, bounded_input)
+        result_conversation_id, reply = _TEAMS_MULTICLOUD_PREVIOUS_CALL_AGENT(conversation_id, bounded_input)
     except Exception as exc:
         if not teams_active or not _teams_is_context_length_error(exc):
             raise
         LOGGER.warning(
             "Teams Foundry context limit reached; retrying once with a fresh conversation and tighter live-repository context."
         )
-        retry_input = _teams_compact_agent_input(agent_input, 45000)
-        return _TEAMS_MULTICLOUD_PREVIOUS_CALL_AGENT(None, retry_input)
+        retry_input = _teams_compact_agent_input(memory_enriched_input, 45000)
+        result_conversation_id, reply = _TEAMS_MULTICLOUD_PREVIOUS_CALL_AGENT(None, retry_input)
+
+    if teams_active:
+        _teams_record_agent_memory_turn(active, agent_input, reply)
+    return result_conversation_id, reply
 
 
 def _handle_teams_chat_request_multicloud(data: dict):
@@ -29194,7 +29495,13 @@ def _handle_teams_chat_request_multicloud(data: dict):
         and stage not in decision_stages
         and not _teams_prompt_requests_pr(prompt)
     ):
-        return _teams_plain_chat_reply(prompt)
+        return _teams_plain_chat_reply(
+            prompt,
+            teams_conversation_id=teams_conversation_id,
+            cloud_hint=str(state.get("cloud") or "").strip(),
+            repo_target_hint=str(state.get("repo_target") or "").strip(),
+            requester=str(request_data.get("teams_requester") or "").strip(),
+        )
 
     # Protocol continuations (branch yes/no and target-picker replies) carry the
     # cloud already resolved for the pending request. Never re-infer cloud from

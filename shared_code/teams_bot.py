@@ -15,7 +15,7 @@ from botbuilder.integration.aiohttp import (
     ConfigurationBotFrameworkAuthentication,
 )
 from botbuilder.schema import Activity, ActivityTypes
-from shared_code import teams_conversation_memory
+from shared_code import agent_memory_store, teams_conversation_memory
 from shared_code.terrabot_service import (
     handle_teams_chat_request,
     handle_teams_workspace_branch_request,
@@ -786,6 +786,10 @@ class TerrabotTeamsBot(ActivityHandler):
 
             TEAMS_THREAD_STATE.pop(thread_id, None)
             teams_conversation_memory.clear(thread_id)
+            try:
+                agent_memory_store.clear_conversation_memory(thread_id)
+            except Exception:
+                LOGGER.debug("agent memory reset skipped", exc_info=True)
             set_teams_short_follow_up(False)
             set_teams_conversation_context("")
             cleared_workflows = int(reset_result.get("workflow_states_cleared") or 0)
