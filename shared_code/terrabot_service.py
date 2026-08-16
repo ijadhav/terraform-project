@@ -29433,6 +29433,170 @@ def _extract_json_payload_for_memory(value: str) -> dict:
     return {}
 
 
+_GROUNDING_REFUSAL_RE = re.compile(
+    r"\b(cannot safely|can(?:not|['\u2019]t) safely|not grounded|cannot proceed without|"
+    r"unable to safely|could not (?:be completed|safely)|cannot determine (?:the )?exact)\b",
+    re.IGNORECASE,
+)
+
+
+def _teams_looks_like_grounding_refusal(reply: str) -> bool:
+    """True when a modification-generation reply is a bare refusal instead
+    of a specific, evidence-backed clarifying question.
+
+    Refusals such as "cannot safely disable X because the exact rule names
+    are not grounded in the repository evidence" are usually the wrong
+    answer: the agent already had the selected file's content in its
+    context and should have asked the user to pick from the actual
+    rule/resource identifiers declared there instead of refusing outright.
+    A reply that already asks a real question (contains "?") is left alone.
+    """
+    text = str(reply or "")
+    if not text or "?" in text:
+        return False
+    return bool(_GROUNDING_REFUSAL_RE.search(text))
+
+
+def _teams_extract_selected_file_contents(payload: Any, max_files: int = 3) -> list[tuple[str, str]]:
+    """Best-effort recursive search for the selected/target file(s)' live
+    content inside an agent-input payload.
+
+    Used to rescue a grounding refusal with real repository evidence
+    instead of leaving the user at a dead end when the agent already had
+    the file but did not use it to ask a concrete question.
+    """
+    found: list[tuple[str, str]] = []
+
+    def _collect(value: Any) -> None:
+        if len(found) >= max_files:
+            return
+        if isinstance(value, dict):
+            is_selected = (
+                value.get("selection_state") == "selected"
+                or value.get("source") == "backend_existing_infra_code_match"
+            )
+            content = value.get("content")
+            path = value.get("path") or value.get("filename") or value.get("selected_path")
+            if is_selected and isinstance(content, str) and content.strip():
+                found.append((str(path or "selected file"), content))
+            matched = value.get("matched_files")
+            if isinstance(matched, list):
+                for entry in matched:
+                    _collect(entry)
+            for nested_key in (
+                "existing_files",
+                "existing_pr_context",
+                "retrieved_value_context",
+                "retrieved_module_context",
+            ):
+                nested = value.get(nested_key)
+                if isinstance(nested, list):
+                    for item in nested:
+                        _collect(item)
+        elif isinstance(value, list):
+            for item in value:
+                _collect(item)
+
+    _collect(payload)
+    return found[:max_files]
+
+
+def _teams_extract_candidate_rule_identifiers(content: str, max_items: int = 12) -> list[dict]:
+    """Extract named rule/resource identifiers declared inside one .tf file.
+
+    Looks for nested ``rule { name = "..." ... }`` blocks (the common shape
+    for WAF/ACL-style resources) and top-level ``resource``/``data`` blocks,
+    so a clarifying question can name concrete choices instead of only
+    pointing at an abstract file.
+    """
+    identifiers: list[dict] = []
+    seen: set[str] = set()
+
+    for match in re.finditer(r"(?ms)\brule\s*\{(.*?)\n\s*\}", content):
+        block = match.group(1)
+        name_match = re.search(r'name\s*=\s*"([^"]+)"', block)
+        if name_match:
+            name = name_match.group(1).strip()
+            if name and name not in seen:
+                seen.add(name)
+                identifiers.append({"identifier": name, "kind": "rule"})
+        if len(identifiers) >= max_items:
+            return identifiers
+
+    for match in re.finditer(r'(?m)^\s*(resource|data)\s+"([^"]+)"\s+"([^"]+)"', content):
+        kind, res_type, res_name = match.groups()
+        label = f"{res_type}.{res_name}"
+        if label not in seen:
+            seen.add(label)
+            identifiers.append({"identifier": label, "kind": kind})
+        if len(identifiers) >= max_items:
+            return identifiers
+
+    return identifiers
+
+
+def _teams_build_grounding_rescue_reply(files: list[tuple[str, str]]) -> Optional[str]:
+    """Build a clarification JSON naming concrete rule/resource choices
+    found in the selected file(s), instead of leaving a bare refusal.
+
+    Returns None when no useful identifiers could be extracted, so the
+    original refusal is left untouched rather than being replaced with an
+    equally unhelpful empty question.
+    """
+    all_identifiers: list[dict] = []
+    evidence_lines: list[str] = []
+    for path, content in files:
+        identifiers = _teams_extract_candidate_rule_identifiers(content)
+        for item in identifiers:
+            item = dict(item)
+            item["file"] = path
+            all_identifiers.append(item)
+        if identifiers:
+            evidence_lines.append(
+                f"`{path}` declares: " + ", ".join(f"`{item['identifier']}`" for item in identifiers[:8])
+            )
+    if not all_identifiers:
+        return None
+
+    options = ", ".join(f"`{item['identifier']}`" for item in all_identifiers[:10])
+    question = (
+        "I read the selected file but the request did not name an exact rule/resource. "
+        f"I found these candidates: {options}. Which one(s) should be disabled?"
+    )
+    payload = {
+        "summary": question,
+        "reply": question,
+        "analysis": "\n".join(evidence_lines)
+        or "Inspected the selected file's live content for named rule/resource declarations.",
+        "questions": [question],
+        "files": [],
+        "user_fillable": [],
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _teams_maybe_rescue_grounding_refusal(agent_input: str, reply: str) -> Optional[str]:
+    """Turn a bare grounding refusal into an evidence-backed clarification.
+
+    Best effort: any failure (unparsable payload, no selected file content,
+    no extractable identifiers) leaves the original reply untouched.
+    """
+    try:
+        if not _teams_looks_like_grounding_refusal(reply):
+            return None
+        payload = json.loads(agent_input)
+    except Exception:
+        return None
+    files = _teams_extract_selected_file_contents(payload)
+    if not files:
+        return None
+    try:
+        return _teams_build_grounding_rescue_reply(files)
+    except Exception:
+        LOGGER.debug("Skipping grounding-refusal rescue", exc_info=True)
+        return None
+
+
 def call_agent(conversation_id: Optional[str], agent_input: str):
     """Run Teams generation with bounded live-GitHub context and one safe retry.
 
@@ -29440,7 +29604,11 @@ def call_agent(conversation_id: Optional[str], agent_input: str):
     memory (see ``shared_code.agent_memory_store``) so the agent does not
     have to re-derive context it already retrieved, and (2) recorded back
     into that cache together with the agent's response, so the next request
-    for this conversation or repository area can reuse it.
+    for this conversation or repository area can reuse it. (3) A bare
+    "cannot safely ground exact rule/value names" refusal for a
+    modification request is rescued into a clarification that names the
+    actual rule/resource identifiers found in the selected file's live
+    content, since the agent already had that evidence available.
     """
     active = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
     teams_active = bool(active.get("active"))
@@ -29474,6 +29642,12 @@ def call_agent(conversation_id: Optional[str], agent_input: str):
         result_conversation_id, reply = _TEAMS_MULTICLOUD_PREVIOUS_CALL_AGENT(None, retry_input)
 
     if teams_active:
+        rescued_reply = _teams_maybe_rescue_grounding_refusal(memory_enriched_input, reply)
+        if rescued_reply:
+            LOGGER.info(
+                "Rescued a bare grounding refusal into an evidence-backed clarification."
+            )
+            reply = rescued_reply
         _teams_record_agent_memory_turn(active, agent_input, reply)
     return result_conversation_id, reply
 
