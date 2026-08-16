@@ -2015,6 +2015,16 @@ instead of understanding the repository:
   and `aws_wafv2_web_acl_association.admin` in `waf.tf`. Which one should be
   disabled, or both?"). The question must prove you already read the file
   content, not just listed its name.
+- Candidates supplied by the backend are ordered by relevance to the current
+  prompt (a `relevance_score`) and each carries a `content_summary` — a
+  one-line, evidence-based description of what that file actually declares
+  (resources/data/module blocks or variables). Use `content_summary` to
+  explain WHY a candidate is relevant, and trust the given order: the
+  highest-relevance candidate (for example the file whose content_summary
+  names a WAF resource for a "disable ... waf ..." request) is the one to
+  lead with, not whichever file happens to sort first alphabetically. Show
+  every candidate the backend supplied, not just the first few, when the
+  user needs to choose among them.
 - If the environment/folder itself is ambiguous or was not explicitly named
   by the user and cannot be inferred from thread/session context, ask that
   first, before resource selection — do not silently default to a different
