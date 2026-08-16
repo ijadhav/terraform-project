@@ -33707,6 +33707,84 @@ def handle_teams_chat_request(data: dict):
 
 
 # =============================================================================
+# Duplicate/related pull-request awareness for infrastructure requests
+# =============================================================================
+# Every infrastructure request (creation, modification, or a clarification
+# reply on the way to one) is checked against already-raised pull requests on
+# the resolved cloud's repository, INCLUDING drafts, so a user is told when
+# their request overlaps with in-flight work instead of Terrabot silently
+# generating a duplicate change. This wraps the final handle_teams_chat_request
+# so no existing routing/state-machine logic above needs to change.
+
+_TEAMS_PR_DUPLICATE_CHECK_PREVIOUS_HANDLE_CHAT = handle_teams_chat_request
+
+
+def _teams_attach_related_pull_requests(result: dict, prompt: str, cloud: str) -> dict:
+    """Best-effort: attach already-raised (including draft) pull requests
+    that appear related to this infrastructure request. Failures never
+    block the response — they are logged at debug level and skipped."""
+    try:
+        normalized_cloud = safe_normalize_cloud(cloud) or ""
+        repo_info = _teams_chat_repo_targets(normalized_cloud)
+        if not repo_info or not prompt:
+            return result
+        pr_result = agent_pr_context.build_pr_context_block(
+            prompt,
+            repo_info["owner"],
+            repo_info["repo"],
+            token=GITHUB_TOKEN,
+            cloud=normalized_cloud,
+        )
+        matches = pr_result.get("matches") or []
+        if not matches:
+            return result
+        result = dict(result)
+        result["related_pull_requests"] = matches
+        result["related_pull_requests_context"] = pr_result.get("context_block") or ""
+        LOGGER.info(
+            "Found %s related pull request(s) (including drafts) for a Teams infra request: cloud=%s",
+            len(matches),
+            normalized_cloud,
+        )
+        return result
+    except Exception:
+        LOGGER.debug("Skipping related/duplicate pull request check", exc_info=True)
+        return result
+
+
+def handle_teams_chat_request(data: dict):
+    """Final Teams wrapper: attach duplicate/related pull request awareness.
+
+    Runs after every prior routing/state-machine stage so it sees the fully
+    resolved cloud and prompt, and applies to infra-generation-facing modes
+    only (creation/modification previews, clarifications on the way to one,
+    and the branch-created result). Plain chat is handled separately by
+    ``_teams_plain_chat_reply``, which already attaches PR context of its own.
+    """
+    request_data = dict(data or {})
+    prompt = str(
+        request_data.get("original_prompt")
+        or request_data.get("prompt")
+        or request_data.get("message")
+        or ""
+    ).strip()
+    result, status_code = _TEAMS_PR_DUPLICATE_CHECK_PREVIOUS_HANDLE_CHAT(request_data)
+    result = dict(result or {})
+
+    mode = str(result.get("mode") or "").strip().lower()
+    cloud = str(
+        result.get("cloud")
+        or request_data.get("requested_cloud")
+        or request_data.get("cloud")
+        or ""
+    ).strip()
+    if prompt and cloud and mode in {"infra_preview", "clarification", "branch_created"}:
+        result = _teams_attach_related_pull_requests(result, prompt, cloud)
+
+    return result, status_code
+
+
+# =============================================================================
 # 2026-08-13 Teams enable/disable flag-only disambiguation final override
 # =============================================================================
 # For explicit feature-state requests, users choose a FLAG, never a Terraform

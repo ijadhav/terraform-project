@@ -325,6 +325,40 @@ def _format_evidence_paths(paths: Any) -> list[str]:
     return ["**Repository evidence used**", *[f"- `{value}`" for value in values]]
 
 
+def _format_related_pull_requests(result: Dict[str, Any]) -> list[str]:
+    """Surface already-raised (including draft) PRs related to this request.
+
+    Populated by ``terrabot_service.handle_teams_chat_request``'s duplicate/
+    related pull-request check so users are told when their request overlaps
+    with in-flight work instead of only discovering it after generation.
+    """
+    matches = result.get("related_pull_requests")
+    if not isinstance(matches, list) or not matches:
+        return []
+    lines = [
+        "**Related pull request(s) already raised**",
+        "Terrabot found existing pull request(s) on this repository that look related to this request:",
+    ]
+    for item in matches[:5]:
+        if not isinstance(item, dict):
+            continue
+        number = item.get("number")
+        title = str(item.get("title") or "").strip()
+        author = str(item.get("author") or "").strip() or "unknown"
+        branch = str(item.get("branch") or "").strip()
+        state = str(item.get("state") or "").strip()
+        draft = bool(item.get("draft"))
+        url = str(item.get("url") or "").strip()
+        status = f"{state}{' draft' if draft else ''}".strip()
+        lines.append(
+            f"- PR #{number} \"{title}\" by {author} (`{branch}`, {status}): {url}"
+        )
+    lines.append(
+        "Review these before continuing — Terrabot will still proceed with this request unless you tell it to stop."
+    )
+    return lines
+
+
 def _format_checkout_command(branch: Any) -> str:
     branch_name = str(branch or "").strip()
     if not branch_name:
@@ -364,6 +398,7 @@ def _format_reply(result: Dict[str, Any]) -> str:
         # decisions belong in the backend/agent workflow; the end user should
         # see only the one genuinely blocking question, if there is one.
         visible_reply = summary or reply
+        related_pr_lines = _format_related_pull_requests(result)
 
         if mode == "clarification":
             # Target disambiguation must render the choices themselves. The old
@@ -415,6 +450,8 @@ def _format_reply(result: Dict[str, Any]) -> str:
                     "",
                     "Reply with the number, resource/module name, or path. Terrabot will continue the original request after your selection.",
                 ])
+                if related_pr_lines:
+                    lines.extend(["", *related_pr_lines])
                 return "\n".join(lines)
 
             if questions:
@@ -426,6 +463,8 @@ def _format_reply(result: Dict[str, Any]) -> str:
                     "**Action required**",
                     questions[0],
                 ])
+                if related_pr_lines:
+                    lines.extend(["", *related_pr_lines])
                 return "\n".join(lines)
 
             # Preserve a backend-formatted multi-line choice reply instead of
@@ -475,6 +514,9 @@ def _format_reply(result: Dict[str, Any]) -> str:
         lines = ["**Infrastructure change prepared**", visible_reply]
         if analysis:
             lines.extend(["", *_format_analysis_block(analysis)])
+        related_pr_lines = _format_related_pull_requests(result)
+        if related_pr_lines:
+            lines.extend(["", *related_pr_lines])
         evidence_lines = _format_evidence_paths(source_paths)
         if evidence_lines:
             lines.extend(["", *evidence_lines])
@@ -517,6 +559,9 @@ def _format_reply(result: Dict[str, Any]) -> str:
         lines = [heading, summary or reply]
         if analysis:
             lines.extend(["", *_format_analysis_block(analysis)])
+        related_pr_lines = _format_related_pull_requests(result)
+        if related_pr_lines:
+            lines.extend(["", *related_pr_lines])
         evidence_lines = _format_evidence_paths(source_paths)
         if evidence_lines:
             lines.extend(["", *evidence_lines])
