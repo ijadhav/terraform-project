@@ -122,9 +122,17 @@ new payload keys so the agent uses them correctly:
   asking anything, and to ask specific, evidence-backed clarifying questions
   naming the actual candidate resources/attributes it found — instead of a
   bare numbered file-target picker — whenever a modification request names
-  a resource by description rather than an exact identifier.
+  a resource by description rather than an exact identifier. Also documents
+  the `content_summary`/`relevance_score` fields attached to each candidate
+  (see §5 below).
+- **Rule 12 — NEVER RETURN A BARE REFUSAL**: forbids a "cannot safely ground
+  exact names" style refusal when the selected file's content was already
+  supplied; requires parsing named sub-blocks (e.g. WAF `rule` blocks) and
+  asking a question that lists the actual identifiers found, and describes
+  the backend's best-effort rescue safety net (see §6 below) as a fallback,
+  not a substitute for asking well-formed questions in the first place.
 
-## 6. Bug fix: AWS `global` environment resolving to `minidev`
+## 4. Bug fix: AWS `global` environment resolving to `minidev`
 
 `detect_explicit_aws_environment` in `shared_code/terrabot_service.py` only
 recognized "global" when paired with "root" (`terraform/root/global`).
@@ -138,6 +146,72 @@ Fixed by adding an explicit `\bglobal\b` check (before the `minidev`/`bolt`/
 `dev` checks) that resolves to `terraform/dev_aws/global` by default, or
 `terraform/prod_aws/global` when the prompt also mentions "prod"/
 "production". Regression tests: `tests/test_aws_environment_resolution.py`.
+
+## 5. Fix: infra-target picker showed alphabetical files, not the relevant one
+
+Once the environment resolved correctly (§4), the modification-target
+picker could still fail the user: it showed the first several files in
+whatever order the upstream matcher returned (often alphabetical —
+`acm.tf, acm_pca.tf, awsconfig.tf, backend.tf, ...`) and never surfaced a
+file like `waf.tf` that actually declared the resource the request was
+about, because candidates were never re-sorted by relevance before being
+truncated to a handful.
+
+Fixed in `shared_code/terrabot_service.py`:
+- The candidates list is re-sorted by a freshly computed relevance score
+  (`_teams_semantic_candidate_score`) against the current prompt immediately
+  before the API response is built, so the most relevant file is first
+  regardless of how the upstream matcher ordered it.
+- Each candidate now carries `content_summary` — a one-line, evidence-based
+  description of what the file actually declares (`_teams_describe_tf_file_
+  contents`, extracted from real `resource`/`data`/`module`/`variable`
+  blocks in its content) — and `relevance_score`.
+- `shared_code/teams_bot.py` renders the picker ordered by `relevance_score`
+  when present, shows up to 15 candidates (previously a hard cap of 6) with
+  each one's `content_summary`, and notes how many more exist beyond that
+  cap.
+
+Tests: `tests/test_infra_target_candidate_ranking.py`.
+
+## 6. Rescuing bare "cannot safely ground exact names" refusals
+
+Even after the environment/picker fixes above, a modification request could
+still hit a dead end: the agent selects the correct file (e.g. `waf.tf`) but
+refuses with something like *"Cannot safely disable MCP waf rules yet
+because the exact MCP rule names are not grounded in the repository
+evidence"* instead of asking the user to pick from the named
+`rule { name = "..." }` blocks it already had in its context.
+
+`shared_code/terrabot_service.py::call_agent` now includes a best-effort
+rescue: if a reply looks like a bare grounding refusal (`_teams_looks_like_
+grounding_refusal`) and the selected file's live content was part of the
+same request (`_teams_extract_selected_file_contents`), the backend extracts
+named rule/resource identifiers from that content
+(`_teams_extract_candidate_rule_identifiers`) and rewrites the reply into a
+clarification that names them (`_teams_build_grounding_rescue_reply`), e.g.
+*"I found these candidates: `mcp-bot-control`, `mcp-rate-limit`,
+`aws_wafv2_web_acl.mcp`. Which one(s) should be disabled?"* instead of a
+dead end. This is a safety net only — `foundry-agent-instructions` rule 12
+requires the agent to ask this kind of question itself rather than relying
+on the backend to rewrite a refusal after the fact.
+
+Once the user answers with a specific identifier and generation succeeds,
+that turn is recorded into `agent_memory_store` exactly like any other
+`call_agent` turn (see §2.2) — no extra wiring was needed, because memory
+recording already happens for every reply, including the follow-up that
+resolves a clarification. A later request mentioning the same resource area
+(for example another "mcp waf" request in the same repository) will have
+this resolution available via `agent_memory_context`.
+
+**Known limitation**: the rescued reply is only what is returned to Teams;
+the underlying Foundry conversation still has the agent's own original
+refusal in its history (the rescue rewrites the outbound text after the
+model call, not the model's own turn). A capable model should still connect
+the user's next answer to the rescued question, but a stronger fix would
+require intercepting before the conversation item is written, which needs
+deeper changes to `_call_agent_base` than this pass makes.
+
+Tests: `tests/test_grounding_refusal_rescue.py`.
 
 ## 7. Duplicate/related pull-request awareness for infrastructure requests
 
@@ -159,7 +233,7 @@ not read automatically by the deployed agent). No agent-side code change is
 required beyond that: the new fields are additional JSON keys attached to
 the same request payload the agent already parses.
 
-## 4. Configuration reference
+## 8. Configuration reference
 
 | Setting | Default | Purpose |
 | --- | --- | --- |
@@ -174,7 +248,7 @@ Table Storage reuses the existing `TERRABOT_STATE_STORAGE_CONNECTION_STRING`
 / `TERRABOT_STATE_STORAGE_ACCOUNT_URL` settings; no new credentials are
 required if Teams workflow state durability is already configured.
 
-## 5. Testing
+## 9. Testing
 
 Pure-logic behavior for all three new modules is covered under `tests/`:
 
