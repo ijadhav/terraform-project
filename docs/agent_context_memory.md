@@ -111,6 +111,47 @@ new payload keys so the agent uses them correctly:
   `repo_chat_context`, `pull_request_context` from `pr_context`), how to cite
   them, and that they do not change the chat-mode output contract (plain
   text only, never Terraform/files/branches/PRs from a chat question).
+- **Rule 10 — RELATED_PULL_REQUESTS (duplicate-work check)**: explains the
+  `related_pull_requests` field attached to infrastructure requests
+  (creation, modification, and clarifications on the way to one), including
+  drafts, and how the agent should surface it without blocking generation on
+  its presence.
+- **Rule 11 — INTERACTIVE RESOURCE RESOLUTION**: requires the agent to
+  actually read every resource-related file in the resolved environment
+  (not only the fixed main.tf/variables.tf/backend.tf/outputs.tf set) before
+  asking anything, and to ask specific, evidence-backed clarifying questions
+  naming the actual candidate resources/attributes it found — instead of a
+  bare numbered file-target picker — whenever a modification request names
+  a resource by description rather than an exact identifier.
+
+## 6. Bug fix: AWS `global` environment resolving to `minidev`
+
+`detect_explicit_aws_environment` in `shared_code/terrabot_service.py` only
+recognized "global" when paired with "root" (`terraform/root/global`).
+A prompt such as "disable mcp waf rules in dev_aws global" matched none of
+the explicit environment checks (no `minidev`/`bolt`/standalone `dev` token),
+so `resolve_aws_environment_path` fell through to its `terraform/dev_aws/
+minidev` default — silently analyzing and proposing changes against the
+wrong environment folder.
+
+Fixed by adding an explicit `\bglobal\b` check (before the `minidev`/`bolt`/
+`dev` checks) that resolves to `terraform/dev_aws/global` by default, or
+`terraform/prod_aws/global` when the prompt also mentions "prod"/
+"production". Regression tests: `tests/test_aws_environment_resolution.py`.
+
+## 7. Duplicate/related pull-request awareness for infrastructure requests
+
+`shared_code/terrabot_service.py::handle_teams_chat_request` now wraps every
+infra-generation-facing response (`infra_preview`, `clarification`,
+`branch_created`) with `_teams_attach_related_pull_requests`, which looks up
+open pull requests (via `shared_code/pr_context.py`, which returns drafts
+too — GitHub's `state=open` includes draft PRs) on the resolved cloud's
+repository and attaches the best keyword matches as `related_pull_requests`
+/ `related_pull_requests_context`. `shared_code/teams_bot.py` renders these
+as a "Related pull request(s) already raised" section, including whether
+each match is a draft. This is informational only — Terrabot still proceeds
+with the requested generation unless the user says otherwise. Tests:
+`tests/test_related_pull_request_awareness.py`.
 
 After editing `foundry-agent-instructions`, re-sync it to the live Foundry
 agent's instructions field in the Azure AI Foundry portal (the file itself is
