@@ -5931,6 +5931,17 @@ def detect_explicit_aws_environment(prompt: str):
     if "bolt dr" in text or "bolt_dr" in text:
         return AWS_DEV_ENV_FOLDERS["bolt_dr"], None
 
+    # "global" is its own real environment folder (terraform/dev_aws/global or
+    # terraform/prod_aws/global) and must never fall through to the minidev
+    # default just because no other environment keyword matched. Without this
+    # check, a prompt such as "disable mcp waf rules in dev_aws global" fell
+    # all the way to resolve_aws_environment_path's minidev fallback because
+    # neither "minidev", "bolt", nor a standalone "dev" token matched.
+    if re.search(r"\bglobal\b", text):
+        if re.search(r"\bprod(?:uction)?\b", text):
+            return AWS_PROD_ENV_FOLDERS["global"], None
+        return AWS_DEV_ENV_FOLDERS["global"], None
+
     if re.search(r"\bminidev\b", text):
         return AWS_DEV_ENV_FOLDERS["minidev"], None
     if re.search(r"\bbolt\b", text):
@@ -5951,8 +5962,6 @@ def detect_explicit_aws_environment(prompt: str):
         return AWS_PROD_ENV_FOLDERS["sqlstaging_west"], None
     if "sqlstaging" in text:
         return AWS_PROD_ENV_FOLDERS["sqlstaging"], None
-    if "prod global" in text or "global prod" in text:
-        return AWS_PROD_ENV_FOLDERS["global"], None
     if "prod devops" in text or "devops prod" in text:
         return AWS_PROD_ENV_FOLDERS["devops"], None
 
