@@ -64,6 +64,36 @@ def test_attach_related_pull_requests_noop_when_no_match(monkeypatch):
     assert "related_pull_requests" not in result
 
 
+def test_handle_teams_chat_request_resolves_cloud_from_nested_router_field(monkeypatch):
+    """Regression: the infra_modification_target_selection clarification
+    response sets cloud only under result["router"]["cloud"], not a
+    top-level result["cloud"]. Without the router.cloud fallback, the
+    duplicate-PR check silently never ran for that response shape."""
+    monkeypatch.setattr(terrabot_service, "GITHUB_OWNER", "acme")
+    monkeypatch.setattr(terrabot_service, "GITHUB_AWS_REPO", "tf-devops")
+    fake_result = {
+        "mode": "clarification",
+        "decision_state": "infra_modification_target_selection",
+        "router": {"request_type": "infra", "cloud": "aws", "workflow": "aws_infra_modification"},
+        "ok": False,
+    }
+
+    with patch.object(
+        terrabot_service,
+        "_TEAMS_PR_DUPLICATE_CHECK_PREVIOUS_HANDLE_CHAT",
+        return_value=(fake_result, 400),
+    ), patch(
+        "shared_code.pr_context.list_open_pull_requests",
+        return_value=[DRAFT_PR],
+    ):
+        result, status_code = terrabot_service.handle_teams_chat_request(
+            {"prompt": "disable mcp waf rules in dev_aws global"}
+        )
+
+    assert status_code == 400
+    assert result["related_pull_requests"][0]["number"] == 77
+
+
 def test_handle_teams_chat_request_attaches_related_prs_for_infra_preview(monkeypatch):
     monkeypatch.setattr(terrabot_service, "GITHUB_OWNER", "acme")
     monkeypatch.setattr(terrabot_service, "GITHUB_AWS_REPO", "tf-devops")

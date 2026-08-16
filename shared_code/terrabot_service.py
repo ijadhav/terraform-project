@@ -19676,6 +19676,22 @@ def handle_chat_request(data: dict):
                             ticket_link=ticket_link,
                             ticket_title=ticket_title,
                         )
+                        # Always re-sort by fresh relevance to the CURRENT prompt
+                        # before building the picker. Upstream builders may
+                        # return matched_files in directory/alphabetical order
+                        # (e.g. after live-environment-folder expansion); without
+                        # this the picker showed the first N files alphabetically
+                        # (acm.tf, backend.tf, ...) instead of the file that
+                        # actually matches the requested resource (e.g. waf.tf
+                        # for "disable mcp waf rules"), even when that file was
+                        # present further down the unsorted list.
+                        _ranked_matched_files = sorted(
+                            matched_files,
+                            key=lambda item: (
+                                -_teams_semantic_candidate_score(effective_prompt, item)[0],
+                                str(item.get("path") or ""),
+                            ),
+                        )
                         return {
                             "ok": False,
                             "mode": "clarification",
@@ -19707,8 +19723,14 @@ def handle_chat_request(data: dict):
                                         for block in (item.get("matched_blocks") or [])
                                         if isinstance(block, dict) and block.get("header")
                                     ],
+                                    # A one-line, evidence-based description of what
+                                    # the file actually declares, so the Teams picker
+                                    # tells the user what is inside every environment
+                                    # file instead of only its path.
+                                    "content_summary": _teams_describe_tf_file_contents(item),
+                                    "relevance_score": _teams_semantic_candidate_score(effective_prompt, item)[0],
                                 }
-                                for index, item in enumerate(matched_files)
+                                for index, item in enumerate(_ranked_matched_files)
                             ],
                         }, 400
                 retrieved_value_context = _remove_backend_existing_infra_contexts(retrieved_value_context)
@@ -32926,6 +32948,45 @@ def _teams_candidate_identifiers(item: dict) -> list[str]:
     return list(dict.fromkeys(str(value).strip() for value in values if str(value).strip()))[:120]
 
 
+def _teams_describe_tf_file_contents(item: dict) -> str:
+    """One-line, evidence-based description of what a .tf file declares.
+
+    Used so the Teams infrastructure-target picker tells the user what is
+    actually inside each candidate file (not just its path), and so a file
+    whose declared resources match the request's wording (for example a WAF
+    resource for a "disable ... waf ..." request) is identifiable at a
+    glance instead of requiring the user to open every candidate.
+    """
+    content = str(item.get("content") or "")
+    if not content:
+        blocks = [
+            str(block.get("header") or "").strip()
+            for block in (item.get("matched_blocks") or [])
+            if isinstance(block, dict) and str(block.get("header") or "").strip()
+        ]
+        return ("Matches: " + ", ".join(dict.fromkeys(blocks[:4]))) if blocks else ""
+
+    declarations: list[str] = []
+    for match in re.finditer(
+        r'(?m)^\s*(resource|data|module)\s+"([^"]+)"(?:\s+"([^"]+)")?',
+        content,
+    ):
+        kind, type_or_name, name = match.groups()
+        label = f"{type_or_name}.{name}" if name else type_or_name
+        declarations.append(f"{kind} {label}")
+        if len(declarations) >= 6:
+            break
+    if declarations:
+        return "Defines: " + ", ".join(dict.fromkeys(declarations))
+
+    variables = re.findall(r'(?m)^\s*variable\s+"([^"]+)"', content)
+    if variables:
+        summary = "Declares variables: " + ", ".join(dict.fromkeys(variables))
+        return summary[:220]
+
+    return ""
+
+
 def _teams_semantic_candidate_score(prompt: str, item: dict) -> tuple[int, list[str]]:
     prompt_tokens = _teams_semantic_tokens(prompt)
     if not prompt_tokens:
@@ -33772,8 +33833,10 @@ def handle_teams_chat_request(data: dict):
     result = dict(result or {})
 
     mode = str(result.get("mode") or "").strip().lower()
+    router_cloud = str((result.get("router") or {}).get("cloud") or "").strip()
     cloud = str(
         result.get("cloud")
+        or router_cloud
         or request_data.get("requested_cloud")
         or request_data.get("cloud")
         or ""
