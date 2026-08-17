@@ -173,35 +173,58 @@ Fixed in `shared_code/terrabot_service.py`:
 
 Tests: `tests/test_infra_target_candidate_ranking.py`.
 
-## 6. Rescuing bare "cannot safely ground exact names" refusals
+## 6. Rescuing bare "cannot safely ground exact names" refusals (guaranteed, never a dead end)
 
 Even after the environment/picker fixes above, a modification request could
 still hit a dead end: the agent selects the correct file (e.g. `waf.tf`) but
 refuses with something like *"Cannot safely disable MCP waf rules yet
-because the exact MCP rule names are not grounded in the repository
-evidence"* instead of asking the user to pick from the named
-`rule { name = "..." }` blocks it already had in its context.
+because the exact MCP rule identifiers are not grounded in the repository
+evidence"* instead of asking the user to pick from the parameters it
+already had in its context.
 
-`shared_code/terrabot_service.py::call_agent` now includes a best-effort
-rescue: if a reply looks like a bare grounding refusal (`_teams_looks_like_
-grounding_refusal`) and the selected file's live content was part of the
-same request (`_teams_extract_selected_file_contents`), the backend extracts
-named rule/resource identifiers from that content
-(`_teams_extract_candidate_rule_identifiers`) and rewrites the reply into a
-clarification that names them (`_teams_build_grounding_rescue_reply`), e.g.
-*"I found these candidates: `mcp-bot-control`, `mcp-rate-limit`,
-`aws_wafv2_web_acl.mcp`. Which one(s) should be disabled?"* instead of a
-dead end. This is a safety net only — `foundry-agent-instructions` rule 12
-requires the agent to ask this kind of question itself rather than relying
-on the backend to rewrite a refusal after the fact.
+`shared_code/terrabot_service.py::call_agent` includes a rescue that now
+**guarantees** the user is never left with this bare refusal:
+
+1. `_teams_looks_like_grounding_refusal` detects the refusal shape.
+2. File content is recovered two ways: `_teams_extract_selected_file_
+   contents` first (entries explicitly marked "selected"), then
+   `_teams_extract_any_file_contents` as a broader fallback that recovers
+   content from **any** file-like entry in the payload — including plain
+   `candidates` list entries that were never marked "selected" (this is the
+   fix for the case where the picker's candidate list did not carry a
+   `selection_state`).
+3. `_teams_extract_candidate_rule_identifiers` understands "rule" the way
+   this repository actually uses it — **primarily a Boolean parameter/flag**
+   (`name = true` / `name = false`), per explicit product guidance, ranked
+   by overlap with the request's own wording (a request about "mcp waf"
+   surfaces `mcp_waf_bot_control_enabled` ahead of an unrelated flag in the
+   same file) — and only falls back to nested `rule { name = "..." }` blocks
+   or bare `resource`/`data` declarations when no Boolean parameters are
+   found.
+4. If named identifiers were found, `_teams_build_grounding_rescue_reply`
+   asks the user to pick among them, e.g. *"I found these candidates:
+   `mcp_waf_bot_control_enabled`, `mcp_rate_limit_enabled`. Which one(s)
+   should be set to `false`?"*
+5. **If nothing could be extracted at all**, `_teams_build_generic_
+   clarification_reply` still returns an interactive question instead of the
+   refusal — this is the guarantee: the user is never shown the bare
+   "cannot safely"/"not grounded" text again, worst case they get a generic
+   "please name the specific rule/parameter" question instead.
+
+This is a safety net; `foundry-agent-instructions` rules 12–13 require the
+agent to ask this kind of question itself (and to understand "rule" as a
+Boolean parameter first) rather than relying on the backend to rewrite a
+refusal after the fact.
 
 Once the user answers with a specific identifier and generation succeeds,
 that turn is recorded into `agent_memory_store` exactly like any other
-`call_agent` turn (see §2.2) — no extra wiring was needed, because memory
-recording already happens for every reply, including the follow-up that
-resolves a clarification. A later request mentioning the same resource area
-(for example another "mcp waf" request in the same repository) will have
-this resolution available via `agent_memory_context`.
+`call_agent` turn (see §2.2), now additionally tagged with `topic_tags`
+(e.g. `["waf", "mcp", "disable"]`) extracted from the prompt/response. A
+later request mentioning the same topic (e.g. another "mcp waf" question)
+is retrieved by topical relevance, not just recency — see §2.2's
+`get_combined_memory_context(..., prompt=...)` — so the resolution "waf mcp
+rules → `mcp_waf_bot_control_enabled`" surfaces even if unrelated requests
+happened in between.
 
 **Known limitation**: the rescued reply is only what is returned to Teams;
 the underlying Foundry conversation still has the agent's own original
@@ -213,19 +236,46 @@ deeper changes to `_call_agent_base` than this pass makes.
 
 Tests: `tests/test_grounding_refusal_rescue.py`.
 
-## 7. Duplicate/related pull-request awareness for infrastructure requests
+## 7. Duplicate/related pull-request awareness for infrastructure requests (always checked)
 
-`shared_code/terrabot_service.py::handle_teams_chat_request` now wraps every
-infra-generation-facing response (`infra_preview`, `clarification`,
-`branch_created`) with `_teams_attach_related_pull_requests`, which looks up
-open pull requests (via `shared_code/pr_context.py`, which returns drafts
-too — GitHub's `state=open` includes draft PRs) on the resolved cloud's
-repository and attaches the best keyword matches as `related_pull_requests`
-/ `related_pull_requests_context`. `shared_code/teams_bot.py` renders these
-as a "Related pull request(s) already raised" section, including whether
-each match is a draft. This is informational only — Terrabot still proceeds
-with the requested generation unless the user says otherwise. Tests:
-`tests/test_related_pull_request_awareness.py`.
+`shared_code/terrabot_service.py::handle_teams_chat_request` wraps every
+infra-generation-facing response with `_teams_attach_related_pull_requests`,
+which looks up open pull requests (via `shared_code/pr_context.py`, which
+returns drafts too — GitHub's `state=open` includes draft PRs) on the
+resolved cloud's repository and attaches the best keyword matches as
+`related_pull_requests` / `related_pull_requests_context`.
+
+The trigger condition is intentionally broad — not a fixed mode whitelist —
+so the check always runs whenever the request is infrastructure-flavored:
+
+```python
+is_infra_flavored = (
+    mode in {"infra_preview", "clarification", "branch_created"}
+    or decision_state in {
+        "infra_modification_target_selection", "aws_module_selection", "azure_module_branch_selection",
+    }
+    or router_request_type == "infra"
+)
+```
+
+`shared_code/teams_bot.py` renders matches as a "Related pull request(s)
+already raised" section, including whether each match is a draft. This is
+informational only — Terrabot still proceeds with the requested generation
+unless the user says otherwise. `foundry-agent-instructions` rule 14 tells
+the agent to always mention `related_pull_requests` when present, including
+drafts, and to re-check once the cloud/repo is resolved if it was not
+supplied on an earlier turn.
+
+If a duplicate/draft PR still is not detected for a request that clearly has
+one, use the `TEAMS-PR-CHECK-*` log lines (see §10) to see exactly why: no
+repository resolved for the cloud, no prompt available, zero open PRs
+returned from GitHub (check `pr_context: fetched N pull request(s)` — zero
+here usually means a token/permissions/repo-name problem, not a matching
+problem), or zero matched despite PRs being fetched (a genuine keyword-
+overlap miss — compare the logged `prompt_tokens` against the PR's actual
+title/branch text).
+
+Tests: `tests/test_related_pull_request_awareness.py`.
 
 After editing `foundry-agent-instructions`, re-sync it to the live Foundry
 agent's instructions field in the Azure AI Foundry portal (the file itself is
@@ -250,12 +300,51 @@ required if Teams workflow state durability is already configured.
 
 ## 9. Testing
 
-Pure-logic behavior for all three new modules is covered under `tests/`:
+Pure-logic behavior for all new modules/fixes is covered under `tests/`:
 
 * `tests/test_agent_memory_store.py`
 * `tests/test_pr_context.py`
 * `tests/test_repo_chat_context.py`
+* `tests/test_aws_environment_resolution.py`
+* `tests/test_infra_target_candidate_ranking.py`
+* `tests/test_grounding_refusal_rescue.py`
+* `tests/test_related_pull_request_awareness.py`
 
 These tests avoid real network/table-storage calls (monkeypatching the
 GitHub-calling functions and forcing the Table Storage backend off) so they
 run offline and deterministically.
+
+## 10. Logging reference (for debugging this workflow in production)
+
+Every new subsystem added by this workflow logs at INFO level (WARNING/
+ERROR for failures) with a distinct, greppable prefix, alongside the
+pre-existing `TEAMS-DIAG-*` transport-layer logs in `shared_code/teams_bot.py`
+and the existing generation/validation logs elsewhere in
+`shared_code/terrabot_service.py`. Grep any Function App log stream for
+these prefixes to trace one request end-to-end:
+
+| Prefix | Where | What it tells you |
+| --- | --- | --- |
+| `TEAMS-AGENT-CALL-1/2/3/RETRY/ERROR` | `terrabot_service.call_agent` | Every prompt sent to the Foundry agent and the reply received, including a byte count, a preview of both, whether the reply looks like a bare refusal, and whether a rescue (see below) was applied. |
+| `TEAMS-MEMORY-1/2/3/ERROR` | `terrabot_service._teams_attach_agent_memory_context` / `_teams_record_agent_memory_turn` | Whether cached memory was found and attached before a call, and confirmation (with topic tags) after a turn is recorded. |
+| `agent_memory: recorded turn ...` / `agent_memory: ... context lookup ...` | `shared_code/agent_memory_store.py` | Low-level cache reads/writes: which key, how many entries, whether relevance-ranking was used, resulting character count. |
+| `TEAMS-RESCUE-1/2/3/4/ERROR` | `terrabot_service._teams_maybe_rescue_grounding_refusal` | When a bare refusal was detected, which file-recovery mode succeeded (`selected` vs `any-file-fallback`), which files were recovered, and whether named identifiers were found or the generic fallback question was used instead. |
+| `TEAMS-PR-CHECK-TRIGGER/SKIP/ERROR` | `terrabot_service.handle_teams_chat_request` / `_teams_attach_related_pull_requests` | Whether the duplicate/related-PR check ran for this response, and why it was skipped when it was (missing prompt, unresolved cloud, or the response was not infra-flavored). |
+| `pr_context: searching/fetched/matched/found/no related` | `shared_code/pr_context.py` | The actual GitHub call outcome: how many open PRs were fetched (zero here usually means a token/permissions/repo-name problem), how many matched the prompt by keyword overlap, and the final PR numbers/draft flags. |
+| `repo_chat_context: searching/listed/candidate/fetched/no file` | `shared_code/repo_chat_context.py` | Live-repository Q&A evidence gathering for Teams plain-language questions: tree size scanned, which paths matched by keyword, which files were actually fetched. |
+
+Example trace for one "disable mcp waf rules" request:
+
+```
+TEAMS-AGENT-CALL-1[...]: sending prompt to Foundry agent ... effective_prompt='disable mcp waf rules in dev_aws global'
+TEAMS-MEMORY-1: no cached agent memory available for conversation=... cloud=aws repo_target=tf-devops
+TEAMS-AGENT-CALL-2[...]: Foundry agent responded ... looks_like_refusal=True
+TEAMS-RESCUE-2: grounding refusal detected, attempting rescue ... extraction_mode=any-file-fallback files_recovered=['terraform/dev_aws/global/waf.tf']
+TEAMS-RESCUE-3: rescued refusal with named identifiers from recovered file content.
+TEAMS-MEMORY-3: recorded agent turn to memory cache ... topic_tags=['disable', 'mcp', 'waf', 'rules', 'dev_aws', 'global']
+TEAMS-PR-CHECK-TRIGGER: checking for a related/duplicate pull request mode=clarification ...
+pr_context: searching for pull requests repo=venasolutions/tf-devops state=open token_configured=True
+pr_context: fetched 12 pull request(s) for venasolutions/tf-devops (3 draft)
+pr_context: matched 1 of 12 pull request(s) against prompt_tokens=[...] (best_score=26)
+TEAMS-PR-CHECK: found 1 related pull request(s) (including drafts) ... numbers=[142] draft_flags=[True]
+```
