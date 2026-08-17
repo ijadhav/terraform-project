@@ -116,9 +116,62 @@ def test_maybe_rescue_grounding_refusal_produces_named_choices():
     assert "waf.tf" in payload["analysis"]
 
 
-def test_maybe_rescue_grounding_refusal_returns_none_without_selected_content():
+def test_maybe_rescue_grounding_refusal_falls_back_to_generic_question_without_file_content():
+    """Even with no recoverable file content at all, the user must never be
+    left with the bare refusal — a still-interactive generic question is
+    the guaranteed worst case."""
     agent_input = json.dumps({"user_request": "disable mcp waf rules in dev_aws global"})
-    assert terrabot_service._teams_maybe_rescue_grounding_refusal(agent_input, REFUSAL) is None
+    rescued = terrabot_service._teams_maybe_rescue_grounding_refusal(agent_input, REFUSAL)
+    assert rescued is not None
+    payload = json.loads(rescued)
+    assert "?" not in REFUSAL  # sanity: original refusal is not itself a question
+    assert payload["questions"]
+    assert "disable mcp waf rules in dev_aws global" in payload["questions"][0]
+
+
+BOOLEAN_PARAMETER_CONTENT = """
+variable "mcp_waf_bot_control_enabled" {
+  default = true
+}
+
+mcp_waf_bot_control_enabled = true
+mcp_rate_limit_enabled      = true
+some_unrelated_flag         = false
+"""
+
+
+def test_extract_candidate_rule_identifiers_prioritizes_prompt_relevant_boolean_parameters():
+    """"Rules" are usually Boolean parameters in this repository convention
+    (per explicit product guidance), and the one whose name overlaps the
+    user's wording (waf/mcp) must be prioritized over an unrelated flag."""
+    identifiers = terrabot_service._teams_extract_candidate_rule_identifiers(
+        BOOLEAN_PARAMETER_CONTENT, prompt="disable mcp waf rules"
+    )
+    names_in_order = [item["identifier"] for item in identifiers if item["kind"] == "parameter"]
+    assert "mcp_waf_bot_control_enabled" in names_in_order
+    assert names_in_order.index("mcp_waf_bot_control_enabled") < names_in_order.index("some_unrelated_flag")
+
+
+def test_extract_candidate_rule_identifiers_boolean_parameters_include_current_value():
+    identifiers = terrabot_service._teams_extract_candidate_rule_identifiers(
+        BOOLEAN_PARAMETER_CONTENT, prompt="disable mcp waf rules"
+    )
+    mcp_item = next(item for item in identifiers if item["identifier"] == "mcp_waf_bot_control_enabled")
+    assert mcp_item["current_value"] == "true"
+
+
+def test_extract_any_file_contents_recovers_unmarked_candidate_files():
+    """Regression: the picker's candidate list did not always mark an entry
+    "selected"; the broader fallback extractor must still recover its
+    content so a rescue is possible."""
+    payload = {
+        "candidates": [
+            {"path": "terraform/dev_aws/global/waf.tf", "content": BOOLEAN_PARAMETER_CONTENT},
+        ]
+    }
+    found = terrabot_service._teams_extract_any_file_contents(payload)
+    assert found
+    assert found[0][0] == "terraform/dev_aws/global/waf.tf"
 
 
 def test_maybe_rescue_grounding_refusal_returns_none_for_non_refusal_reply():
