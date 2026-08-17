@@ -28,6 +28,7 @@ from typing import Any, Dict, List, Optional
 import requests
 
 LOGGER = logging.getLogger("terrabot.repo_chat_context")
+LOGGER.setLevel(logging.INFO)
 
 GITHUB_API = "https://api.github.com"
 DEFAULT_TIMEOUT = 20
@@ -81,12 +82,14 @@ def list_repo_tree_paths(
 
     entries = payload.get("tree") if isinstance(payload, dict) else None
     if not isinstance(entries, list):
+        LOGGER.warning("repo_chat_context: no tree entries returned for %s/%s@%s", owner, repo, branch)
         return []
     paths = [
         str(entry.get("path") or "")
         for entry in entries
         if isinstance(entry, dict) and entry.get("type") == "blob" and entry.get("path")
     ]
+    LOGGER.info("repo_chat_context: listed %s file(s) in %s/%s@%s", len(paths), owner, repo, branch)
     return paths[:MAX_TREE_ENTRIES]
 
 
@@ -185,10 +188,21 @@ def build_live_repo_chat_context(
         - ``context_block``: formatted string ready to attach to the agent
           input, or "" when no relevant file was found.
     """
+    LOGGER.info(
+        "repo_chat_context: searching live repository for chat grounding repo=%s/%s@%s prompt_preview=%r",
+        owner, repo, branch, str(prompt or "")[:120],
+    )
     tree_paths = list_repo_tree_paths(owner, repo, branch=branch, token=token)
     relevant_paths = find_relevant_repo_files(prompt, tree_paths, max_files=max_files)
     if not relevant_paths:
+        LOGGER.info(
+            "repo_chat_context: no file in %s/%s@%s matched the question keywords (scanned %s file(s))",
+            owner, repo, branch, len(tree_paths),
+        )
         return {"paths": [], "context_block": ""}
+    LOGGER.info(
+        "repo_chat_context: candidate file(s) matched by keyword overlap: %s", relevant_paths,
+    )
 
     sections = [
         f"LIVE REPOSITORY CONTEXT repo={owner}/{repo}@{branch}: the file "
@@ -206,6 +220,13 @@ def build_live_repo_chat_context(
         sections.append(f"--- {path} ---\n{content}")
 
     if not fetched_paths:
+        LOGGER.warning(
+            "repo_chat_context: matched %s path(s) but could not fetch content for any of them: %s",
+            len(relevant_paths), relevant_paths,
+        )
         return {"paths": [], "context_block": ""}
 
+    LOGGER.info(
+        "repo_chat_context: fetched content for %s file(s) for chat grounding: %s", len(fetched_paths), fetched_paths,
+    )
     return {"paths": fetched_paths, "context_block": "\n\n".join(sections)}

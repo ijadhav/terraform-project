@@ -66,6 +66,14 @@ except ImportError:  # pragma: no cover - already a hard dependency in prod
 
 
 LOGGER = logging.getLogger("terrabot.agent_memory")
+LOGGER.setLevel(logging.INFO)
+
+_TOPIC_STOPWORDS = {
+    "the", "a", "an", "and", "or", "for", "to", "in", "on", "of", "is",
+    "are", "with", "using", "create", "add", "new", "please", "can",
+    "you", "existing", "current", "this", "that", "terraform", "infra",
+    "infrastructure", "set", "yet", "now", "should", "would", "could",
+}
 
 MEMORY_TABLE_NAME = (os.getenv("TERRABOT_AGENT_MEMORY_TABLE") or "TerrabotAgentMemory").strip()
 MEMORY_TABLE_PARTITION = "agent-context-memory"
@@ -347,6 +355,26 @@ def _append_entry(key: str, entry: dict) -> None:
             _compact_file_if_needed(key)
 
 
+def extract_topic_tags(*texts: str, limit: int = 12) -> List[str]:
+    """Derive short topic tags (e.g. "waf", "mcp") from prompt/response text.
+
+    Used so a resolved concept — for example "mcp waf rules" resolving to a
+    specific parameter — can be retrieved by topical relevance later, not
+    only by recency. Pure/deterministic so it is easy to unit test.
+    """
+    tags: List[str] = []
+    seen: set = set()
+    for text in texts:
+        for token in re.findall(r"[a-z0-9][a-z0-9_-]{2,}", str(text or "").lower()):
+            if token in _TOPIC_STOPWORDS or token in seen:
+                continue
+            seen.add(token)
+            tags.append(token)
+            if len(tags) >= limit:
+                return tags
+    return tags
+
+
 def build_memory_entry(
     *,
     prompt: str = "",
@@ -359,9 +387,11 @@ def build_memory_entry(
     context_retrieved_summary: str = "",
     code_generated_summary: str = "",
     response_summary: str = "",
+    topic_tags: Optional[List[str]] = None,
     extra: Optional[Dict[str, Any]] = None,
 ) -> dict:
     """Build the structured record persisted for one agent turn."""
+    resolved_tags = list(topic_tags) if topic_tags else extract_topic_tags(prompt, response_summary)
     entry = {
         "at": _now(),
         "prompt": _clean(prompt, 800),
@@ -374,6 +404,7 @@ def build_memory_entry(
         "context_retrieved_summary": _clean(context_retrieved_summary, MAX_FIELD_CHARS),
         "code_generated_summary": _clean(code_generated_summary, MAX_FIELD_CHARS),
         "response_summary": _clean(response_summary, MAX_FIELD_CHARS),
+        "topic_tags": _clean_list(resolved_tags, limit=12, item_limit=48),
     }
     if isinstance(extra, dict):
         entry["extra"] = {str(k): _clean(v, 300) for k, v in list(extra.items())[:10]}
@@ -393,6 +424,7 @@ def record_agent_turn(
     context_retrieved_summary: str = "",
     code_generated_summary: str = "",
     response_summary: str = "",
+    topic_tags: Optional[List[str]] = None,
     extra: Optional[Dict[str, Any]] = None,
 ) -> dict:
     """Append one agent turn to both the conversation and centralized memory.
@@ -411,22 +443,36 @@ def record_agent_turn(
         context_retrieved_summary=context_retrieved_summary,
         code_generated_summary=code_generated_summary,
         response_summary=response_summary,
+        topic_tags=topic_tags,
         extra=extra,
     )
 
     conv_key = _conversation_key(conversation_id)
+    central_key = _centralized_key(cloud, repo_target)
+
     if conv_key:
         try:
             _append_entry(conv_key, entry)
         except Exception:
-            LOGGER.exception("Unable to record conversation agent memory")
+            LOGGER.exception("agent_memory: unable to record conversation turn key_hash=%s", _row_key(conv_key)[:12])
 
-    central_key = _centralized_key(cloud, repo_target)
     if central_key:
         try:
             _append_entry(central_key, entry)
         except Exception:
-            LOGGER.exception("Unable to record centralized agent memory")
+            LOGGER.exception("agent_memory: unable to record centralized turn key_hash=%s", _row_key(central_key)[:12])
+
+    LOGGER.info(
+        "agent_memory: recorded turn conversation=%s cloud=%s repo_target=%s topic_tags=%s "
+        "prompt_chars=%s files_searched=%s cache_file=%s",
+        _row_key(conv_key)[:12] if conv_key else "",
+        cloud or "",
+        repo_target or "",
+        entry.get("topic_tags") or [],
+        len(entry.get("prompt") or ""),
+        len(entry.get("files_searched") or []),
+        str(CACHE_FILE_PATH),
+    )
 
     return entry
 
@@ -466,16 +512,60 @@ def _format_entries(entries: List[dict], max_chars: int) -> str:
     return "\n".join(lines)
 
 
+def _rank_entries_by_relevance(entries: List[dict], prompt: str) -> List[dict]:
+    """Reorder cached entries so ones topically relevant to ``prompt`` are
+    considered first, falling back to recency when nothing is relevant.
+
+    This is what lets "what are the mcp waf rules?" retrieve an earlier
+    "disable mcp waf rules" resolution even when many unrelated turns were
+    cached in between, instead of only ever surfacing the most recent N
+    turns regardless of topic.
+    """
+    if not entries:
+        return []
+    prompt_tags = set(extract_topic_tags(prompt))
+    if not prompt_tags:
+        return list(entries)
+
+    def _score(entry: dict) -> int:
+        entry_tags = set(entry.get("topic_tags") or [])
+        return len(entry_tags & prompt_tags)
+
+    scored = [(index, _score(entry), entry) for index, entry in enumerate(entries)]
+    # Stable: relevance first (descending), recency (original/insertion
+    # order, oldest-first) as the tiebreaker so _format_entries' "reversed()"
+    # rendering still shows the most relevant-and-recent entry last/closest
+    # to the live prompt.
+    scored.sort(key=lambda item: (-item[1], item[0]))
+    ranked = [entry for _index, score, entry in scored if score > 0]
+    if not ranked:
+        return list(entries)
+    # Keep any non-matching entries after the relevant ones so context is
+    # never silently smaller than the recency-only behavior would provide.
+    relevant_ids = {id(entry) for entry in ranked}
+    ranked.extend(entry for entry in entries if id(entry) not in relevant_ids)
+    return ranked
+
+
 def get_conversation_memory_context(
     conversation_id: str,
     max_entries: int = 8,
     max_chars: int = MAX_CONTEXT_CHARS,
+    prompt: str = "",
 ) -> str:
     key = _conversation_key(conversation_id)
     if not key:
         return ""
-    entries = _read_entries(key)[-max_entries:]
-    return _format_entries(entries, max_chars)
+    entries = _read_entries(key)
+    if prompt:
+        entries = _rank_entries_by_relevance(entries, prompt)
+    entries = entries[-max_entries:] if not prompt else entries[:max_entries]
+    block = _format_entries(entries, max_chars)
+    LOGGER.info(
+        "agent_memory: conversation context lookup key_hash=%s entries_found=%s relevance_ranked=%s chars=%s",
+        _row_key(key)[:12], len(entries), bool(prompt), len(block),
+    )
+    return block
 
 
 def get_centralized_memory_context(
@@ -483,12 +573,22 @@ def get_centralized_memory_context(
     repo_target: str,
     max_entries: int = 6,
     max_chars: int = MAX_CONTEXT_CHARS,
+    prompt: str = "",
 ) -> str:
     key = _centralized_key(cloud, repo_target)
     if not key:
         return ""
-    entries = _read_entries(key)[-max_entries:]
-    return _format_entries(entries, max_chars)
+    entries = _read_entries(key)
+    if prompt:
+        entries = _rank_entries_by_relevance(entries, prompt)
+    entries = entries[-max_entries:] if not prompt else entries[:max_entries]
+    block = _format_entries(entries, max_chars)
+    LOGGER.info(
+        "agent_memory: centralized context lookup cloud=%s repo_target=%s entries_found=%s "
+        "relevance_ranked=%s chars=%s",
+        cloud or "", repo_target or "", len(entries), bool(prompt), len(block),
+    )
+    return block
 
 
 def get_combined_memory_context(
@@ -497,16 +597,23 @@ def get_combined_memory_context(
     cloud: str = "",
     repo_target: str = "",
     max_chars: int = MAX_CONTEXT_CHARS,
+    prompt: str = "",
 ) -> str:
     """Build the full memory block to attach to an agent request.
 
     Combines this conversation's own history with the centralized history
     for the same cloud/repo-target (other users' cached activity), bounded
-    to ``max_chars`` total. Returns "" when there is nothing cached.
+    to ``max_chars`` total. Returns "" when there is nothing cached. When
+    ``prompt`` is supplied, entries are ranked by topical relevance to it
+    first (see :func:`_rank_entries_by_relevance`) rather than only recency,
+    so a later request about the same topic (e.g. "mcp waf rules") can
+    retrieve an earlier resolution even if other turns happened in between.
     """
     half = max(500, max_chars // 2)
-    conversation_block = get_conversation_memory_context(conversation_id, max_chars=half)
-    centralized_block = get_centralized_memory_context(cloud, repo_target, max_chars=max_chars - half)
+    conversation_block = get_conversation_memory_context(conversation_id, max_chars=half, prompt=prompt)
+    centralized_block = get_centralized_memory_context(
+        cloud, repo_target, max_chars=max_chars - half, prompt=prompt
+    )
 
     sections = []
     if conversation_block:

@@ -29340,17 +29340,40 @@ def _teams_attach_agent_memory_context(agent_input: str, active: dict) -> str:
     unchanged so memory caching can never break generation.
     """
     try:
+        prompt_for_relevance = str(
+            active.get("effective_prompt")
+            or json.loads(agent_input).get("user_request", "")
+            or ""
+        )
+    except Exception:
+        prompt_for_relevance = str(active.get("effective_prompt") or "")
+    try:
         memory_context = agent_memory_store.get_combined_memory_context(
             conversation_id=str(active.get("teams_conversation_id") or ""),
             cloud=str(active.get("cloud") or ""),
             repo_target=str(active.get("repo_target") or ""),
+            prompt=prompt_for_relevance,
         )
         if not memory_context:
+            LOGGER.info(
+                "TEAMS-MEMORY-1: no cached agent memory available for conversation=%s cloud=%s repo_target=%s",
+                str(active.get("teams_conversation_id") or ""),
+                str(active.get("cloud") or ""),
+                str(active.get("repo_target") or ""),
+            )
             return agent_input
         payload = json.loads(agent_input)
         if not isinstance(payload, dict):
             return agent_input
         payload["agent_memory_context"] = memory_context
+        LOGGER.info(
+            "TEAMS-MEMORY-2: attached %s char(s) of cached agent memory to the outgoing agent input "
+            "(cloud=%s repo_target=%s topically_ranked=%s)",
+            len(memory_context),
+            str(active.get("cloud") or ""),
+            str(active.get("repo_target") or ""),
+            bool(prompt_for_relevance),
+        )
         return json.dumps(payload, ensure_ascii=False)
     except Exception:
         LOGGER.debug("Skipping agent memory context attachment", exc_info=True)
@@ -29412,9 +29435,19 @@ def _teams_record_agent_memory_turn(active: dict, agent_input: str, reply: str) 
             ),
             code_generated_summary=code_generated_summary,
             response_summary=str(reply or "")[:1500],
+            topic_tags=agent_memory_store.extract_topic_tags(prompt, reply),
+        )
+        LOGGER.info(
+            "TEAMS-MEMORY-3: recorded agent turn to memory cache conversation=%s cloud=%s repo_target=%s "
+            "prompt_preview=%r topic_tags=%s",
+            str(active.get("teams_conversation_id") or ""),
+            str(active.get("cloud") or ""),
+            str(active.get("repo_target") or ""),
+            prompt[:160],
+            agent_memory_store.extract_topic_tags(prompt, reply),
         )
     except Exception:
-        LOGGER.debug("Skipping agent memory turn recording", exc_info=True)
+        LOGGER.exception("TEAMS-MEMORY-ERROR: skipping agent memory turn recording due to an unexpected error")
 
 
 def _extract_json_payload_for_memory(value: str) -> dict:
@@ -29439,6 +29472,14 @@ _GROUNDING_REFUSAL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# "Rule" in an enable/disable request almost always maps to a repository
+# Boolean parameter/flag (e.g. `mcp_waf_bot_control_enabled = true`), not a
+# Terraform-native nested block. This mirrors foundry-agent-instructions
+# rule 13: understand "rule" as a parameter set to true/false first.
+_BOOLEAN_ASSIGNMENT_RE = re.compile(
+    r'(?m)^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(true|false)\b'
+)
+
 
 def _teams_looks_like_grounding_refusal(reply: str) -> bool:
     """True when a modification-generation reply is a bare refusal instead
@@ -29448,8 +29489,9 @@ def _teams_looks_like_grounding_refusal(reply: str) -> bool:
     are not grounded in the repository evidence" are usually the wrong
     answer: the agent already had the selected file's content in its
     context and should have asked the user to pick from the actual
-    rule/resource identifiers declared there instead of refusing outright.
-    A reply that already asks a real question (contains "?") is left alone.
+    rule/resource/parameter identifiers declared there instead of refusing
+    outright. A reply that already asks a real question (contains "?") is
+    left alone.
     """
     text = str(reply or "")
     if not text or "?" in text:
@@ -29458,12 +29500,8 @@ def _teams_looks_like_grounding_refusal(reply: str) -> bool:
 
 
 def _teams_extract_selected_file_contents(payload: Any, max_files: int = 3) -> list[tuple[str, str]]:
-    """Best-effort recursive search for the selected/target file(s)' live
-    content inside an agent-input payload.
-
-    Used to rescue a grounding refusal with real repository evidence
-    instead of leaving the user at a dead end when the agent already had
-    the file but did not use it to ask a concrete question.
+    """Recursive search for the selected/target file(s)' live content inside
+    an agent-input payload, preferring entries explicitly marked selected.
     """
     found: list[tuple[str, str]] = []
 
@@ -29501,16 +29539,68 @@ def _teams_extract_selected_file_contents(payload: Any, max_files: int = 3) -> l
     return found[:max_files]
 
 
-def _teams_extract_candidate_rule_identifiers(content: str, max_items: int = 12) -> list[dict]:
-    """Extract named rule/resource identifiers declared inside one .tf file.
+def _teams_extract_any_file_contents(payload: Any, max_files: int = 6) -> list[tuple[str, str]]:
+    """Broader fallback: collect content from ANY file-like entry in the
+    payload, regardless of whether it was marked "selected".
 
-    Looks for nested ``rule { name = "..." ... }`` blocks (the common shape
-    for WAF/ACL-style resources) and top-level ``resource``/``data`` blocks,
-    so a clarifying question can name concrete choices instead of only
-    pointing at an abstract file.
+    Used when :func:`_teams_extract_selected_file_contents` finds nothing —
+    for example because the upstream payload never set selection_state on
+    the entry the user actually picked. Without this fallback the rescue
+    could silently fail to find evidence that was, in fact, present in the
+    request, leaving the user back at a bare refusal.
+    """
+    found: list[tuple[str, str]] = []
+    seen_paths: set[str] = set()
+
+    def _collect(value: Any) -> None:
+        if len(found) >= max_files:
+            return
+        if isinstance(value, dict):
+            content = value.get("content")
+            path = str(value.get("path") or value.get("filename") or value.get("selected_path") or "").strip()
+            if isinstance(content, str) and content.strip() and path and path not in seen_paths:
+                seen_paths.add(path)
+                found.append((path, content))
+            matched = value.get("matched_files")
+            if isinstance(matched, list):
+                for entry in matched:
+                    _collect(entry)
+            for nested_key in (
+                "existing_files",
+                "existing_pr_context",
+                "retrieved_value_context",
+                "retrieved_module_context",
+                "candidates",
+            ):
+                nested = value.get(nested_key)
+                if isinstance(nested, list):
+                    for item in nested:
+                        _collect(item)
+        elif isinstance(value, list):
+            for item in value:
+                _collect(item)
+
+    _collect(payload)
+    return found[:max_files]
+
+
+def _teams_extract_candidate_rule_identifiers(content: str, prompt: str = "", max_items: int = 12) -> list[dict]:
+    """Extract named rule/resource/parameter identifiers declared inside one
+    .tf file, so a clarifying question can name concrete choices instead of
+    only pointing at an abstract file.
+
+    Priority order reflects repository convention, not Terraform syntax
+    alone: (1) named nested ``rule { name = "..." }`` blocks (WAF/ACL style),
+    (2) Boolean parameter/flag assignments (``name = true`` / ``name =
+    false``) — the common shape behind "enable/disable this rule" requests —
+    ranked by overlap with the request's own wording so a flag literally
+    named e.g. ``mcp_waf_bot_control_enabled`` outranks an unrelated one in
+    the same file, and (3) top-level ``resource``/``data`` blocks as a last
+    resort.
     """
     identifiers: list[dict] = []
     seen: set[str] = set()
+    prompt_tokens = {token for token in re.findall(r"[a-z0-9]+", (prompt or "").lower()) if len(token) >= 3}
 
     for match in re.finditer(r"(?ms)\brule\s*\{(.*?)\n\s*\}", content):
         block = match.group(1)
@@ -29521,7 +29611,26 @@ def _teams_extract_candidate_rule_identifiers(content: str, max_items: int = 12)
                 seen.add(name)
                 identifiers.append({"identifier": name, "kind": "rule"})
         if len(identifiers) >= max_items:
-            return identifiers
+            return identifiers[:max_items]
+
+    bool_matches: list[tuple[str, str]] = []
+    for match in _BOOLEAN_ASSIGNMENT_RE.finditer(content):
+        name, value = match.groups()
+        if name not in seen:
+            bool_matches.append((name, value))
+
+    def _bool_relevance(item: tuple[str, str]) -> int:
+        name_tokens = set(re.findall(r"[a-z0-9]+", item[0].lower()))
+        return len(name_tokens & prompt_tokens)
+
+    bool_matches.sort(key=_bool_relevance, reverse=True)
+    for name, value in bool_matches:
+        if name in seen:
+            continue
+        seen.add(name)
+        identifiers.append({"identifier": name, "kind": "parameter", "current_value": value})
+        if len(identifiers) >= max_items:
+            return identifiers[:max_items]
 
     for match in re.finditer(r'(?m)^\s*(resource|data)\s+"([^"]+)"\s+"([^"]+)"', content):
         kind, res_type, res_name = match.groups()
@@ -29530,23 +29639,25 @@ def _teams_extract_candidate_rule_identifiers(content: str, max_items: int = 12)
             seen.add(label)
             identifiers.append({"identifier": label, "kind": kind})
         if len(identifiers) >= max_items:
-            return identifiers
+            return identifiers[:max_items]
 
-    return identifiers
+    return identifiers[:max_items]
 
 
-def _teams_build_grounding_rescue_reply(files: list[tuple[str, str]]) -> Optional[str]:
-    """Build a clarification JSON naming concrete rule/resource choices
-    found in the selected file(s), instead of leaving a bare refusal.
+def _teams_build_grounding_rescue_reply(files: list[tuple[str, str]], prompt: str = "") -> Optional[str]:
+    """Build a clarification JSON naming concrete rule/resource/parameter
+    choices found in the selected file(s), instead of leaving a bare
+    refusal.
 
     Returns None when no useful identifiers could be extracted, so the
-    original refusal is left untouched rather than being replaced with an
-    equally unhelpful empty question.
+    caller can fall back to a still-interactive (but generic) question via
+    :func:`_teams_build_generic_clarification_reply` rather than the
+    original dead-end refusal.
     """
     all_identifiers: list[dict] = []
     evidence_lines: list[str] = []
     for path, content in files:
-        identifiers = _teams_extract_candidate_rule_identifiers(content)
+        identifiers = _teams_extract_candidate_rule_identifiers(content, prompt=prompt)
         for item in identifiers:
             item = dict(item)
             item["file"] = path
@@ -29560,14 +29671,47 @@ def _teams_build_grounding_rescue_reply(files: list[tuple[str, str]]) -> Optiona
 
     options = ", ".join(f"`{item['identifier']}`" for item in all_identifiers[:10])
     question = (
-        "I read the selected file but the request did not name an exact rule/resource. "
-        f"I found these candidates: {options}. Which one(s) should be disabled?"
+        "I read the selected file but the request did not name an exact rule/parameter. "
+        f"I found these candidates: {options}. Which one(s) should be set to `false` "
+        "(or otherwise changed) for this request?"
     )
     payload = {
         "summary": question,
         "reply": question,
         "analysis": "\n".join(evidence_lines)
-        or "Inspected the selected file's live content for named rule/resource declarations.",
+        or "Inspected the selected file's live content for named rule/resource/parameter declarations.",
+        "questions": [question],
+        "files": [],
+        "user_fillable": [],
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _teams_build_generic_clarification_reply(prompt: str, files: Optional[list[tuple[str, str]]] = None) -> str:
+    """Guaranteed non-refusal fallback: always ask, never dead-end.
+
+    Used when the request was recognized as a modification but no
+    identifiers could be extracted from any recovered file content. The
+    user must always get an interactive question instead of a bare
+    "cannot proceed" message, per the no-dead-end requirement.
+    """
+    files = files or []
+    inspected = f" I inspected `{files[0][0]}`." if files else ""
+    clean_prompt = str(prompt or "").strip()
+    question = (
+        (f'For "{clean_prompt}", ' if clean_prompt else "")
+        + "I could not confidently identify the exact rule, resource, or parameter to change."
+        + inspected
+        + " Please name the specific rule/parameter (or its current true/false value) that should be changed, "
+        "and I will apply it."
+    )
+    payload = {
+        "summary": question,
+        "reply": question,
+        "analysis": (
+            "Repository evidence was inspected but did not contain an unambiguous, "
+            "uniquely named match for this request; asking the user instead of refusing."
+        ),
         "questions": [question],
         "files": [],
         "user_fillable": [],
@@ -29578,23 +29722,51 @@ def _teams_build_grounding_rescue_reply(files: list[tuple[str, str]]) -> Optiona
 def _teams_maybe_rescue_grounding_refusal(agent_input: str, reply: str) -> Optional[str]:
     """Turn a bare grounding refusal into an evidence-backed clarification.
 
-    Best effort: any failure (unparsable payload, no selected file content,
-    no extractable identifiers) leaves the original reply untouched.
+    Guarantees the user is never left with a bare "cannot safely"/"not
+    grounded" refusal for a modification request that reached the agent:
+    if named identifiers can be extracted from recovered file content, they
+    are listed; otherwise a still-interactive generic clarification is
+    returned. Only a reply that is not recognized as a refusal at all (or a
+    payload that cannot be parsed) is left completely untouched.
     """
+    if not _teams_looks_like_grounding_refusal(reply):
+        return None
     try:
-        if not _teams_looks_like_grounding_refusal(reply):
-            return None
         payload = json.loads(agent_input)
     except Exception:
+        LOGGER.warning(
+            "TEAMS-RESCUE-1: grounding refusal detected but agent_input was not valid JSON; "
+            "cannot recover file evidence, leaving the original reply unchanged."
+        )
         return None
+
+    prompt = str(payload.get("user_request") or payload.get("prompt") or "").strip()
     files = _teams_extract_selected_file_contents(payload)
+    extraction_mode = "selected"
     if not files:
-        return None
+        files = _teams_extract_any_file_contents(payload)
+        extraction_mode = "any-file-fallback"
+
+    LOGGER.info(
+        "TEAMS-RESCUE-2: grounding refusal detected, attempting rescue prompt=%r "
+        "extraction_mode=%s files_recovered=%s",
+        prompt[:160], extraction_mode, [path for path, _content in files],
+    )
+
     try:
-        return _teams_build_grounding_rescue_reply(files)
+        rescued = _teams_build_grounding_rescue_reply(files, prompt=prompt) if files else None
+        if rescued:
+            LOGGER.info("TEAMS-RESCUE-3: rescued refusal with named identifiers from recovered file content.")
+            return rescued
+        LOGGER.warning(
+            "TEAMS-RESCUE-4: no named identifiers could be extracted from %s recovered file(s); "
+            "falling back to a generic (but still interactive) clarification instead of the bare refusal.",
+            len(files),
+        )
+        return _teams_build_generic_clarification_reply(prompt, files)
     except Exception:
-        LOGGER.debug("Skipping grounding-refusal rescue", exc_info=True)
-        return None
+        LOGGER.exception("TEAMS-RESCUE-ERROR: rescue construction failed; using generic clarification fallback.")
+        return _teams_build_generic_clarification_reply(prompt, files)
 
 
 def call_agent(conversation_id: Optional[str], agent_input: str):
@@ -29621,6 +29793,20 @@ def call_agent(conversation_id: Optional[str], agent_input: str):
         active["fresh_generation_consumed"] = True
         conversation_id = None
 
+    call_id = uuid.uuid4().hex[:10]
+    if teams_active:
+        LOGGER.info(
+            "TEAMS-AGENT-CALL-1[%s]: sending prompt to Foundry agent conversation_id=%s "
+            "teams_conversation=%s cloud=%s repo_target=%s effective_prompt=%r input_chars=%s",
+            call_id,
+            conversation_id or "(new)",
+            str(active.get("teams_conversation_id") or ""),
+            str(active.get("cloud") or ""),
+            str(active.get("repo_target") or ""),
+            str(active.get("effective_prompt") or "")[:200],
+            len(agent_input or ""),
+        )
+
     context_budget = max(90000, int(os.getenv("TERRABOT_TEAMS_AGENT_CONTEXT_MAX_CHARS", "180000")))
     memory_enriched_input = (
         _teams_attach_agent_memory_context(agent_input, active) if teams_active else agent_input
@@ -29634,18 +29820,33 @@ def call_agent(conversation_id: Optional[str], agent_input: str):
         result_conversation_id, reply = _TEAMS_MULTICLOUD_PREVIOUS_CALL_AGENT(conversation_id, bounded_input)
     except Exception as exc:
         if not teams_active or not _teams_is_context_length_error(exc):
+            if teams_active:
+                LOGGER.exception("TEAMS-AGENT-CALL-ERROR[%s]: Foundry agent call failed.", call_id)
             raise
         LOGGER.warning(
-            "Teams Foundry context limit reached; retrying once with a fresh conversation and tighter live-repository context."
+            "TEAMS-AGENT-CALL-RETRY[%s]: Teams Foundry context limit reached; retrying once with a "
+            "fresh conversation and tighter live-repository context.",
+            call_id,
         )
         retry_input = _teams_compact_agent_input(memory_enriched_input, 45000)
         result_conversation_id, reply = _TEAMS_MULTICLOUD_PREVIOUS_CALL_AGENT(None, retry_input)
 
     if teams_active:
+        LOGGER.info(
+            "TEAMS-AGENT-CALL-2[%s]: Foundry agent responded conversation_id=%s reply_chars=%s "
+            "reply_preview=%r looks_like_refusal=%s",
+            call_id,
+            result_conversation_id or "",
+            len(reply or ""),
+            str(reply or "")[:200],
+            _teams_looks_like_grounding_refusal(reply),
+        )
         rescued_reply = _teams_maybe_rescue_grounding_refusal(memory_enriched_input, reply)
         if rescued_reply:
             LOGGER.info(
-                "Rescued a bare grounding refusal into an evidence-backed clarification."
+                "TEAMS-AGENT-CALL-3[%s]: rescued a bare grounding refusal into an evidence-backed "
+                "clarification before returning it to the user.",
+                call_id,
             )
             reply = rescued_reply
         _teams_record_agent_memory_turn(active, agent_input, reply)
@@ -33957,11 +34158,19 @@ _TEAMS_PR_DUPLICATE_CHECK_PREVIOUS_HANDLE_CHAT = handle_teams_chat_request
 def _teams_attach_related_pull_requests(result: dict, prompt: str, cloud: str) -> dict:
     """Best-effort: attach already-raised (including draft) pull requests
     that appear related to this infrastructure request. Failures never
-    block the response — they are logged at debug level and skipped."""
+    block the response — they are logged and skipped."""
     try:
         normalized_cloud = safe_normalize_cloud(cloud) or ""
         repo_info = _teams_chat_repo_targets(normalized_cloud)
-        if not repo_info or not prompt:
+        if not repo_info:
+            LOGGER.warning(
+                "TEAMS-PR-CHECK-SKIP: no repository configured for cloud=%r (raw cloud=%r); "
+                "cannot check for a related/duplicate pull request.",
+                normalized_cloud, cloud,
+            )
+            return result
+        if not prompt:
+            LOGGER.warning("TEAMS-PR-CHECK-SKIP: no prompt available; cannot check for a related pull request.")
             return result
         pr_result = agent_pr_context.build_pr_context_block(
             prompt,
@@ -33972,18 +34181,25 @@ def _teams_attach_related_pull_requests(result: dict, prompt: str, cloud: str) -
         )
         matches = pr_result.get("matches") or []
         if not matches:
+            LOGGER.info(
+                "TEAMS-PR-CHECK: no related/duplicate pull request found for this request cloud=%s.",
+                normalized_cloud,
+            )
             return result
         result = dict(result)
         result["related_pull_requests"] = matches
         result["related_pull_requests_context"] = pr_result.get("context_block") or ""
         LOGGER.info(
-            "Found %s related pull request(s) (including drafts) for a Teams infra request: cloud=%s",
+            "TEAMS-PR-CHECK: found %s related pull request(s) (including drafts) for a Teams infra "
+            "request: cloud=%s numbers=%s draft_flags=%s",
             len(matches),
             normalized_cloud,
+            [item.get("number") for item in matches],
+            [item.get("draft") for item in matches],
         )
         return result
     except Exception:
-        LOGGER.debug("Skipping related/duplicate pull request check", exc_info=True)
+        LOGGER.exception("TEAMS-PR-CHECK-ERROR: skipping related/duplicate pull request check due to an error")
         return result
 
 
@@ -33991,10 +34207,14 @@ def handle_teams_chat_request(data: dict):
     """Final Teams wrapper: attach duplicate/related pull request awareness.
 
     Runs after every prior routing/state-machine stage so it sees the fully
-    resolved cloud and prompt, and applies to infra-generation-facing modes
-    only (creation/modification previews, clarifications on the way to one,
-    and the branch-created result). Plain chat is handled separately by
-    ``_teams_plain_chat_reply``, which already attaches PR context of its own.
+    resolved cloud and prompt. Applies to every infra-generation-facing
+    response: the mode/decision_state whitelist below, PLUS any response the
+    router classified as an infra request (``router.request_type ==
+    "infra"``) regardless of the exact mode/decision_state string, so a
+    duplicate/draft pull request is always checked for whenever the request
+    is infrastructure-flavored — not only for a fixed set of mode values.
+    Plain chat is handled separately by ``_teams_plain_chat_reply``, which
+    already attaches PR context of its own.
     """
     request_data = dict(data or {})
     prompt = str(
@@ -34007,7 +34227,10 @@ def handle_teams_chat_request(data: dict):
     result = dict(result or {})
 
     mode = str(result.get("mode") or "").strip().lower()
-    router_cloud = str((result.get("router") or {}).get("cloud") or "").strip()
+    decision_state = str(result.get("decision_state") or "").strip().lower()
+    router = result.get("router") or {}
+    router_request_type = str(router.get("request_type") or "").strip().lower()
+    router_cloud = str(router.get("cloud") or "").strip()
     cloud = str(
         result.get("cloud")
         or router_cloud
@@ -34015,8 +34238,25 @@ def handle_teams_chat_request(data: dict):
         or request_data.get("cloud")
         or ""
     ).strip()
-    if prompt and cloud and mode in {"infra_preview", "clarification", "branch_created"}:
+
+    is_infra_flavored = (
+        mode in {"infra_preview", "clarification", "branch_created"}
+        or decision_state in {"infra_modification_target_selection", "aws_module_selection", "azure_module_branch_selection"}
+        or router_request_type == "infra"
+    )
+    if prompt and cloud and is_infra_flavored:
+        LOGGER.info(
+            "TEAMS-PR-CHECK-TRIGGER: checking for a related/duplicate pull request mode=%s "
+            "decision_state=%s router_request_type=%s cloud=%s prompt_preview=%r",
+            mode, decision_state, router_request_type, cloud, prompt[:160],
+        )
         result = _teams_attach_related_pull_requests(result, prompt, cloud)
+    elif prompt:
+        LOGGER.info(
+            "TEAMS-PR-CHECK-TRIGGER: skipped (not infra-flavored or cloud unresolved) mode=%s "
+            "decision_state=%s router_request_type=%s cloud=%r",
+            mode, decision_state, router_request_type, cloud,
+        )
 
     return result, status_code
 

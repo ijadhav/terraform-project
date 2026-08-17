@@ -63,6 +63,58 @@ def test_combined_memory_context_empty_when_nothing_cached(memory_module):
     assert memory_module.get_combined_memory_context(conversation_id="conv-empty") == ""
 
 
+def test_extract_topic_tags_derives_meaningful_keywords(memory_module):
+    tags = memory_module.extract_topic_tags("disable mcp waf rules in dev_aws global")
+    assert "waf" in tags
+    assert "mcp" in tags
+    assert "rules" in tags
+
+
+def test_relevance_ranked_retrieval_surfaces_topically_matching_entry_over_recent_unrelated_ones(memory_module):
+    """Regression: "what are the mcp waf rules?" must be able to retrieve an
+    earlier "disable mcp waf rules" resolution even if unrelated requests
+    happened in between, not just the most recent N entries."""
+    memory_module.record_agent_turn(
+        conversation_id="conv-topic",
+        cloud="aws",
+        repo_target="tf-devops",
+        prompt="disable mcp waf rules in dev_aws global",
+        response_summary="Set mcp_waf_bot_control_enabled to false in waf.tf.",
+    )
+    for index in range(5):
+        memory_module.record_agent_turn(
+            conversation_id="conv-topic",
+            cloud="aws",
+            repo_target="tf-devops",
+            prompt=f"create an unrelated s3 bucket number {index}",
+            response_summary=f"Created bucket {index}.",
+        )
+
+    # Recency-only retrieval (no prompt) would miss the waf resolution once
+    # more than max_entries unrelated turns have happened.
+    recency_only = memory_module.get_conversation_memory_context("conv-topic", max_entries=3)
+    assert "mcp_waf_bot_control_enabled" not in recency_only
+
+    relevance_ranked = memory_module.get_conversation_memory_context(
+        "conv-topic", max_entries=3, prompt="what are the mcp waf rules?"
+    )
+    assert "mcp_waf_bot_control_enabled" in relevance_ranked
+
+
+def test_combined_memory_context_with_prompt_ranks_by_relevance(memory_module):
+    memory_module.record_agent_turn(
+        conversation_id="conv-b2",
+        cloud="aws",
+        repo_target="tf-devops",
+        prompt="disable mcp waf rules",
+        response_summary="Resolved to mcp_waf_bot_control_enabled = false.",
+    )
+    context = memory_module.get_combined_memory_context(
+        conversation_id="conv-b2", cloud="aws", repo_target="tf-devops", prompt="mcp waf rules again"
+    )
+    assert "mcp_waf_bot_control_enabled" in context
+
+
 def test_clear_conversation_memory(memory_module):
     memory_module.record_agent_turn(conversation_id="conv-clear", prompt="hello")
     assert memory_module.get_conversation_memory_context("conv-clear")
