@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional
 import requests
 
 LOGGER = logging.getLogger("terrabot.pr_context")
+LOGGER.setLevel(logging.INFO)
 
 GITHUB_API = "https://api.github.com"
 DEFAULT_TIMEOUT = 15
@@ -62,8 +63,16 @@ def list_open_pull_requests(
     owner = str(owner or "").strip()
     repo = str(repo or "").strip()
     if not owner or not repo:
+        LOGGER.warning(
+            "pr_context: cannot list pull requests, owner/repo missing: owner=%r repo=%r", owner, repo
+        )
         return []
     url = f"{GITHUB_API}/repos/{owner}/{repo}/pulls"
+    token_configured = bool((token or os.getenv("GITHUB_TOKEN") or "").strip())
+    LOGGER.info(
+        "pr_context: searching for pull requests repo=%s/%s state=%s token_configured=%s",
+        owner, repo, state, token_configured,
+    )
     try:
         response = requests.get(
             url,
@@ -73,9 +82,18 @@ def list_open_pull_requests(
         )
         response.raise_for_status()
         payload = response.json()
-        return payload if isinstance(payload, list) else []
+        pull_requests = payload if isinstance(payload, list) else []
+        draft_count = sum(1 for pr in pull_requests if isinstance(pr, dict) and pr.get("draft"))
+        LOGGER.info(
+            "pr_context: fetched %s pull request(s) for %s/%s (%s draft)",
+            len(pull_requests), owner, repo, draft_count,
+        )
+        return pull_requests
     except Exception as exc:
-        LOGGER.warning("Unable to list pull requests for %s/%s: %s", owner, repo, exc)
+        LOGGER.warning(
+            "pr_context: unable to list pull requests for %s/%s status=%s error=%s",
+            owner, repo, getattr(getattr(exc, "response", None), "status_code", "n/a"), exc,
+        )
         return []
 
 
@@ -122,7 +140,13 @@ def match_pull_requests_for_prompt(
         if score >= min_score:
             scored.append((score, pull_request))
     scored.sort(key=lambda item: item[0], reverse=True)
-    return [item[1] for item in scored[:max_matches]]
+    matches = [item[1] for item in scored[:max_matches]]
+    LOGGER.info(
+        "pr_context: matched %s of %s pull request(s) against prompt_tokens=%s (best_score=%s)",
+        len(matches), len(pull_requests), sorted(prompt_tokens)[:10],
+        scored[0][0] if scored else 0,
+    )
+    return matches
 
 
 def _summarize_pull_request(pull_request: dict) -> Dict[str, Any]:
@@ -155,12 +179,27 @@ def build_pr_context_block(
         - ``context_block``: a formatted string ready to attach to the agent
           input, or "" when there is nothing relevant.
     """
+    LOGGER.info(
+        "pr_context: duplicate-work check starting repo=%s/%s cloud=%s prompt_preview=%r",
+        owner, repo, cloud or "", str(prompt or "")[:120],
+    )
     pull_requests = list_open_pull_requests(owner, repo, token=token)
     matches = match_pull_requests_for_prompt(prompt, pull_requests, max_matches=max_matches)
     summaries = [_summarize_pull_request(pr) for pr in matches]
 
     if not summaries:
+        LOGGER.info(
+            "pr_context: no related pull request found repo=%s/%s cloud=%s (checked %s open PR(s))",
+            owner, repo, cloud or "", len(pull_requests),
+        )
         return {"matches": [], "context_block": ""}
+
+    LOGGER.info(
+        "pr_context: found %s related pull request(s) repo=%s/%s cloud=%s numbers=%s draft_flags=%s",
+        len(summaries), owner, repo, cloud or "",
+        [item["number"] for item in summaries],
+        [item["draft"] for item in summaries],
+    )
 
     lines = [
         "OPEN PULL REQUEST CONTEXT"
