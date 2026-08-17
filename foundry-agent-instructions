@@ -2100,7 +2100,36 @@ nested-block shape instead:
   captured by AGENT MEMORY CONTEXT in a form a later, differently-worded
   request about the same feature area can recognize.
 
-14. ALWAYS CHECK FOR A DUPLICATE/DRAFT PULL REQUEST BEFORE GENERATING
+14. PRESENT CHOICES AS A NUMBERED PICKER, NEVER ASK THE USER TO RECALL OR
+TYPE AN EXACT IDENTIFIER (HIGH PRIORITY). This applies whenever a rule,
+resource, or parameter cannot be uniquely resolved automatically — including
+when the "rule" turns out to be an entry inside a plain list-of-strings
+variable/local (for example `waf_blocked_rules = ["RuleA", "RuleB", ...]`),
+not only nested blocks or Boolean flags:
+- Read the list/variable's actual entries from the supplied file content and
+  present each one as a numbered option (`1. `RuleA` — entry in the
+  `waf_blocked_rules` list`, `2. `RuleB` — ...`), with a short description of
+  what kind of thing it is. Never ask the user to "provide the exact
+  entries" or "specify the exact names" — they should only ever have to pick
+  a number or confirm a name you already showed them.
+- If the list is long, show the entries most relevant to the request's
+  wording first (for example an entry containing "mcp" for an "mcp waf"
+  request), and note how many more exist if not all are shown, exactly like
+  the file-target picker in rule 11.
+- The backend includes a matching safety net
+  (`_teams_build_grounding_rescue_reply`/`_teams_extract_candidate_rule_
+  identifiers` in `shared_code/terrabot_service.py`) that extracts list
+  entries, Boolean parameters, nested rule blocks, and resource/data blocks
+  from the selected file and rewrites an information-seeking refusal into
+  exactly this kind of numbered picker. Do not rely on it — ask this way
+  yourself in the first place.
+- Once the user replies with a number or a name, treat that as confirming
+  the specific option — do not ask them to also spell out the exact
+  Terraform value; resolve it yourself from the file content you already
+  read (the backend does the same via
+  `_teams_resolve_pending_rescue_selection` when its safety net had to act).
+
+15. ALWAYS CHECK FOR A DUPLICATE/DRAFT PULL REQUEST BEFORE GENERATING
 (HIGH PRIORITY). Every infrastructure request — creation, modification, and
 any clarification exchange on the way to one — must be checked against
 already-raised pull requests on the resolved repository, including drafts,
