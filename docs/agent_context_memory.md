@@ -128,9 +128,24 @@ new payload keys so the agent uses them correctly:
 - **Rule 12 — NEVER RETURN A BARE REFUSAL**: forbids a "cannot safely ground
   exact names" style refusal when the selected file's content was already
   supplied; requires parsing named sub-blocks (e.g. WAF `rule` blocks) and
-  asking a question that lists the actual identifiers found, and describes
-  the backend's best-effort rescue safety net (see §6 below) as a fallback,
-  not a substitute for asking well-formed questions in the first place.
+  asking a question that lists the actual identifiers found.
+- **Rule 13 — UNDERSTAND "RULE" AS A BOOLEAN PARAMETER FIRST**: "rule(s)" in
+  an enable/disable request usually means a repository Boolean
+  parameter/flag (`name = true`/`false`), not a Terraform-native nested
+  block, unless the file's evidence shows otherwise; requires recording the
+  resolved mapping (e.g. "waf mcp rules → `mcp_waf_bot_control_enabled`") so
+  AGENT MEMORY CONTEXT can cache it.
+- **Rule 14 — PRESENT CHOICES AS A NUMBERED PICKER, NEVER ASK THE USER TO
+  RECALL/TYPE AN EXACT IDENTIFIER**: extends rule 13 to plain list-of-strings
+  variables (e.g. `waf_blocked_rules = [...]`); requires showing every
+  relevant entry as a numbered option with a short description instead of
+  asking the user to "provide the exact entries," and describes the
+  backend's rescue safety net (see §6 below) as a fallback, not a substitute
+  for asking this way in the first place.
+- **Rule 15 — ALWAYS CHECK FOR A DUPLICATE/DRAFT PULL REQUEST BEFORE
+  GENERATING**: requires checking every infrastructure request (not just a
+  fixed set of modes) and always mentioning `related_pull_requests` —
+  including drafts — when the backend supplies it.
 
 ## 4. Bug fix: AWS `global` environment resolving to `minidev`
 
@@ -173,66 +188,121 @@ Fixed in `shared_code/terrabot_service.py`:
 
 Tests: `tests/test_infra_target_candidate_ranking.py`.
 
-## 6. Rescuing bare "cannot safely ground exact names" refusals (guaranteed, never a dead end)
+## 6. Rescuing bare refusals into a numbered, choosable picker (guaranteed, never a dead end, never "type the exact name")
 
 Even after the environment/picker fixes above, a modification request could
-still hit a dead end: the agent selects the correct file (e.g. `waf.tf`) but
-refuses with something like *"Cannot safely disable MCP waf rules yet
-because the exact MCP rule identifiers are not grounded in the repository
-evidence"* instead of asking the user to pick from the parameters it
-already had in its context.
+still hit a dead end two different ways:
 
-`shared_code/terrabot_service.py::call_agent` includes a rescue that now
-**guarantees** the user is never left with this bare refusal:
+1. A bare "cannot ground" refusal, e.g. *"Cannot safely disable MCP waf
+   rules yet because the exact MCP rule identifiers are not grounded in the
+   repository evidence."*
+2. An **information-seeking** refusal that already found the right file but
+   still asks the user to recall/type an exact value, e.g. *"I can help, but
+   I need exact MCP-related rule names to disable. The repo shows a long
+   `waf_blocked_rules` list in `waf.tf`, but it doesn't label which entries
+   are specifically MCP-related. Please provide the exact
+   `waf_blocked_rules` entries..."* — this is still a dead end even though
+   the agent clearly saw the list, because it asks the user to supply values
+   instead of presenting them as choices.
 
-1. `_teams_looks_like_grounding_refusal` detects the refusal shape.
+`shared_code/terrabot_service.py::call_agent` includes a rescue that
+**guarantees** the user is never left with either shape, and — this round —
+always presents a real numbered picker instead of asking for an exact name:
+
+1. `_teams_looks_like_grounding_refusal` detects both refusal shapes (bare
+   "cannot ground" language AND "I need the exact .../please provide the
+   exact ..." language), but never touches a reply that already contains a
+   real numbered list (`_NUMBERED_OPTIONS_RE`) — a good clarification the
+   agent wrote itself is left alone.
 2. File content is recovered two ways: `_teams_extract_selected_file_
    contents` first (entries explicitly marked "selected"), then
    `_teams_extract_any_file_contents` as a broader fallback that recovers
    content from **any** file-like entry in the payload — including plain
-   `candidates` list entries that were never marked "selected" (this is the
-   fix for the case where the picker's candidate list did not carry a
-   `selection_state`).
-3. `_teams_extract_candidate_rule_identifiers` understands "rule" the way
-   this repository actually uses it — **primarily a Boolean parameter/flag**
-   (`name = true` / `name = false`), per explicit product guidance, ranked
-   by overlap with the request's own wording (a request about "mcp waf"
-   surfaces `mcp_waf_bot_control_enabled` ahead of an unrelated flag in the
-   same file) — and only falls back to nested `rule { name = "..." }` blocks
-   or bare `resource`/`data` declarations when no Boolean parameters are
-   found.
-4. If named identifiers were found, `_teams_build_grounding_rescue_reply`
-   asks the user to pick among them, e.g. *"I found these candidates:
-   `mcp_waf_bot_control_enabled`, `mcp_rate_limit_enabled`. Which one(s)
-   should be set to `false`?"*
+   `candidates` list entries that were never marked "selected".
+3. `_teams_extract_candidate_rule_identifiers` extracts **every** shape this
+   repository actually uses for "a rule": (a) entries inside a plain
+   list-of-strings variable/local such as `waf_blocked_rules = ["RuleA",
+   "RuleB", ...]` (`_teams_extract_list_literal_entries`) — the shape behind
+   the reported `waf_blocked_rules` case — (b) Boolean parameter/flag
+   assignments (`name = true`/`false`) — per explicit product guidance that
+   "rule" usually means a true/false parameter — (c) named nested
+   `rule { name = "..." }` blocks, and (d) bare `resource`/`data`
+   declarations as a last resort. All four are pooled and ranked together by
+   relevance to the request's own wording (exact-token match weighted
+   highest, case-insensitive substring match next — the latter is what lets
+   a camelCase identifier like `AWSManagedRulesMcpBotControl` outrank
+   `AWSManagedRulesCommonRuleSet` for an "mcp" request even though neither
+   tokenizes into separate words).
+4. `_teams_build_grounding_rescue_reply` renders the ranked options as a
+   **numbered list with a one-line description each** — never a
+   comma-separated "which one(s)" sentence and never a request to type an
+   exact name — e.g.:
+   ```
+   I found the following option(s) in `waf.tf` for "disable mcp waf rules...".
+   1. `AWSManagedRulesMcpBotControl` — entry in the `waf_blocked_rules` list
+   2. `AWSManagedRulesBotControlRuleSet` — entry in the `waf_blocked_rules` list
+   ...
+   Reply with the number(s) or the exact name(s).
+   ```
 5. **If nothing could be extracted at all**, `_teams_build_generic_
    clarification_reply` still returns an interactive question instead of the
-   refusal — this is the guarantee: the user is never shown the bare
-   "cannot safely"/"not grounded" text again, worst case they get a generic
-   "please name the specific rule/parameter" question instead.
+   refusal — the guarantee is that the user is never shown a bare
+   "cannot safely"/"not grounded"/"please provide the exact" message again.
 
-This is a safety net; `foundry-agent-instructions` rules 12–13 require the
-agent to ask this kind of question itself (and to understand "rule" as a
-Boolean parameter first) rather than relying on the backend to rewrite a
-refusal after the fact.
+### Resolving the user's numbered reply
 
-Once the user answers with a specific identifier and generation succeeds,
-that turn is recorded into `agent_memory_store` exactly like any other
-`call_agent` turn (see §2.2), now additionally tagged with `topic_tags`
-(e.g. `["waf", "mcp", "disable"]`) extracted from the prompt/response. A
-later request mentioning the same topic (e.g. another "mcp waf" question)
-is retrieved by topical relevance, not just recency — see §2.2's
-`get_combined_memory_context(..., prompt=...)` — so the resolution "waf mcp
-rules → `mcp_waf_bot_control_enabled`" surfaces even if unrelated requests
-happened in between.
+Presenting a numbered picker only helps if the next reply is understood.
+When a rescue builds a picker, `call_agent` persists the option list to
+durable Teams state as `pending_rescue_selection` (via `_teams_save_ui_
+state`, the same store `teams_conversation_state` already uses). The final
+`handle_teams_chat_request` wrapper checks for this on every subsequent
+message **before** any routing/state-machine logic runs:
+
+- `_teams_resolve_pending_rescue_selection` matches the reply by 1-based
+  number or by case-insensitive exact/substring match against an option's
+  identifier, and returns a fully-specified instruction, e.g. *'For the
+  request "disable mcp waf rules in dev_aws global": disable the rule
+  entry/entries "AWSManagedRulesMcpBotControl" from the `waf_blocked_rules`
+  list in `waf.tf`. Preserve every other entry in that list unchanged.'*
+- On a match, the wrapper rewrites `request_data["prompt"]`/
+  `["original_prompt"]` to this instruction, sets `fresh_infra_generation`,
+  and clears `pending_rescue_selection` — so the next generation attempt
+  targets an exact, already-confirmed identifier instead of re-parsing
+  ambiguous free text, and starts a fresh Foundry conversation rather than
+  continuing one whose history contains the original refusal.
+- On no match (the user sent something unrelated instead of answering), the
+  message is left untouched and handled as an ordinary new request;
+  `pending_rescue_selection` is also cleared by the `/clear` reset command
+  along with the rest of the Teams workflow state.
+
+This is a safety net; `foundry-agent-instructions` rules 12–14 require the
+agent to ask this way itself (numbered options with descriptions, never a
+request to recall an exact name) rather than relying on the backend to
+rewrite a refusal after the fact.
+
+### Memory: remembering the resolved rule for next time
+
+Once the user picks an option and generation succeeds, that turn is
+recorded into `agent_memory_store` exactly like any other `call_agent` turn
+(see §2.2), tagged with `topic_tags` (e.g. `["waf", "mcp", "disable"]`)
+extracted from the prompt/response. A later request mentioning the same
+topic (e.g. another "mcp waf" question) is retrieved by topical relevance,
+not just recency — see §2.2's `get_combined_memory_context(..., prompt=...)`
+— so the resolution "waf mcp rules → `AWSManagedRulesMcpBotControl` in
+`waf_blocked_rules`" surfaces even if unrelated requests happened in
+between. No extra plumbing was needed for this beyond the tagging, since
+`call_agent` already records every turn's prompt and response automatically.
 
 **Known limitation**: the rescued reply is only what is returned to Teams;
 the underlying Foundry conversation still has the agent's own original
 refusal in its history (the rescue rewrites the outbound text after the
-model call, not the model's own turn). A capable model should still connect
-the user's next answer to the rescued question, but a stronger fix would
-require intercepting before the conversation item is written, which needs
-deeper changes to `_call_agent_base` than this pass makes.
+model call, not the model's own turn). Resolving the next reply
+deterministically via `pending_rescue_selection` (rather than relying on the
+model to connect a bare "1" back to a list it never actually wrote) is what
+makes this round's fix work despite that limitation — the model does not
+need to remember the picker at all, because the backend resolves the
+selection and reformulates it as a complete, self-contained instruction
+before the next Foundry call.
 
 Tests: `tests/test_grounding_refusal_rescue.py`.
 
@@ -261,7 +331,7 @@ is_infra_flavored = (
 `shared_code/teams_bot.py` renders matches as a "Related pull request(s)
 already raised" section, including whether each match is a draft. This is
 informational only — Terrabot still proceeds with the requested generation
-unless the user says otherwise. `foundry-agent-instructions` rule 14 tells
+unless the user says otherwise. `foundry-agent-instructions` rule 15 tells
 the agent to always mention `related_pull_requests` when present, including
 drafts, and to re-check once the cloud/repo is resolved if it was not
 supplied on an earlier turn.

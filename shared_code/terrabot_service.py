@@ -29468,9 +29468,16 @@ def _extract_json_payload_for_memory(value: str) -> dict:
 
 _GROUNDING_REFUSAL_RE = re.compile(
     r"\b(cannot safely|can(?:not|['\u2019]t) safely|not grounded|cannot proceed without|"
-    r"unable to safely|could not (?:be completed|safely)|cannot determine (?:the )?exact)\b",
+    r"unable to safely|could not (?:be completed|safely)|cannot determine (?:the )?exact|"
+    r"i need (?:the )?exact|please provide the exact|provide the exact|specify the exact|"
+    r"name the exact|doesn'?t label which|does not label which)\b",
     re.IGNORECASE,
 )
+
+# A reply that already presents real numbered/lettered options is a GOOD
+# clarification and must never be rewritten, even if it also happens to
+# contain refusal-like wording elsewhere in the same message.
+_NUMBERED_OPTIONS_RE = re.compile(r"(?m)^\s*\d+[.)]\s+\S")
 
 # "Rule" in an enable/disable request almost always maps to a repository
 # Boolean parameter/flag (e.g. `mcp_waf_bot_control_enabled = true`), not a
@@ -29480,21 +29487,33 @@ _BOOLEAN_ASSIGNMENT_RE = re.compile(
     r'(?m)^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(true|false)\b'
 )
 
+# WAF/ACL-style rule lists are frequently declared as a plain list-of-strings
+# variable/local (e.g. `waf_blocked_rules = ["RuleA", "RuleB", ...]`) rather
+# than as individual Boolean flags or nested blocks. Each string entry is a
+# selectable option in its own right.
+_LIST_LITERAL_RE = re.compile(r"(?ms)([A-Za-z_][A-Za-z0-9_]*)\s*=\s*\[(.*?)\]")
+
 
 def _teams_looks_like_grounding_refusal(reply: str) -> bool:
-    """True when a modification-generation reply is a bare refusal instead
-    of a specific, evidence-backed clarifying question.
+    """True when a modification-generation reply is a bare refusal/
+    information-seeking dead end instead of a specific, evidence-backed,
+    already-answerable-by-number clarifying question.
 
     Refusals such as "cannot safely disable X because the exact rule names
-    are not grounded in the repository evidence" are usually the wrong
-    answer: the agent already had the selected file's content in its
-    context and should have asked the user to pick from the actual
-    rule/resource/parameter identifiers declared there instead of refusing
-    outright. A reply that already asks a real question (contains "?") is
-    left alone.
+    are not grounded in the repository evidence", or "I need the exact
+    MCP-related rule names ... please provide the exact entries", are
+    usually the wrong answer: the agent already had the selected file's
+    content in its context and should have asked the user to CHOOSE among
+    the actual rule/resource/parameter/list-entry identifiers declared
+    there, instead of asking the user to recall or type them from memory.
+    A reply that already presents real numbered options (see
+    ``_NUMBERED_OPTIONS_RE``) is left alone — it is already a good
+    clarification and must not be rewritten.
     """
     text = str(reply or "")
-    if not text or "?" in text:
+    if not text:
+        return False
+    if _NUMBERED_OPTIONS_RE.search(text):
         return False
     return bool(_GROUNDING_REFUSAL_RE.search(text))
 
@@ -29584,23 +29603,75 @@ def _teams_extract_any_file_contents(payload: Any, max_files: int = 6) -> list[t
     return found[:max_files]
 
 
-def _teams_extract_candidate_rule_identifiers(content: str, prompt: str = "", max_items: int = 12) -> list[dict]:
-    """Extract named rule/resource/parameter identifiers declared inside one
-    .tf file, so a clarifying question can name concrete choices instead of
-    only pointing at an abstract file.
+def _teams_extract_list_literal_entries(content: str, max_lists: int = 4) -> list[tuple[str, str]]:
+    """Extract ``variable_name = ["EntryA", "EntryB", ...]`` style lists.
 
-    Priority order reflects repository convention, not Terraform syntax
-    alone: (1) named nested ``rule { name = "..." }`` blocks (WAF/ACL style),
-    (2) Boolean parameter/flag assignments (``name = true`` / ``name =
-    false``) — the common shape behind "enable/disable this rule" requests —
-    ranked by overlap with the request's own wording so a flag literally
-    named e.g. ``mcp_waf_bot_control_enabled`` outranks an unrelated one in
-    the same file, and (3) top-level ``resource``/``data`` blocks as a last
-    resort.
+    Returns ``(list_variable_name, entry_string)`` pairs for every quoted
+    string entry found in every matching list literal, so each entry can be
+    offered as its own selectable option (the common shape for a WAF/ACL
+    "blocked rules" list, which is plain strings rather than nested blocks
+    or individual Boolean flags).
     """
-    identifiers: list[dict] = []
-    seen: set[str] = set()
+    pairs: list[tuple[str, str]] = []
+    lists_seen = 0
+    for match in _LIST_LITERAL_RE.finditer(content):
+        var_name, body = match.groups()
+        entries = re.findall(r'"([^"]+)"', body)
+        if not entries:
+            continue
+        lists_seen += 1
+        for entry in entries:
+            pairs.append((var_name, entry))
+        if lists_seen >= max_lists:
+            break
+    return pairs
+
+
+def _teams_extract_candidate_rule_identifiers(content: str, prompt: str = "", max_items: int = 12) -> list[dict]:
+    """Extract named rule/resource/parameter/list-entry identifiers declared
+    inside one .tf file, so a clarifying question can offer concrete,
+    choosable options instead of only pointing at an abstract file or
+    asking the user to recall/type an exact name from memory.
+
+    Reflects repository convention, not Terraform syntax alone: WAF/ACL
+    style "rules" are commonly (a) a plain list-of-strings variable/local
+    (for example ``waf_blocked_rules = ["RuleA", "RuleB"]``), (b) a Boolean
+    parameter/flag (``name = true``/``false``), (c) a named nested
+    ``rule { name = "..." }`` block, or — rarely — (d) a top-level
+    ``resource``/``data`` block. All four shapes are collected and then
+    ranked together by overlap with the request's own wording so, for
+    example, a list entry or flag whose name contains "mcp" outranks an
+    unrelated one found in the same file.
+    """
     prompt_tokens = {token for token in re.findall(r"[a-z0-9]+", (prompt or "").lower()) if len(token) >= 3}
+
+    def _relevance(text: str) -> int:
+        text_lower = text.lower()
+        text_tokens = set(re.findall(r"[a-z0-9]+", text_lower))
+        exact_hits = text_tokens & prompt_tokens
+        # Identifiers such as AWS managed rule set names are frequently
+        # camelCase/PascalCase with no separators (e.g.
+        # "AWSManagedRulesMcpBotControl"), so a whole-token match never
+        # occurs even when the identifier clearly names the requested
+        # concept ("mcp"). A case-insensitive substring check catches this
+        # without needing full camelCase segmentation.
+        substring_hits = {token for token in prompt_tokens if token not in exact_hits and token in text_lower}
+        return len(exact_hits) * 2 + len(substring_hits)
+
+    candidates: list[dict] = []
+    seen: set[str] = set()
+
+    for var_name, entry in _teams_extract_list_literal_entries(content):
+        if entry in seen:
+            continue
+        seen.add(entry)
+        candidates.append({
+            "identifier": entry,
+            "kind": "list_entry",
+            "list_variable": var_name,
+            "description": f"entry in the `{var_name}` list",
+            "_score": _relevance(entry) + _relevance(var_name),
+        })
 
     for match in re.finditer(r"(?ms)\brule\s*\{(.*?)\n\s*\}", content):
         block = match.group(1)
@@ -29609,82 +29680,125 @@ def _teams_extract_candidate_rule_identifiers(content: str, prompt: str = "", ma
             name = name_match.group(1).strip()
             if name and name not in seen:
                 seen.add(name)
-                identifiers.append({"identifier": name, "kind": "rule"})
-        if len(identifiers) >= max_items:
-            return identifiers[:max_items]
+                candidates.append({
+                    "identifier": name,
+                    "kind": "rule",
+                    "description": "named rule block",
+                    "_score": _relevance(name),
+                })
 
-    bool_matches: list[tuple[str, str]] = []
     for match in _BOOLEAN_ASSIGNMENT_RE.finditer(content):
         name, value = match.groups()
-        if name not in seen:
-            bool_matches.append((name, value))
-
-    def _bool_relevance(item: tuple[str, str]) -> int:
-        name_tokens = set(re.findall(r"[a-z0-9]+", item[0].lower()))
-        return len(name_tokens & prompt_tokens)
-
-    bool_matches.sort(key=_bool_relevance, reverse=True)
-    for name, value in bool_matches:
         if name in seen:
             continue
         seen.add(name)
-        identifiers.append({"identifier": name, "kind": "parameter", "current_value": value})
-        if len(identifiers) >= max_items:
-            return identifiers[:max_items]
+        candidates.append({
+            "identifier": name,
+            "kind": "parameter",
+            "current_value": value,
+            "description": f"parameter, currently `{value}`",
+            "_score": _relevance(name),
+        })
 
     for match in re.finditer(r'(?m)^\s*(resource|data)\s+"([^"]+)"\s+"([^"]+)"', content):
         kind, res_type, res_name = match.groups()
         label = f"{res_type}.{res_name}"
-        if label not in seen:
-            seen.add(label)
-            identifiers.append({"identifier": label, "kind": kind})
-        if len(identifiers) >= max_items:
-            return identifiers[:max_items]
+        if label in seen:
+            continue
+        seen.add(label)
+        candidates.append({
+            "identifier": label,
+            "kind": kind,
+            "description": f"{kind} block",
+            "_score": _relevance(label),
+        })
 
-    return identifiers[:max_items]
+    # Stable sort: relevance to the prompt first, otherwise keep discovery
+    # order (list entries, then rule blocks, then parameters, then
+    # resources) so a large, mostly-irrelevant list still shows its first
+    # few entries rather than an arbitrary re-shuffle.
+    candidates_with_index = list(enumerate(candidates))
+    candidates_with_index.sort(key=lambda pair: (-pair[1]["_score"], pair[0]))
+    ordered = [item for _index, item in candidates_with_index]
+    for item in ordered:
+        item.pop("_score", None)
+    return ordered[:max_items]
 
 
-def _teams_build_grounding_rescue_reply(files: list[tuple[str, str]], prompt: str = "") -> Optional[str]:
-    """Build a clarification JSON naming concrete rule/resource/parameter
-    choices found in the selected file(s), instead of leaving a bare
-    refusal.
-
-    Returns None when no useful identifiers could be extracted, so the
-    caller can fall back to a still-interactive (but generic) question via
-    :func:`_teams_build_generic_clarification_reply` rather than the
-    original dead-end refusal.
+def _teams_build_options_question(
+    options: list[dict],
+    prompt: str,
+    file_path: str,
+    total_available: int = 0,
+) -> str:
+    """Render extracted identifiers as a real numbered picker with a short
+    description per option, instead of asking the user to type/recall an
+    exact name from memory.
     """
-    all_identifiers: list[dict] = []
-    evidence_lines: list[str] = []
+    lines = [
+        f"I found the following option(s) in `{file_path}` for \"{prompt.strip()}\". "
+        "Which one(s) should be changed?" if prompt.strip() else
+        f"I found the following option(s) in `{file_path}`. Which one(s) should be changed?",
+        "",
+    ]
+    for index, item in enumerate(options, start=1):
+        description = str(item.get("description") or item.get("kind") or "").strip()
+        suffix = f" — {description}" if description else ""
+        lines.append(f"{index}. `{item['identifier']}`{suffix}")
+    remaining = total_available - len(options)
+    if remaining > 0:
+        lines.append(f"...and {remaining} more option(s) not shown. Reply with the exact name if you don't see it above.")
+    lines.extend(["", "Reply with the number(s) or the exact name(s)."])
+    return "\n".join(lines)
+
+
+def _teams_build_grounding_rescue_reply(
+    files: list[tuple[str, str]],
+    prompt: str = "",
+    max_options: int = 15,
+) -> Optional[tuple[str, dict]]:
+    """Build a clarification naming concrete, choosable options found in the
+    selected file(s), instead of leaving a bare refusal or asking the user
+    to recall/type an exact identifier.
+
+    Returns ``(reply_json_str, resolution_context)`` on success, where
+    ``resolution_context`` is the structured record (options, file, prompt)
+    the caller should persist so the user's next reply (a number or name)
+    can be deterministically resolved back into a fully-specified
+    instruction — see :func:`_teams_resolve_pending_rescue_selection`.
+    Returns None when no useful identifiers could be extracted at all, so
+    the caller can fall back to :func:`_teams_build_generic_clarification_reply`.
+    """
+    all_options: list[dict] = []
+    primary_file = files[0][0] if files else ""
     for path, content in files:
-        identifiers = _teams_extract_candidate_rule_identifiers(content, prompt=prompt)
+        identifiers = _teams_extract_candidate_rule_identifiers(content, prompt=prompt, max_items=40)
         for item in identifiers:
             item = dict(item)
             item["file"] = path
-            all_identifiers.append(item)
-        if identifiers:
-            evidence_lines.append(
-                f"`{path}` declares: " + ", ".join(f"`{item['identifier']}`" for item in identifiers[:8])
-            )
-    if not all_identifiers:
+            all_options.append(item)
+    if not all_options:
         return None
 
-    options = ", ".join(f"`{item['identifier']}`" for item in all_identifiers[:10])
-    question = (
-        "I read the selected file but the request did not name an exact rule/parameter. "
-        f"I found these candidates: {options}. Which one(s) should be set to `false` "
-        "(or otherwise changed) for this request?"
-    )
+    visible_options = all_options[:max_options]
+    question = _teams_build_options_question(visible_options, prompt, primary_file, total_available=len(all_options))
     payload = {
         "summary": question,
         "reply": question,
-        "analysis": "\n".join(evidence_lines)
-        or "Inspected the selected file's live content for named rule/resource/parameter declarations.",
+        "analysis": (
+            f"Inspected `{primary_file}` and extracted {len(all_options)} named "
+            "rule/parameter/list-entry candidate(s) instead of asking the user to recall an exact name."
+        ),
         "questions": [question],
         "files": [],
         "user_fillable": [],
     }
-    return json.dumps(payload, ensure_ascii=False)
+    resolution_context = {
+        "options": visible_options,
+        "file": primary_file,
+        "original_prompt": prompt,
+    }
+    return json.dumps(payload, ensure_ascii=False), resolution_context
 
 
 def _teams_build_generic_clarification_reply(prompt: str, files: Optional[list[tuple[str, str]]] = None) -> str:
@@ -29719,15 +29833,22 @@ def _teams_build_generic_clarification_reply(prompt: str, files: Optional[list[t
     return json.dumps(payload, ensure_ascii=False)
 
 
-def _teams_maybe_rescue_grounding_refusal(agent_input: str, reply: str) -> Optional[str]:
-    """Turn a bare grounding refusal into an evidence-backed clarification.
+def _teams_maybe_rescue_grounding_refusal(agent_input: str, reply: str) -> Optional[tuple[str, Optional[dict]]]:
+    """Turn a bare grounding refusal into an evidence-backed, choosable
+    clarification.
 
     Guarantees the user is never left with a bare "cannot safely"/"not
-    grounded" refusal for a modification request that reached the agent:
-    if named identifiers can be extracted from recovered file content, they
-    are listed; otherwise a still-interactive generic clarification is
-    returned. Only a reply that is not recognized as a refusal at all (or a
-    payload that cannot be parsed) is left completely untouched.
+    grounded"/"please provide the exact ..." refusal for a modification
+    request that reached the agent: if named identifiers can be extracted
+    from recovered file content, they are presented as a numbered picker;
+    otherwise a still-interactive generic clarification is returned. Only a
+    reply that is not recognized as a refusal at all (or a payload that
+    cannot be parsed) is left completely untouched.
+
+    Returns ``(reply, resolution_context_or_None)``. ``resolution_context``
+    is non-None only when a numbered picker was built, and should be
+    persisted (see ``call_agent``) so the next user reply can be resolved
+    deterministically instead of being sent to the agent as free text.
     """
     if not _teams_looks_like_grounding_refusal(reply):
         return None
@@ -29756,17 +29877,86 @@ def _teams_maybe_rescue_grounding_refusal(agent_input: str, reply: str) -> Optio
     try:
         rescued = _teams_build_grounding_rescue_reply(files, prompt=prompt) if files else None
         if rescued:
-            LOGGER.info("TEAMS-RESCUE-3: rescued refusal with named identifiers from recovered file content.")
-            return rescued
+            reply_json, resolution_context = rescued
+            LOGGER.info(
+                "TEAMS-RESCUE-3: rescued refusal with %s named option(s) from recovered file content.",
+                len(resolution_context.get("options") or []),
+            )
+            return reply_json, resolution_context
         LOGGER.warning(
             "TEAMS-RESCUE-4: no named identifiers could be extracted from %s recovered file(s); "
             "falling back to a generic (but still interactive) clarification instead of the bare refusal.",
             len(files),
         )
-        return _teams_build_generic_clarification_reply(prompt, files)
+        return _teams_build_generic_clarification_reply(prompt, files), None
     except Exception:
         LOGGER.exception("TEAMS-RESCUE-ERROR: rescue construction failed; using generic clarification fallback.")
-        return _teams_build_generic_clarification_reply(prompt, files)
+        return _teams_build_generic_clarification_reply(prompt, files), None
+
+
+def _teams_resolve_pending_rescue_selection(prompt: str, pending: dict) -> Optional[str]:
+    """Resolve a user's reply to a previously rescued numbered picker into a
+    fully-specified instruction, so the next generation attempt targets an
+    exact, already-confirmed identifier instead of ambiguous free text.
+
+    Matches by 1-based number first, then by case-insensitive exact or
+    substring match against an option's identifier. Returns None when the
+    reply does not match any pending option (the caller should then treat
+    the message as an ordinary new request instead of forcing a match).
+    """
+    options = pending.get("options") or []
+    if not options:
+        return None
+    text = str(prompt or "").strip()
+    if not text:
+        return None
+
+    selected: list[dict] = []
+    number_tokens = re.findall(r"\d+", text)
+    if number_tokens and re.fullmatch(r"[\d,\s&and]+", text, re.IGNORECASE):
+        for token in number_tokens:
+            index = int(token) - 1
+            if 0 <= index < len(options):
+                selected.append(options[index])
+    if not selected:
+        normalized = text.lower()
+        for option in options:
+            identifier = str(option.get("identifier") or "").lower()
+            if identifier and (identifier == normalized or identifier in normalized or normalized in identifier):
+                selected.append(option)
+
+    if not selected:
+        return None
+
+    file_path = str(pending.get("file") or "").strip()
+    original_prompt = str(pending.get("original_prompt") or "").strip()
+    identifiers = ", ".join(f'"{item.get("identifier")}"' for item in selected)
+    kinds = {str(item.get("kind") or "") for item in selected}
+
+    if kinds == {"parameter"}:
+        instruction = (
+            f'For the request "{original_prompt}": set the parameter(s) {identifiers} to `false` '
+            f"in `{file_path}`. Do not change any other parameter in that file."
+        )
+    elif kinds == {"list_entry"}:
+        list_vars = {str(item.get("list_variable") or "") for item in selected}
+        list_var = next(iter(list_vars)) if len(list_vars) == 1 else ""
+        list_note = f" from the `{list_var}` list" if list_var else ""
+        instruction = (
+            f'For the request "{original_prompt}": disable the rule entry/entries {identifiers}{list_note} '
+            f"in `{file_path}`. Preserve every other entry in that list unchanged."
+        )
+    else:
+        instruction = (
+            f'For the request "{original_prompt}": apply the requested change to {identifiers} in '
+            f"`{file_path}`. Do not change any other declaration in that file."
+        )
+
+    LOGGER.info(
+        "TEAMS-RESCUE-RESOLVE: resolved user reply %r to option(s) %s -> instruction=%r",
+        text[:80], [item.get("identifier") for item in selected], instruction[:200],
+    )
+    return instruction
 
 
 def call_agent(conversation_id: Optional[str], agent_input: str):
@@ -29841,14 +30031,40 @@ def call_agent(conversation_id: Optional[str], agent_input: str):
             str(reply or "")[:200],
             _teams_looks_like_grounding_refusal(reply),
         )
-        rescued_reply = _teams_maybe_rescue_grounding_refusal(memory_enriched_input, reply)
-        if rescued_reply:
+        rescue_outcome = _teams_maybe_rescue_grounding_refusal(memory_enriched_input, reply)
+        if rescue_outcome:
+            rescued_reply, resolution_context = rescue_outcome
             LOGGER.info(
                 "TEAMS-AGENT-CALL-3[%s]: rescued a bare grounding refusal into an evidence-backed "
-                "clarification before returning it to the user.",
+                "clarification before returning it to the user (options=%s).",
                 call_id,
+                len((resolution_context or {}).get("options") or []),
             )
             reply = rescued_reply
+            teams_conversation_id = str(active.get("teams_conversation_id") or "").strip()
+            if resolution_context and teams_conversation_id:
+                try:
+                    _teams_save_ui_state(
+                        teams_conversation_id,
+                        {
+                            "pending_rescue_selection": {
+                                **resolution_context,
+                                "cloud": str(active.get("cloud") or ""),
+                                "repo_target": str(active.get("repo_target") or ""),
+                            },
+                        },
+                    )
+                    LOGGER.info(
+                        "TEAMS-RESCUE-5: persisted pending rescue selection for conversation=%s "
+                        "(%s option(s)) so the next reply can be resolved deterministically.",
+                        teams_conversation_id,
+                        len(resolution_context.get("options") or []),
+                    )
+                except Exception:
+                    LOGGER.exception(
+                        "TEAMS-RESCUE-ERROR: unable to persist pending rescue selection for conversation=%s",
+                        teams_conversation_id,
+                    )
         _teams_record_agent_memory_turn(active, agent_input, reply)
     return result_conversation_id, reply
 
@@ -34223,6 +34439,55 @@ def handle_teams_chat_request(data: dict):
         or request_data.get("message")
         or ""
     ).strip()
+
+    # Resolve a reply to a previously rescued numbered picker (see
+    # _teams_maybe_rescue_grounding_refusal) BEFORE any routing/state-machine
+    # logic sees this message, so a bare "1" or a named option is turned into
+    # a fully-specified instruction instead of ambiguous free text. This is
+    # what lets the user "choose from the list" rather than having to type an
+    # exact rule/parameter name from memory.
+    teams_conversation_id = str(
+        request_data.get("teams_conversation_id")
+        or request_data.get("conversation_id")
+        or ""
+    ).strip()
+    if teams_conversation_id and prompt and not str(request_data.get("action") or "").strip():
+        try:
+            existing_state = load_teams_conversation_state(teams_conversation_id) or {}
+        except Exception:
+            existing_state = {}
+        pending_rescue = existing_state.get("pending_rescue_selection")
+        if isinstance(pending_rescue, dict) and pending_rescue.get("options"):
+            resolved_instruction = _teams_resolve_pending_rescue_selection(prompt, pending_rescue)
+            if resolved_instruction:
+                LOGGER.info(
+                    "TEAMS-RESCUE-RESOLVE-TRIGGER: rewriting reply %r into a fully-specified "
+                    "instruction using the pending rescue selection for conversation=%s.",
+                    prompt[:80], teams_conversation_id,
+                )
+                request_data["prompt"] = resolved_instruction
+                request_data["original_prompt"] = resolved_instruction
+                request_data["fresh_infra_generation"] = True
+                request_data["mode"] = "infra"
+                pending_cloud = str(pending_rescue.get("cloud") or "").strip()
+                if pending_cloud:
+                    request_data["cloud"] = pending_cloud
+                    request_data["requested_cloud"] = pending_cloud
+                prompt = resolved_instruction
+                try:
+                    _teams_save_ui_state(teams_conversation_id, {"pending_rescue_selection": None})
+                except Exception:
+                    LOGGER.exception(
+                        "TEAMS-RESCUE-ERROR: unable to clear pending rescue selection for conversation=%s",
+                        teams_conversation_id,
+                    )
+            else:
+                LOGGER.info(
+                    "TEAMS-RESCUE-RESOLVE-TRIGGER: reply %r did not match any pending rescue option "
+                    "for conversation=%s; treating it as an ordinary new message.",
+                    prompt[:80], teams_conversation_id,
+                )
+
     result, status_code = _TEAMS_PR_DUPLICATE_CHECK_PREVIOUS_HANDLE_CHAT(request_data)
     result = dict(result or {})
 
