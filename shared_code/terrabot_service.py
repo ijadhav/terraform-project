@@ -33320,70 +33320,70 @@ def commit_terraform_files_to_branch_for_teams(agent_result: dict, prompt: str, 
     return _commit_terraform_files_to_branch_for_teams_base(agent_result, prompt, thread_id)
 
 # =============================================================================
-# 2026-08-18 ENABLE/DISABLE MAIN.TF-FIRST EVIDENCE ROUTING — FINAL OVERRIDE
+# 2026-08-18 TARGET main.tf + AGENT-OWNED FLAG RESOLUTION + PRESERVATION GUARD
 # =============================================================================
-# Enable/disable semantics remain Foundry-owned. The backend only guarantees
-# that the complete target-environment main.tf is supplied first as live code
-# evidence, followed by the rest of the environment files. It never extracts,
-# ranks, selects, or toggles Boolean flags itself.
+# Final override. The backend retrieves authoritative repository code and
+# validates preservation only. Foundry remains solely responsible for deciding
+# which module/Boolean implements the user's request and for generating HCL.
 
-_AGENT_FLAG_MAIN_FIRST_PREVIOUS_SELECTED_CHECK = _backend_existing_infra_context_is_selected
-_AGENT_FLAG_MAIN_FIRST_PREVIOUS_BUILD_CONTEXT = build_backend_existing_infra_modification_context
-
-
-def _backend_existing_infra_context_is_selected(context: dict | None) -> bool:
-    """Treat agent-resolved feature-state context as generation-ready.
-
-    A feature-state request can intentionally contain several live files because
-    Foundry, not the backend, must decide which repository-defined Boolean is the
-    controlling flag. Do not convert that evidence set into a user file picker.
-    """
-    if (
-        isinstance(context, dict)
-        and context.get("agent_resolves_target")
-        and context.get("selection_state") == "selected"
-        and bool(context.get("matched_files"))
-    ):
-        return True
-    return _AGENT_FLAG_MAIN_FIRST_PREVIOUS_SELECTED_CHECK(context)
+_AGENT_MAIN_TF_PREVIOUS_BUILD_EXISTING_CONTEXT = build_backend_existing_infra_modification_context
+_AGENT_MAIN_TF_PREVIOUS_GITHUB_PUT_IF_CHANGED = github_put_file_if_changed
 
 
-def _teams_agent_owned_main_tf_evidence(
+def _teams_target_environment_main_tf_evidence(
     prompt: str,
-    branch: str,
+    cloud: str,
     workflow: str,
+    branch: str,
 ) -> list[dict]:
-    """Return complete target AWS main.tf file(s), in prompt environment order.
+    """Return complete live target-environment main.tf files when they exist.
 
-    This function performs repository retrieval only. It deliberately does not
-    parse resource names, module names, aliases, or Boolean assignments.
+    This is structural repository retrieval only. It deliberately does not
+    choose a module, resource, or flag. Foundry receives the complete consumer
+    file and performs the semantic resolution.
     """
-    entries: list[dict] = []
-    for environment_path in _teams_requested_aws_environment_paths(prompt, branch=branch):
-        main_path = f"{environment_path.rstrip('/')}/main.tf"
+    try:
+        normalized_cloud = normalize_cloud(cloud)
+    except Exception:
+        return []
+    if normalized_cloud != "aws":
+        return []
+
+    repo_target = normalize_repo_target(
+        normalized_cloud,
+        workflow=workflow,
+    )
+    environment_paths = _teams_requested_aws_environment_paths(prompt, branch=branch)
+    if not environment_paths:
+        exact_environment = _teams_exact_aws_environment_path(prompt)
+        if exact_environment:
+            environment_paths = [exact_environment]
+
+    evidence: list[dict] = []
+    for environment_path in environment_paths:
+        main_path = f"{str(environment_path).strip().strip('/')}/main.tf"
         try:
             content = github_get_file_content(
                 "aws",
                 main_path,
                 branch,
-                repo_target="tf-devops",
+                repo_target=repo_target,
                 workflow=workflow,
             )
         except Exception:
             content = None
         if content is None:
             continue
-        entries.append({
+        evidence.append({
             "path": main_path,
             "filename": "main.tf",
             "content": content,
-            "matched_blocks": [],
             "reason": (
-                "authoritative target-environment main.tf supplied first for "
-                "Foundry-owned resource/module and Boolean-state resolution"
+                "authoritative target-environment consumer main.tf from live GitHub; "
+                "Foundry must resolve the requested module and any controlling Boolean here"
             ),
         })
-    return entries
+    return evidence
 
 
 def build_backend_existing_infra_modification_context(
@@ -33393,8 +33393,14 @@ def build_backend_existing_infra_modification_context(
     workflow: str,
     retrieved_value_context: list | None = None,
 ) -> dict:
-    """Feature-state routing: main.tf first, Foundry decides the actual flag."""
-    context = _AGENT_FLAG_MAIN_FIRST_PREVIOUS_BUILD_CONTEXT(
+    """Prefer complete target main.tf evidence for Teams enable/disable turns.
+
+    No semantic module or flag decision is made here. The backend only resolves
+    the environment and reads the authoritative consumer file. This prevents
+    repository-wide keyword matches such as backend.tf, outputs.tf, SSM data
+    sources, or unrelated parameter files from becoming user choices.
+    """
+    context = _AGENT_MAIN_TF_PREVIOUS_BUILD_EXISTING_CONTEXT(
         prompt,
         thread_id,
         cloud,
@@ -33402,82 +33408,170 @@ def build_backend_existing_infra_modification_context(
         retrieved_value_context=retrieved_value_context,
     )
     active = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
-    if not (
-        active.get("active")
-        and safe_normalize_cloud(cloud) == "aws"
-        and _teams_feature_flag_intent(prompt) in {"enable", "disable"}
-    ):
+    intent = _teams_feature_flag_intent(prompt)
+    if not (active.get("active") and intent in {"enable", "disable"}):
         return context
 
     context = dict(context or {})
-    branch = str(
-        context.get("context_ref")
-        or _teams_remote_context_branch(
-            "aws",
-            repo_target="tf-devops",
-            workflow=workflow,
-        )
-        or ""
-    ).strip()
+    branch = str(context.get("context_ref") or "").strip()
+    if not branch:
+        try:
+            normalized_cloud = normalize_cloud(cloud)
+            repo_target = normalize_repo_target(normalized_cloud, workflow=workflow)
+            branch = _teams_remote_context_branch(normalized_cloud, repo_target, workflow)
+        except Exception:
+            branch = ""
 
-    # Guarantee target environment main.tf is present first. Existing context
-    # remains available afterwards as additional live repository evidence, but
-    # none of it is presented to the user as a file choice.
-    main_entries = _teams_agent_owned_main_tf_evidence(prompt, branch, workflow)
-    existing_entries = [
-        dict(item)
-        for item in (context.get("matched_files") or [])
-        if isinstance(item, dict)
-    ]
-    ordered: list[dict] = []
-    seen: set[str] = set()
-    for item in main_entries + existing_entries:
-        path = str(item.get("path") or "").strip().strip("/")
-        if not path or path in seen:
-            continue
-        seen.add(path)
-        ordered.append(item)
-
-    # Also supply the complete files from each explicitly requested environment
-    # when they were not already found by the generic retrieval path. This is
-    # evidence only; Foundry filters it semantically and emits only actionable
-    # Boolean choices when genuine ambiguity remains.
-    try:
-        env_entries, _value_paths, _debug = _teams_environment_folder_evidence(
-            prompt,
-            "aws",
-            "tf-devops",
-            workflow,
-            branch,
-        )
-    except Exception:
-        env_entries = []
-    for item in env_entries:
-        if not isinstance(item, dict):
-            continue
-        path = str(item.get("path") or "").strip().strip("/")
-        if not path or path in seen:
-            continue
-        seen.add(path)
-        ordered.append(dict(item))
-
-    context["selection_state"] = "selected"
-    context["selected_path"] = ""
-    context["agent_resolves_target"] = True
-    context["main_tf_first"] = True
-    context["matched_files"] = ordered
-    context["matched_file_paths"] = [
-        str(item.get("path") or "").strip().strip("/")
-        for item in ordered
-        if str(item.get("path") or "").strip()
-    ]
-    context["instructions"] = [
-        "Foundry owns all resource/module/flag semantic resolution and all Terraform generation.",
-        "For each requested environment, inspect its complete main.tf FIRST and locate the existing module/resource that implements the user's requested feature.",
-        "Inside that repository-proven workflow, prefer actionable Boolean assignments for enable/disable when they exist; apply requested-state polarity before deciding whether a candidate is actionable.",
-        "Do not expose files, SSM/data parameters, backend/provider/version files, or non-Boolean values merely because their text resembles the user request.",
-        "If exactly one relevant actionable Boolean flag is proven, change it immediately and return no target-selection question.",
-        "If multiple genuinely relevant actionable Boolean flags remain, ask one numbered semantic flag choice generated from the Terraform context; never ask the user to choose a file.",
-        "The backend has not selected a module, resource, or flag and will not modify Terraform content itself.",
-    ]
+    main_tf_evidence = _teams_target_environment_main_tf_evidence(
+        prompt,
+        cloud,
+        workflow,
+        branch,
+    )
+    if main_tf_evidence:
+        # Replace broad keyword candidates with the authoritative environment
+        # consumer file(s). Foundry sees the full file and performs module/flag
+        # resolution itself.
+        context["matched_files"] = main_tf_evidence
+        context["matched_file_paths"] = [item["path"] for item in main_tf_evidence]
+        context["selection_state"] = "selected"
+        context["selected_path"] = main_tf_evidence[0]["path"] if len(main_tf_evidence) == 1 else ""
+        context["target_environment_main_tf_first"] = True
+        context["agent_resolves_target"] = True
+        context["instructions"] = [
+            "Treat each supplied target-environment main.tf as authoritative live repository content.",
+            "For enable/disable requests, first inspect module blocks in target main.tf. Resolve the user's resource wording to the relevant existing module from its module label, source, comments, arguments, and surrounding repository semantics.",
+            "Within semantically relevant module blocks, prefer repository-defined Boolean controls whose current literal value matches the requested transition: disable => true, enable => false. Typical naming shapes such as enable_*, create_*, *_enabled, deploy_*, use_* are examples only, not a whitelist.",
+            "Do not surface data sources, SSM parameters, backend/provider/version files, outputs, unrelated arguments, or plain keyword matches as choices when a semantically relevant Boolean control exists.",
+            "If exactly one relevant module/Boolean exists, generate the change directly without asking the user.",
+            "If multiple genuinely relevant modules remain, ask only which MODULE the user means. Each choice must show the module label and the relevant Boolean flag(s) found inside that module; do not ask the user to choose a file when all choices are in target main.tf.",
+            "Return the COMPLETE final file content for every modified existing file. Copy every unrelated existing line/block/comment exactly and change only the requested assignment(s). Never use placeholders such as '<existing content preserved as in evidence>', ellipses standing for omitted repository code, or abbreviated file bodies.",
+            "The backend will reject destructive/truncated full-file responses; it will not merge or synthesize Terraform on Foundry's behalf.",
+        ]
     return context
+
+
+def _terrabot_placeholder_content_detected(content: str) -> bool:
+    text = str(content or "").lower()
+    markers = (
+        "<existing content preserved as in evidence>",
+        "existing content preserved as in evidence",
+        "<existing content preserved>",
+        "existing content unchanged",
+        "... existing content ...",
+        "# existing content preserved",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _validate_agent_full_file_preservation_for_write(
+    existing_content: str,
+    generated_content: str,
+    path: str,
+    workflow: str | None,
+) -> None:
+    """Reject destructive Foundry rewrites without generating any Terraform.
+
+    Validation may compare repository truth with Foundry's final file. It may
+    not repair, merge, append, toggle, or otherwise mutate the generated HCL.
+    """
+    if existing_content is None:
+        return
+    if _terrabot_placeholder_content_detected(generated_content):
+        raise ValueError(
+            f"Generated modification for {path} contains a repository-content placeholder. "
+            "Foundry must return the complete real file with unrelated content preserved."
+        )
+
+    normalized_workflow = str(workflow or "").strip()
+    if normalized_workflow not in INFRA_MODIFICATION_WORKFLOWS:
+        return
+
+    # Re-enable the existing non-mutating preservation validator. This function
+    # only rejects destructive replacements; it does not construct file content.
+    _validate_full_file_modification_preserves_existing(
+        existing_content,
+        generated_content,
+        path,
+    )
+
+    existing = (existing_content or "").replace("\r\n", "\n")
+    generated = (generated_content or "").replace("\r\n", "\n")
+    if not existing.strip():
+        return
+
+    # Modification requests must not silently delete existing top-level blocks
+    # unless the user explicitly requested deletion/removal.
+    flow_context = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
+    effective_prompt = str(flow_context.get("effective_prompt") or "").lower()
+    explicit_delete = bool(re.search(r"\b(?:delete|remove)\b", effective_prompt))
+    if path.endswith(".tf") and not explicit_delete:
+        existing_headers = _top_level_tf_headers_for_modification(existing)
+        generated_headers = _top_level_tf_headers_for_modification(generated)
+        missing_headers = sorted(existing_headers - generated_headers)
+        if missing_headers:
+            raise ValueError(
+                f"Generated modification for {path} removed existing Terraform blocks: "
+                + ", ".join(missing_headers[:12])
+                + ". Foundry must preserve unrelated repository content and edit only the requested code."
+            )
+
+    # A complete-file modification should remain close in size to repository
+    # truth. This catches one-line/single-block replacements while allowing
+    # ordinary targeted edits and additions. It is validation only.
+    existing_nonblank = [line for line in existing.splitlines() if line.strip()]
+    generated_nonblank = [line for line in generated.splitlines() if line.strip()]
+    if len(existing_nonblank) >= 20 and len(generated_nonblank) < max(8, int(len(existing_nonblank) * 0.70)):
+        raise ValueError(
+            f"Generated modification for {path} is substantially shorter than the live repository file "
+            f"({len(generated_nonblank)} vs {len(existing_nonblank)} nonblank lines). "
+            "Refusing a likely truncated overwrite; Foundry must return the complete final file."
+        )
+
+
+def github_put_file_if_changed(
+    cloud: str,
+    path: str,
+    content: str,
+    branch: str,
+    commit_message: str,
+    repo_target: Optional[str] = None,
+    workflow: Optional[str] = None,
+):
+    """Validate preservation, then transport Foundry content exactly as returned."""
+    existing_content = github_get_file_content(
+        cloud,
+        path,
+        branch,
+        repo_target=repo_target,
+        workflow=workflow,
+    )
+    final_content = str(content or "")
+
+    normalized_existing = (existing_content or "").replace("\r\n", "\n").strip()
+    normalized_new = final_content.replace("\r\n", "\n").strip()
+    if existing_content is not None and normalized_existing == normalized_new:
+        return {"changed": False, "path": path, "result": None}
+
+    if path.endswith((".tf", ".tfvars")):
+        _validate_hcl_content_complete(path, final_content)
+        if _has_git_conflict_markers(final_content):
+            raise ValueError(f"Generated {path} contains Git conflict markers.")
+        _validate_agent_full_file_preservation_for_write(
+            existing_content,
+            final_content,
+            path,
+            workflow,
+        )
+
+    # Transport only: no merge, repair, append, normalization, or flag toggle.
+    result = github_put_file(
+        cloud=cloud,
+        path=path,
+        content=final_content,
+        branch=branch,
+        commit_message=commit_message,
+        repo_target=repo_target,
+        workflow=workflow,
+    )
+    return {"changed": True, "path": path, "result": result}

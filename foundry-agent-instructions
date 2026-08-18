@@ -4257,77 +4257,89 @@ Before every enable/disable response verify:
   preserves all unrelated repository code.
 
 ================================================================================
-26. ENABLE / DISABLE — TARGET ENVIRONMENT main.tf FIRST — FINAL OVERRIDE
+TARGET ENVIRONMENT main.tf BOOLEAN RESOLUTION + FULL-FILE PRESERVATION — FINAL OVERRIDE
 ================================================================================
 
-This section refines the Foundry-owned enable/disable workflow. It overrides
-any earlier behavior that treats every repository text match as a candidate or
-asks the user to choose among Terraform files.
+This section is the final authority for an existing-resource enable/disable or
+small modification request when Teams supplies live target-environment code.
 
-1. START WITH THE TARGET ENVIRONMENT main.tf
+1. TARGET ENVIRONMENT main.tf FIRST
+- When the backend supplies `target_environment_main_tf_first = true`, inspect
+  the complete target environment `main.tf` before considering any other
+  repository match.
+- Treat its existing `module` blocks as the primary consumer/resource units.
+- Resolve the user's wording semantically against module label, source,
+  comments, arguments, and the module's role in the surrounding Terraform.
+- Do not turn every file or every textual keyword occurrence into a user choice.
 
-For every enable/disable/turn-on/turn-off request, inspect the complete live
-`main.tf` for EACH environment named by the user before considering generic
-repository text matches.
+2. BOOLEAN FLAGS BEFORE GENERIC PARAMETER MATCHES
+- For `disable`, inside the semantically relevant module(s), first consider
+  repository-defined Boolean controls whose CURRENT literal value is `true`.
+- For `enable`, inside the semantically relevant module(s), first consider
+  repository-defined Boolean controls whose CURRENT literal value is `false`.
+- Names such as `enable_*`, `create_*`, `*_enabled`, `deploy_*`, `use_*`, or
+  similar repository conventions are examples, not a hardcoded whitelist.
+- A data source, SSM parameter, secret reference, URL, output, backend/provider
+  setting, unrelated module argument, or plain text keyword occurrence is NOT
+  a modification candidate merely because its name contains the user's word.
+- Example: if target `main.tf` contains module `patch_management` and that
+  module contains `enable_patch_monitoring = true`, a request to "disable patch
+  setup" should resolve to that module/Boolean when repository semantics support
+  it. Do not offer patch-related SSM data sources as alternatives.
 
-Use `main.tf` to identify the existing module/resource/locals workflow that
-implements the requested capability. Follow repository references from that
-workflow only when necessary (for example a module source, variable
-declaration, implementation condition, or sibling environment).
+3. WHEN TO ASK
+- Exactly one semantically relevant module/Boolean: make the requested change
+  directly. Do not ask the user to pick a file or parameter.
+- Multiple genuinely relevant modules: ask ONE module-level question only.
+  Each numbered choice must show:
+    `module "<label>" — <relevant_boolean> = <current_value> — <path>`
+  Add one short repository-derived description when useful.
+- Do not list backend.tf, outputs.tf, versions.tf, unrelated .tf files, data
+  sources, or arbitrary parameters in that module picker.
+- After the user chooses a module, apply the original request immediately; do
+  not ask which flag or file when the repository evidence makes that answer
+  clear.
 
-Example: for "disable patch setup on us1", first inspect
-`terraform/prod_aws/us1/main.tf`. If it contains the patch-management module
-and that module invocation contains or wires the repository Boolean
-`enable_patch_monitoring = true`, that is the primary semantic target.
+4. COMPLETE EXISTING FILE IS MANDATORY
+- For every existing file that must be modified, return the COMPLETE current
+  repository file with only the requested change applied.
+- Preserve every unrelated line, block, comment, module, resource, data source,
+  local, variable, output, and formatting-relevant value exactly unless the
+  requested change itself requires touching it.
+- NEVER return a partial block, abbreviated file, synthetic reconstruction, or
+  placeholder such as:
+    `<existing content preserved as in evidence>`
+    `... existing content ...`
+    `# existing content preserved`
+- A placeholder is not preservation. The actual repository text must be present
+  in `files[].content`.
+- Do not replace a large existing file with the one changed module. Do not drop
+  sibling modules/resources. Do not append a sentence claiming they were
+  preserved.
 
-2. BOOLEAN FLAGS OUTRANK TEXTUAL PARAMETER MATCHES FOR ENABLE/DISABLE
+5. MINIMAL CHANGE
+- For a Boolean enable/disable request, normally only the resolved Boolean
+  assignment changes. Keep the containing module and the rest of the file
+  unchanged.
+- Do not create a new module/resource when an existing module and controlling
+  Boolean already implement the requested feature.
+- Do not remove the module to disable a Boolean-gated feature unless live repo
+  evidence proves removal is the repository convention and the user explicitly
+  requested deletion rather than disablement.
 
-After locating the relevant workflow in `main.tf`, search that workflow and its
-repository-proven references for Boolean state controls. A Boolean is actionable
-only when both are true:
-- repository semantics connect it to the user's requested capability; and
-- its current value has the correct polarity for the requested operation
-  (disable => true, enable => false).
+6. BACKEND OWNERSHIP BOUNDARY
+- Backend evidence retrieval and preservation validation are not Terraform
+  generation. The backend may reject a truncated/destructive output, but it
+  will not merge, repair, append, reconstruct, or toggle Terraform for you.
+- Therefore the Foundry response itself must contain the correct complete final
+  repository file.
 
-Do NOT treat these as user-visible candidates merely because they contain the
-same words:
-- `data` blocks or SSM parameter names;
-- string/number/list/map values;
-- backend/provider/version files;
-- outputs;
-- unrelated module/resource blocks;
-- unrelated Boolean assignments.
-
-Text similarity is evidence for locating the workflow, not evidence that every
-matching parameter is a valid modification target.
-
-3. ONE BOOLEAN MATCH => CHANGE IT WITHOUT ASKING
-
-If the `main.tf`-first workflow proves exactly one relevant actionable Boolean,
-select it automatically, generate the complete final file, and return
-`questions=[]`.
-
-The user-facing analysis/summary must identify the semantic target, for example:
-- module: `patch_monitoring` / `patch_management` (use the exact live label);
-- flag: `enable_patch_monitoring`;
-- old value: `true`;
-- new value: `false`;
-- path: the exact target environment `main.tf` (or the exact repository value
-  file only if the live workflow proves the Boolean is stored there).
-
-Do not show backend.tf, outputs.tf, s3.tf, versions.tf, SSM parameters, or other
-non-actionable matches.
-
-4. MULTIPLE BOOLEAN MATCHES => SEMANTIC FLAG CHOICE, NEVER FILE CHOICE
-
-Only when two or more genuinely relevant actionable Boolean controls remain,
-ask one numbered question. Each option must be a Boolean flag/resource meaning,
-not a filename. Derive the description from the enclosing module/resource,
-variable declaration, comments, and implementation references.
-
-5. BACKEND RESPONSIBILITY REMAINS EVIDENCE ONLY
-
-The backend may ensure the target environment `main.tf` and surrounding live
-repository files are supplied as evidence. It does not decide which module,
-resource, or Boolean is correct and it does not toggle Terraform itself. All
-semantic filtering and final HCL generation are performed by this Foundry agent.
+Before returning, verify:
+- target main.tf was inspected first when supplied;
+- the semantic module matches the user's requested feature;
+- relevant Boolean controls were preferred over generic textual matches;
+- any question is module-level and only necessary because multiple relevant
+  modules remain;
+- every modified existing file contains the complete real repository content;
+- no preservation placeholder or omitted-content marker exists;
+- only the requested code changed.
