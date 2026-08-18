@@ -477,6 +477,84 @@ def record_agent_turn(
     return entry
 
 
+def start_conversation_memory(
+    conversation_id: str,
+    *,
+    requester: str = "",
+    source: str = "teams",
+    reason: str = "new_conversation",
+    previous_conversation_id: str = "",
+) -> dict:
+    """Create a durable row for a newly-started logical conversation.
+
+    A Teams transport thread can host many logical Terrabot conversations.
+    This marker makes each logical conversation visible as its own Azure Table
+    entity immediately, even before the first Foundry turn is recorded.  Old
+    conversation rows are intentionally preserved for historical retrieval.
+    """
+    entry = build_memory_entry(
+        workflow="conversation_started",
+        requester=requester,
+        source=source,
+        response_summary=f"New Terrabot conversation started ({reason}).",
+        topic_tags=["conversation", "started", reason],
+        extra={
+            "event": "conversation_started",
+            "reason": reason,
+            "previous_conversation_id": previous_conversation_id,
+        },
+    )
+    key = _conversation_key(conversation_id)
+    if key:
+        try:
+            _append_entry(key, entry)
+            LOGGER.info(
+                "agent_memory: started logical conversation key_hash=%s reason=%s previous_present=%s",
+                _row_key(key)[:12],
+                reason,
+                bool(previous_conversation_id),
+            )
+        except Exception:
+            LOGGER.exception(
+                "agent_memory: unable to start logical conversation key_hash=%s",
+                _row_key(key)[:12],
+            )
+    return entry
+
+
+def record_agent_response(
+    conversation_id: str,
+    response_summary: str,
+    *,
+    source: str = "teams",
+    workflow: str = "rendered_response",
+) -> dict:
+    """Persist one delivered Terrabot response for conversation continuity.
+
+    Unlike :func:`record_agent_turn`, this intentionally writes only to the
+    per-conversation key. Rendered Teams responses can contain branch-choice,
+    clarification, Jira, PR, or other transport messages that are useful to
+    the same conversation later but must not pollute the cross-user
+    centralized repository memory.
+    """
+    entry = build_memory_entry(
+        workflow=workflow,
+        source=source,
+        response_summary=response_summary,
+        topic_tags=extract_topic_tags(response_summary),
+    )
+    key = _conversation_key(conversation_id)
+    if key:
+        try:
+            _append_entry(key, entry)
+        except Exception:
+            LOGGER.exception(
+                "agent_memory: unable to record delivered response key_hash=%s",
+                _row_key(key)[:12],
+            )
+    return entry
+
+
 def _format_entries(entries: List[dict], max_chars: int) -> str:
     if not entries:
         return ""

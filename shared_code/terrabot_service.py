@@ -2521,109 +2521,36 @@ def infer_azure_module_resource_slug(original_prompt: str) -> str:
     return slug or "module"
 
 
-def build_deterministic_azure_module_repo_creation_payload(
-    original_prompt: str,
-    requested_repo_name: str = "",
-) -> dict:
-    resource_slug = infer_azure_module_resource_slug(original_prompt)
-    resource_slug = resource_slug.replace("azure-", "", 1).strip("-")
-    resource_id = resource_slug.replace("-", "_")
-
-    explicit_repo_name = (
-        sanitize_azure_module_repo_name(requested_repo_name)
-        or extract_requested_azure_module_repo_name(original_prompt)
-    )
-
-    if explicit_repo_name:
-        repo_name = explicit_repo_name
-        module_label = terraform_label_from_repo_name(repo_name, fallback=f"azure_{resource_id}_module")
-    else:
-        repo_name = f"tf-module-azure-{resource_slug}"
-        module_label = f"tf_module_azure_{resource_id}"
-
-    tf_filename = f"{module_label}.tf"
-
-    description_resource = " ".join(
-        "VM" if part == "vm" else part.capitalize()
-        for part in resource_slug.split("-")
-    )
-
-    content = f"""module "{module_label}" {{
-  source = "../modules/repo"
-
-  name                   = "{repo_name}"
-  description            = "Repository for Azure {description_resource} Module"
-  delete_branch_on_merge = true
-  has_issues             = true
-  default_branch         = "main"
-  merge_commit_title     = "{DEFAULT_GITHUB_MERGE_COMMIT_TITLE}"
-  merge_commit_message   = "{DEFAULT_GITHUB_MERGE_COMMIT_MESSAGE}"
-  actions_enabled        = false
-
-  managed_files = {{
-    PULL_REQUEST_TEMPLATE = {{
-      repo_path  = ".github/PULL_REQUEST_TEMPLATE.md"
-      local_file = "devops.md"
-    }}
-    CODEOWNERS = {{
-      repo_path     = ".github/CODEOWNERS"
-      file_contents = "* @venasolutions/${{var.vena_teams.sto.slug}}"
-    }}
-    PRE_COMMIT = {{
-      repo_path  = ".pre-commit-config.yaml"
-      local_file = "terraform.yml"
-    }}
-  }}
-
-  collaborators = {{}}
-
-  managed_branches = ["main"]
-}}
-"""
-
-    return {
-        "mode": "infra",
-        "cloud": "azure",
-        "workflow": "azure_module_repo_creation",
-        "repo_target": "vena_repos",
-        "title": f"[AZURE] Create {repo_name} module repository",
-        "summary": f"Creates the Azure module repository definition {repo_name} in terraform-github/vena_repos.",
-        "target_module_repo_name": repo_name,
-        "target_module_repo_full_name": f"{GITHUB_OWNER}/{repo_name}",
-        "files": [
-            {
-                "filename": tf_filename,
-                "content": content,
-            }
-        ],
-    }
-
-
 def generate_azure_module_repo_creation_with_agent(
     conversation_id: str,
     original_prompt: str,
     requested_repo_name: str = "",
 ) -> dict:
-    del conversation_id
+    """Generate Azure module-repository Terraform exclusively through Foundry.
 
-    # This stage is deterministic on purpose: the repo-creation PR must only
-    # add the vena-repos repository definition. Do not ask the agent to
-    # generate Terraform here, because it may emit module implementation files
-    # such as main.tf, variables.tf, or outputs.tf.
-    payload = build_deterministic_azure_module_repo_creation_payload(
-        original_prompt,
-        requested_repo_name=requested_repo_name,
+    The backend supplies the resolved user request and repository evidence; it
+    never constructs Terraform/HCL itself. Any requested repository name is
+    passed to Foundry as user intent, not converted into backend-owned code.
+    """
+    request = {
+        "task": "Generate the requested Azure module repository Terraform using the live repository evidence and Terrabot Foundry instructions.",
+        "user_request": str(original_prompt or "").strip(),
+        "requested_repo_name": sanitize_azure_module_repo_name(requested_repo_name)
+        or extract_requested_azure_module_repo_name(original_prompt),
+        "backend_role": "evidence_and_transport_only",
+        "rules": [
+            "Infer the repository workflow and Terraform structure from supplied live repository evidence.",
+            "Generate all Terraform/HCL in Foundry; the backend must not synthesize Terraform.",
+            "Return the normal Terrabot infrastructure JSON payload.",
+        ],
+    }
+    _conversation_id, agent_reply = call_agent(
+        conversation_id or None,
+        json.dumps(request, ensure_ascii=False),
     )
-    parsed = parse_agent_output(json.dumps(payload))
-
-    if parsed.get("workflow") != "azure_module_repo_creation":
-        raise ValueError("Repo-creation generation returned the wrong workflow.")
-
-    for key in ("target_module_repo_name", "target_module_repo_full_name"):
-        if payload.get(key):
-            parsed[key] = payload[key]
-
-    return parsed
+    if not str(agent_reply or "").strip():
+        raise RuntimeError("No response returned from Foundry for Azure module repository generation.")
+    return try_parse_agent_output(agent_reply)
 
 def cloud_root_dir(cloud: Any | None, repo_target: Optional[str] = None, workflow: Optional[str] = None) -> str:
     cloud = normalize_cloud(cloud)
@@ -3900,6 +3827,12 @@ def github_put_file_if_changed(
     repo_target: Optional[str] = None,
     workflow: Optional[str] = None,
 ):
+    """Write Foundry-generated content exactly; never synthesize Terraform.
+
+    The backend may compare, validate, and transport the agent's final file,
+    but it must not merge blocks, repair braces, normalize tfvars, toggle
+    Boolean values, or otherwise create/modify Terraform on the agent's behalf.
+    """
     existing_content = github_get_file_content(
         cloud,
         path,
@@ -3907,137 +3840,18 @@ def github_put_file_if_changed(
         repo_target=repo_target,
         workflow=workflow,
     )
-
-    final_content = content
-    is_azure_variables_tf = _is_azure_consumer_variables_tf_path(
-        cloud=cloud,
-        path=path,
-        repo_target=repo_target,
-        workflow=workflow,
-    )
-
-    workflow_key = (workflow or "").strip().lower()
-
-    if (
-        existing_content is not None
-        and workflow_key in INFRA_MODIFICATION_WORKFLOWS
-        and (path.endswith(".tf") or path.endswith(".tfvars"))
-     ):
-        # Modification workflows are full-file edits. Do not run append/merge
-        # logic here; append/merge intentionally preserves existing blocks and
-        # can swallow one-line changes inside those blocks.
-        final_content = (content or "").replace("\r\n", "\n").rstrip() + "\n"
-        if is_azure_variables_tf:
-            final_content = _repair_unclosed_variables_tf_content_for_write(
-                existing_content,
-                final_content,
-                path,
-            )
-        _validate_full_file_modification_preserves_existing(
-            existing_content,
-            final_content,
-            path,
-        )
-    elif existing_content is not None and path.endswith(".tf"):
-        merge_input = content
-        
-        if is_azure_variables_tf:
-            merge_input = _repair_unclosed_variables_tf_content_for_write(
-                existing_content,
-                merge_input,
-                path,
-            )
-
-        final_content = _merge_terraform_content_preserving_existing(
-            existing_content,
-            merge_input,
-        )
-
-        if is_azure_variables_tf:
-            final_content = _repair_unclosed_variables_tf_content_for_write(
-                existing_content,
-                final_content,
-                path,
-            )
-    elif existing_content is not None and path.endswith(".tfvars"):
-        final_content = content
-        if not _content_contains_existing_file(existing_content, final_content):
-            try:
-                is_azure_tfvars = (
-                    normalize_cloud(cloud) == "azure"
-                    and normalize_repo_target("azure", repo_target=repo_target, workflow=workflow) == "tf-azure-hub"
-                )
-            except Exception:
-                is_azure_tfvars = False
-
-            if is_azure_tfvars:
-                final_content = _merge_generated_tfvars_with_existing_preserving_existing(
-                    existing_tfvars=existing_content,
-                    generated_tfvars=final_content,
-                    candidate_assignments={},
-                    consumer_content="",
-                )
-
-            if not _content_contains_existing_file(existing_content, final_content):
-                raise ValueError(
-                    f"Generated tfvars content for {path} does not preserve the existing file contents. "
-                    "The backend rejects tfvars updates unless the generated file contains the current file content plus additions."
-                )
-
-        if _normalized_hcl_content_for_compare(existing_content) == _normalized_hcl_content_for_compare(final_content):
-            raise ValueError(
-                f"Generated tfvars content for {path} is unchanged. "
-                "Azure consumer PRs must include variable value additions in the routed tfvars file."
-            )
-
-        final_content = _normalize_generated_tfvars_content_preserving_existing(
-            existing_content,
-            final_content,
-        )
-        if not _content_contains_existing_file(existing_content, final_content):
-            final_content = _merge_generated_tfvars_with_existing_preserving_existing(
-                existing_tfvars=existing_content,
-                generated_tfvars=final_content,
-                candidate_assignments={},
-                consumer_content="",
-            )
-            final_content = _normalize_generated_tfvars_content_preserving_existing(
-                existing_content,
-                final_content,
-            )
-        if not _content_contains_existing_file(existing_content, final_content):
-            raise ValueError(
-                f"Generated tfvars content for {path} does not preserve the existing file contents after formatting. "
-                "The backend rejects tfvars updates unless the generated file contains the current file content plus additions."
-            )
-
-    elif existing_content is None and path.endswith(".tfvars"):
-        final_content = _normalize_generated_tfvars_content(final_content)
-
-
-
-    if is_azure_variables_tf:
-        final_content = _repair_unclosed_variables_tf_content_for_write(
-            existing_content=existing_content,
-            generated_content=final_content,
-            path=path,
-        )
+    final_content = str(content or "")
 
     normalized_existing = (existing_content or "").replace("\r\n", "\n").strip()
-    normalized_new = (final_content or "").replace("\r\n", "\n").strip()
-
+    normalized_new = final_content.replace("\r\n", "\n").strip()
     if existing_content is not None and normalized_existing == normalized_new:
-        if workflow_key in INFRA_MODIFICATION_WORKFLOWS:
-            raise ValueError(
-                 f"Generated modification for {path} did not change the matched file. "
-                 "Modification workflows must return the full final file with the requested edit applied."
-            )
+        return {"changed": False, "path": path, "result": None}
 
-        return {
-                "changed": False,
-                "path": path,
-                "result": None,
-            }
+    # Validation is allowed; mutation is not. Foundry must correct invalid HCL.
+    if path.endswith((".tf", ".tfvars")):
+        _validate_hcl_content_complete(path, final_content)
+        if _has_git_conflict_markers(final_content):
+            raise ValueError(f"Generated {path} contains Git conflict markers.")
 
     result = github_put_file(
         cloud=cloud,
@@ -4048,12 +3862,7 @@ def github_put_file_if_changed(
         repo_target=repo_target,
         workflow=workflow,
     )
-
-    return {
-        "changed": True,
-        "path": path,
-        "result": result,
-    }
+    return {"changed": True, "path": path, "result": result}
 
 def github_create_pull_request(cloud: Any | None, branch_name: str, title: str, body: str, repo_target: Optional[str] = None, workflow: Optional[str] = None):
     repo = github_repo_for_cloud(cloud, repo_target=repo_target, workflow=workflow)
@@ -8718,8 +8527,69 @@ def _teams_list_value_files_recursive(
     return results
 
 
+def _teams_requested_aws_environment_paths(prompt: str, branch: str = "") -> list[str]:
+    """Resolve every AWS environment explicitly requested by one Teams prompt.
+
+    This is deliberately plural. A prompt such as ``us1 and us2`` must not be
+    collapsed to the first match, and ``all prod environments`` expands from
+    the live ``terraform/prod_aws`` directory instead of assuming one default
+    production environment.
+    """
+    text = str(prompt or "").strip().lower().replace("-", "_")
+    paths: list[str] = []
+
+    all_prod = bool(re.search(r"\b(?:all|every)\s+(?:prod|production)(?:\s+(?:env|envs|environment|environments|hub|hubs))?\b", text))
+    if all_prod and branch:
+        try:
+            items = github_get_directory_listing(
+                "aws", "terraform/prod_aws", branch,
+                repo_target="tf-devops", workflow="aws_infra_modification",
+            ) or []
+            for item in items:
+                if isinstance(item, dict) and item.get("type") == "dir":
+                    path = str(item.get("path") or "").strip().strip("/")
+                    if path.startswith("terraform/prod_aws/") and path not in paths:
+                        paths.append(path)
+        except Exception:
+            LOGGER.debug("Unable to enumerate all live prod AWS environments", exc_info=True)
+
+    # Explicit environment names. Long/specific names are checked before their
+    # shorter base names so ``us1_dr`` does not also produce ``us1``.
+    aliases: list[tuple[str, str]] = []
+    for name, path in {**AWS_DEV_ENV_FOLDERS, **AWS_PROD_ENV_FOLDERS}.items():
+        aliases.append((str(name).lower(), str(path)))
+    aliases.sort(key=lambda item: len(item[0]), reverse=True)
+    consumed: list[tuple[int, int]] = []
+    for name, path in aliases:
+        forms = {name, name.replace("_", " "), name.replace("_", "-")}
+        for form in forms:
+            for match in re.finditer(rf"(?<![a-z0-9]){re.escape(form)}(?![a-z0-9])", text):
+                span = match.span()
+                if any(span[0] >= a and span[1] <= b for a, b in consumed):
+                    continue
+                if path not in paths:
+                    paths.append(path)
+                consumed.append(span)
+                break
+            else:
+                continue
+            break
+
+    # Region aliases not equal to folder names remain supported by the legacy
+    # singular resolver. Add that result when it represents another explicit
+    # target, but never use its minidev/us1 fallback for plural requests.
+    try:
+        legacy_path, legacy_error = detect_explicit_aws_environment(prompt)
+    except Exception:
+        legacy_path, legacy_error = None, None
+    if not legacy_error and legacy_path and legacy_path not in paths:
+        paths.append(str(legacy_path).strip().strip("/"))
+
+    return paths
+
+
 def _teams_exact_aws_environment_path(prompt: str) -> str:
-    """Return the deterministic tf-devops environment folder named by the prompt.
+    """Return one deterministic tf-devops environment folder when exactly one is requested.
 
     AWS repository layout is fixed at the tier boundary: non-production
     environments live under terraform/dev_aws and production environments live
@@ -8727,13 +8597,19 @@ def _teams_exact_aws_environment_path(prompt: str) -> str:
     repo-wide token walker so words such as ``ec2``, ``instance`` or ``dev_aws``
     can never become accidental environment matches.
     """
-    try:
-        path, error = resolve_aws_environment_path(prompt)
-    except Exception:
+    explicit_paths = _teams_requested_aws_environment_paths(prompt)
+    if len(explicit_paths) > 1:
         return ""
-    if error or not path:
-        return ""
-    normalized = str(path).strip().strip("/")
+    if explicit_paths:
+        normalized = explicit_paths[0]
+    else:
+        try:
+            path, error = resolve_aws_environment_path(prompt)
+        except Exception:
+            return ""
+        if error or not path:
+            return ""
+        normalized = str(path).strip().strip("/")
     allowed_prefixes = ("terraform/dev_aws/", "terraform/prod_aws/")
     if normalized == "terraform/root/global" or normalized.startswith(allowed_prefixes):
         return normalized
@@ -8840,21 +8716,33 @@ def _teams_locate_environment_value_files(
     # terraform/dev_aws/<env> or terraform/prod_aws/<env> first and read that
     # folder directly; do not depend on the bounded repo-wide token walk.
     if safe_normalize_cloud(cloud) == "aws":
-        exact_env = _teams_exact_aws_environment_path(prompt)
-        if exact_env:
-            entries, value_paths, exact_debug = _teams_read_exact_environment_folder(
-                exact_env, cloud, repo_target, workflow, branch
-            )
-            value_entries = [
-                entry for entry in entries
-                if str((entry or {}).get("path") or "").endswith((".tfvars", ".tfvars.json"))
-            ]
-            return value_entries, value_paths, {
-                "tokens": [exact_env.rsplit("/", 1)[-1]],
+        exact_envs = _teams_requested_aws_environment_paths(prompt, branch=branch)
+        if exact_envs:
+            combined_entries: list[dict] = []
+            combined_value_paths: list[str] = []
+            per_environment: list[dict] = []
+            for exact_env in exact_envs:
+                entries, value_paths, exact_debug = _teams_read_exact_environment_folder(
+                    exact_env, cloud, repo_target, workflow, branch
+                )
+                combined_entries.extend(
+                    entry for entry in entries
+                    if str((entry or {}).get("path") or "").endswith((".tfvars", ".tfvars.json"))
+                )
+                for path in value_paths:
+                    if path not in combined_value_paths:
+                        combined_value_paths.append(path)
+                per_environment.append({
+                    "path": exact_env,
+                    "files": exact_debug.get("files", 0),
+                    "value_files": list(value_paths),
+                })
+            return combined_entries, combined_value_paths, {
+                "tokens": [path.rsplit("/", 1)[-1] for path in exact_envs],
                 "walked": 0,
-                "matched": value_paths,
-                "exact_environment_path": exact_env,
-                "exact_folder_files": exact_debug.get("files", 0),
+                "matched": combined_value_paths,
+                "exact_environment_paths": exact_envs,
+                "environments": per_environment,
             }
 
     tokens = _teams_prompt_environment_tokens(prompt)
@@ -8932,18 +8820,32 @@ def _teams_environment_folder_evidence(
     file names anywhere in the live repository tree, exactly the way a human
     finds it. Returns (evidence_entries, value_write_paths, debug)."""
     if safe_normalize_cloud(cloud) == "aws":
-        exact_env = _teams_exact_aws_environment_path(prompt)
-        if exact_env:
-            entries, value_paths, exact_debug = _teams_read_exact_environment_folder(
-                exact_env, cloud, repo_target, workflow, branch
-            )
-            exact_debug.update({
-                "tokens": [exact_env.rsplit("/", 1)[-1]],
-                "matched_dirs": [exact_env],
-                "visited": 1,
-                "resolver": "deterministic_aws_environment_path",
-            })
-            return entries, value_paths, exact_debug
+        exact_envs = _teams_requested_aws_environment_paths(prompt, branch=branch)
+        if exact_envs:
+            combined_entries: list[dict] = []
+            combined_value_paths: list[str] = []
+            per_environment: list[dict] = []
+            for exact_env in exact_envs:
+                entries, value_paths, exact_debug = _teams_read_exact_environment_folder(
+                    exact_env, cloud, repo_target, workflow, branch
+                )
+                combined_entries.extend(entries)
+                for path in value_paths:
+                    if path not in combined_value_paths:
+                        combined_value_paths.append(path)
+                per_environment.append({
+                    "path": exact_env,
+                    "files": exact_debug.get("files", 0),
+                    "value_files": list(value_paths),
+                })
+            return combined_entries, combined_value_paths, {
+                "tokens": [path.rsplit("/", 1)[-1] for path in exact_envs],
+                "matched_dirs": exact_envs,
+                "visited": len(exact_envs),
+                "files": len(combined_entries),
+                "resolver": "deterministic_plural_aws_environment_paths",
+                "environments": per_environment,
+            }
 
     tokens = _teams_prompt_environment_tokens(prompt)
     debug: dict = {"tokens": tokens, "matched_dirs": [], "files": 0, "visited": 0}
@@ -17607,6 +17509,7 @@ def _handle_teams_chat_request_base(data: dict):  # pyright: ignore[reportGenera
         "source": "teams",
         "github_token": installation_token,
         "teams_conversation_id": teams_conversation_id,
+        "memory_conversation_id": str(data.get("memory_conversation_id") or teams_conversation_id).strip(),
     })
 
     with github_token_context(installation_token), teams_requester_context(requester):
@@ -19605,7 +19508,26 @@ def handle_chat_request(data: dict):
 
             if effective_workflow in INFRA_MODIFICATION_WORKFLOWS:
                 existing_infra_context = _get_backend_existing_infra_context(retrieved_value_context)
-                if not existing_infra_context:
+
+                # FINAL TEAMS MODIFICATION REFRESH:
+                # Broad backend_existing_infra_code_match context may have been populated
+                # earlier in the same request by repository-wide/environment discovery.
+                # Reusing that candidate set here bypasses the final target-main.tf +
+                # Foundry Boolean-control resolver and causes the legacy file picker
+                # (main.tf/backend.tf/outputs.tf/...) to be rendered.
+                #
+                # For a fresh Teams AWS modification turn, always rebuild the context
+                # unless this is already a user-selected pending target. The final
+                # resolver semantically classifies the complete target environment
+                # main.tf and validates any returned Boolean against literal live HCL.
+                # This is intentionally independent of hardcoded enable/disable words.
+                _teams_modification_refresh_required = bool(
+                    (_ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}).get("active")
+                    and str(target_cloud or "").strip().lower() == "aws"
+                    and not _backend_existing_infra_context_is_selected(existing_infra_context)
+                )
+
+                if not existing_infra_context or _teams_modification_refresh_required:
                     existing_infra_context = build_backend_existing_infra_modification_context(
                         prompt=effective_prompt,
                         thread_id=conversation_id,
@@ -19745,72 +19667,16 @@ def handle_chat_request(data: dict):
                 retrieved_value_context=retrieved_value_context,
             )
 
-            # A uniquely resolved Boolean feature-flag edit is deterministic.
-            # Materialize it directly from the live GitHub file instead of
-            # allowing Foundry to ask the user for a path or implementation
-            # choice that the backend has already resolved. Foundry remains in
-            # the workflow for non-deterministic infrastructure generation.
-            selected_flag_context = _get_backend_existing_infra_context(
-                retrieved_value_context
+            # Terraform generation is Foundry-owned. The backend has already
+            # collected live GitHub evidence; pass that evidence to Foundry and
+            # never synthesize, toggle, merge, or materialize Terraform here.
+            conversation_id, agent_reply = call_agent(conversation_id, agent_input)
+
+            if not agent_reply.strip():
+                raise RuntimeError("No response returned from agent.")
+            agent_reply = _teams_apply_agent_identity(
+                agent_reply, target_cloud, effective_workflow
             )
-
-            # Azure object-backed creation is completely determined by the live
-            # backend evidence.  Build the sibling invocation here instead of
-            # asking Foundry to rediscover object-root wiring.  The existing
-            # commit-side materializer then clones variables.tf + the target
-            # environment tfvars object and validates the complete three-file
-            # write-set before any branch write.  If the repository does not
-            # prove this pattern, return None and preserve the prior agent path.
-            deterministic_object_creation = None
-            if (
-                target_cloud == "azure"
-                and effective_workflow in INFRA_MODIFICATION_WORKFLOWS
-                and isinstance(selected_flag_context, dict)
-                and selected_flag_context.get("invocation_generation")
-                and not selected_flag_context.get("feature_flag_match")
-            ):
-                deterministic_object_creation = _teams_synthesize_azure_object_backed_creation_draft(
-                    effective_prompt,
-                    retrieved_value_context,
-                    effective_workflow,
-                )
-
-            if deterministic_object_creation:
-                agent_result = deterministic_object_creation
-                agent_reply = json.dumps(agent_result)
-                _teams_diag_log(
-                    "azure_object_creation_backend_synthesized",
-                    thread=conversation_id or "",
-                    path=(selected_flag_context.get("selected_path") or ""),
-                )
-            elif (
-                effective_workflow in INFRA_MODIFICATION_WORKFLOWS
-                and isinstance(selected_flag_context, dict)
-                and selected_flag_context.get("feature_flag_match")
-            ):
-                deterministic_context = {
-                    "expected_cloud": target_cloud,
-                    "expected_workflow": effective_workflow,
-                    "expected_repo_target": normalize_repo_target(
-                        target_cloud,
-                        workflow=effective_workflow,
-                    ),
-                    "effective_prompt": effective_prompt,
-                    "retrieved_value_context": retrieved_value_context,
-                    "context_branch": selected_flag_context.get("context_ref") or "",
-                }
-                agent_result = _teams_build_deterministic_feature_flag_payload(
-                    deterministic_context
-                )
-                agent_reply = json.dumps(agent_result)
-            else:
-                conversation_id, agent_reply = call_agent(conversation_id, agent_input)
-
-                if not agent_reply.strip():
-                    raise RuntimeError("No response returned from agent.")
-                agent_reply = _teams_apply_agent_identity(
-                    agent_reply, target_cloud, effective_workflow
-                )
 
             conversation_label = build_enhanced_conversation_label(
                 ticket_number=ticket_number,
@@ -21621,146 +21487,16 @@ def _teams_feature_flag_intent(prompt: str) -> str:
     return ""
 
 
-def _teams_feature_flag_terms(prompt: str) -> list[str]:
-    text = re.sub(r"[^a-z0-9]+", "_", str(prompt or "").lower()).strip("_")
-    stop = {
-        "please", "can", "you", "disable", "enable", "turn", "switch", "off", "on",
-        "deactivate", "activate", "remove", "decommission", "in", "for", "the", "from",
-        "aws", "azure", "terraform", "environment", "env",
-    }
-    return [token for token in text.split("_") if token and token not in stop and len(token) > 1]
-
-
-def _teams_find_feature_flag_matches(existing_infra_context: dict, prompt: str) -> list[dict]:
-    """Find boolean feature assignments directly in live candidate files."""
-    action = _teams_feature_flag_intent(prompt)
-    if not action:
-        return []
-    desired_current = "true" if action == "disable" else "false"
-    terms = _teams_feature_flag_terms(prompt)
-    matches: list[dict] = []
-    assignment_re = re.compile(
-        r"(?m)^(?P<indent>[ \t]*)(?P<name>(?:create|enable|enabled|deploy|use|has|is)_[A-Za-z0-9_]+|[A-Za-z0-9_]+_enabled)\s*=\s*(?P<value>true|false)\s*(?P<comment>#.*)?$",
-        re.IGNORECASE,
-    )
-    for index, item in enumerate(existing_infra_context.get("matched_files") or []):
-        content = str((item or {}).get("content") or "")
-        path = str((item or {}).get("path") or "")
-        for match in assignment_re.finditer(content):
-            name = match.group("name")
-            value = match.group("value").lower()
-            if value != desired_current:
-                continue
-            normalized_name = name.lower()
-            score = 0
-            for term in terms:
-                if term in normalized_name:
-                    score += 50
-            compact_prompt = re.sub(r"[^a-z0-9]+", "", str(prompt or "").lower())
-            compact_flag = re.sub(r"^(?:create|enable|enabled|deploy|use|has|is)_", "", normalized_name)
-            compact_flag = compact_flag.replace("_enabled", "").replace("_", "")
-            if compact_flag and compact_flag in compact_prompt:
-                score += 250
-            if not terms or score <= 0:
-                continue
-            matches.append({
-                "candidate_index": index,
-                "path": path,
-                "flag": name,
-                "current_value": value,
-                "new_value": "false" if action == "disable" else "true",
-                "action": action,
-                "start": match.start(),
-                "end": match.end(),
-                "matched_line": match.group(0),
-                "score": score,
-            })
-    matches.sort(key=lambda item: (-int(item.get("score") or 0), item.get("path") or "", item.get("flag") or ""))
-    return matches
-
 
 def _teams_auto_select_feature_flag_context(existing_infra_context: dict, prompt: str) -> dict:
-    matches = _teams_find_feature_flag_matches(existing_infra_context, prompt)
-    if not matches:
-        return {}
-    best = matches[0]
-    equally_best = [item for item in matches if item.get("score") == best.get("score")]
-    distinct = {(item.get("path"), item.get("flag")) for item in equally_best}
-    if len(distinct) != 1:
-        return {}
-    selected = dict((existing_infra_context.get("matched_files") or [])[int(best["candidate_index"])])
-    selected["selected_by_backend"] = True
-    selected["feature_flag_match"] = dict(best)
-    return {
-        "source": "backend_existing_infra_code_match",
-        "selection_state": "selected",
-        "cloud": existing_infra_context.get("cloud"),
-        "repo_target": existing_infra_context.get("repo_target"),
-        "workflow": existing_infra_context.get("workflow"),
-        "repo_full_name": existing_infra_context.get("repo_full_name") or "",
-        "context_ref": existing_infra_context.get("context_ref") or "",
-        "search_terms": existing_infra_context.get("search_terms") or [],
-        "selected_path": selected.get("path") or "",
-        "matched_files": [selected],
-        "matched_file_paths": [selected.get("path") or ""],
-        "feature_flag_match": dict(best),
-        "instructions": [
-            "Backend uniquely identified the existing Boolean feature flag from live repository content.",
-            "Modify only this assignment and preserve the complete selected file.",
-            "Do not ask the user to choose a file or explain how the feature is controlled.",
-        ],
-    }
+    """Compatibility no-op: feature/flag selection is Foundry-owned.
 
-
-def _teams_build_deterministic_feature_flag_payload(context: dict) -> dict:
-    selected_context = _get_backend_existing_infra_context(context.get("retrieved_value_context") or [])
-    match = dict(selected_context.get("feature_flag_match") or {}) if isinstance(selected_context, dict) else {}
-    matched_files = selected_context.get("matched_files") or [] if isinstance(selected_context, dict) else []
-    if not match or len(matched_files) != 1:
-        raise ValueError("No unique backend-selected feature flag is available for deterministic repair.")
-    file_data = matched_files[0]
-    content = str(file_data.get("content") or "")
-    old_line = str(match.get("matched_line") or "")
-    flag = str(match.get("flag") or "")
-    old_value = str(match.get("current_value") or "")
-    new_value = str(match.get("new_value") or "")
-    if not content or not old_line or not flag or old_value not in {"true", "false"} or new_value not in {"true", "false"}:
-        raise ValueError("The selected feature-flag evidence is incomplete.")
-    replacement_line = re.sub(
-        rf"(\b{re.escape(flag)}\s*=\s*){old_value}\b",
-        rf"\g<1>{new_value}",
-        old_line,
-        count=1,
-        flags=re.IGNORECASE,
-    )
-    final_content = content.replace(old_line, replacement_line, 1)
-    if final_content == content:
-        raise ValueError(f"Could not change {flag} from {old_value} to {new_value}.")
-    path = str(file_data.get("path") or file_data.get("filename") or "").strip()
-    action_word = "Disable" if new_value == "false" else "Enable"
-    raw_payload = {
-        "mode": "infra",
-        "cloud": context.get("expected_cloud") or selected_context.get("cloud") or "aws",
-        "workflow": context.get("expected_workflow") or selected_context.get("workflow") or "aws_infra_modification",
-        "repo_target": context.get("expected_repo_target") or selected_context.get("repo_target") or "tf-devops",
-        "title": f"{action_word} {flag}",
-        "branch_name": f"terrabot/{action_word.lower()}-{flag.replace('_', '-')}",
-        "summary": f"{action_word}s `{flag}` in `{path}` by changing `{old_value}` to `{new_value}`.",
-        "analysis": "\n".join([
-            f"Repository scan: found `{flag} = {old_value}` in `{path}`.",
-            f"Target resolution: this was the unique live-repository feature flag matching the request.",
-            f"Change: `{flag}` is set to `{new_value}`; all companion settings and unrelated code are preserved.",
-        ]),
-        "source_paths_used": [path],
-        "files": [{"filename": path, "content": final_content}],
-        "user_fillable": [],
-        "questions": [],
-        "validation_commands": ["terraform fmt -check -recursive", "terraform validate"],
-    }
-    parsed = parse_agent_output(json.dumps(raw_payload))
-    for key in ("analysis", "source_paths_used", "user_fillable", "questions", "validation_commands", "branch_name"):
-        parsed[key] = raw_payload.get(key)
-    return parsed
+    The backend deliberately does not tokenize resource names, rank Boolean
+    assignments, infer aliases, or choose a Terraform flag. It only supplies
+    live repository files to Foundry.
+    """
+    del existing_infra_context, prompt
+    return {}
 
 def _teams_repo_target_for_expected(cloud: str, workflow: str) -> str:
     return normalize_repo_target(cloud, workflow=workflow)
@@ -22353,160 +22089,8 @@ def _teams_select_aws_environment_consumer_file(
 
 
 def _teams_build_deterministic_aws_consumer_payload(context: dict) -> dict:
-    retrieved_modules = [item for item in context.get("retrieved_module_context") or [] if isinstance(item, dict)]
-    value_context = [item for item in context.get("retrieved_value_context") or [] if isinstance(item, dict)]
-    confirmed = _get_confirmed_aws_module_selection(value_context)
-    selected_path = str(confirmed.get("module_path") or "").strip()
-
-    selected = {}
-    for item in retrieved_modules:
-        module_path = str(item.get("module_path") or item.get("verified_module_path") or "").strip()
-        normalized = _sanitize_aws_module_rel_path(module_path)
-        if selected_path and normalized == _sanitize_aws_module_rel_path(selected_path):
-            selected = dict(item)
-            break
-    if not selected and len(retrieved_modules) == 1:
-        selected = dict(retrieved_modules[0])
-    if not selected:
-        raise ValueError("No single confirmed AWS module context was available for deterministic Teams recovery.")
-
-    module_path = _sanitize_aws_module_rel_path(
-        selected.get("module_path") or selected.get("verified_module_path") or selected_path
-    )
-    if not module_path:
-        raise ValueError("The confirmed AWS module did not include a verified module path.")
-
-    environment_path = str(
-        confirmed.get("environment_path")
-        or selected.get("environment_path")
-        or context.get("context_root")
-        or "terraform/dev_aws/minidev"
-    ).strip().strip("/")
-    selected = build_verified_aws_module_context(
-        module_path,
-        branch=selected.get("resolved_ref") or None,
-        environment_path=environment_path,
-        include_examples=True,
-    )
-    source = str(selected.get("module_source") or build_aws_local_module_source(module_path, environment_path)).strip()
-    specs = selected.get("input_specs") or _teams_variable_specs_from_module_context(selected)
-    examples = _teams_module_example_assignments(selected)
-    prompt = str(context.get("effective_prompt") or "").strip()
-    context_branch = str(
-        context.get("context_branch")
-        or selected.get("resolved_ref")
-        or _teams_remote_context_branch(
-            "aws",
-            repo_target="tf-devops",
-            workflow="aws_module_consumer",
-        )
-    ).strip()
-    consumer_path, consumer_existing_content = _teams_select_aws_environment_consumer_file(
-        environment_path,
-        context_branch,
-    )
-
-    input_lines: list[tuple[str, str]] = []
-    user_fillable: list[dict] = []
-    source_paths: list[str] = [path for path in selected.get("tf_files") or [] if path]
-    source_paths.extend(
-        str(example.get("path") or "")
-        for example in selected.get("consumer_examples") or []
-        if example.get("path")
-    )
-
-    required_names = set(selected.get("required_inputs_detected") or [])
-    if not specs:
-        specs = [{"name": name, "type": "string", "required": True, "default": "", "sensitive": False} for name in required_names]
-
-    for spec in specs:
-        name = str(spec.get("name") or "").strip()
-        if not name:
-            continue
-        default_expr = str(spec.get("default") or "").strip()
-        required = bool(spec.get("required")) or name in required_names
-        sensitive = bool(spec.get("sensitive"))
-        explicit = "" if sensitive else _explicit_prompt_default_for_variable(
-            prompt,
-            name,
-            spec.get("type") or "string",
-        )
-        if explicit:
-            # Explicit non-sensitive prompt values override module defaults.
-            expression = explicit
-        elif name in examples:
-            expression = examples[name]
-        elif default_expr and not required:
-            # Omit optional inputs so the verified module default applies.
-            continue
-        elif not required:
-            continue
-        else:
-            expression, token = _teams_placeholder_expression(name, spec.get("type") or "string")
-            hint_type = str(spec.get("type") or "string")
-            hint = f"Required {hint_type} module input"
-            if spec.get("sensitive"):
-                hint += "; replace with the repository-approved secret/reference pattern, never a literal secret"
-            elif hint_type == "string":
-                hint += f", e.g. a value already used by another {module_path} consumer"
-            user_fillable.append({
-                "token": token,
-                "input": name,
-                "file": consumer_path,
-                "hint": hint,
-            })
-        input_lines.append((name, expression))
-
-    module_label = re.sub(r"[^A-Za-z0-9_]+", "_", module_path.rsplit("/", 1)[-1]).strip("_") or "terrabot_module"
-    module_label = f"terrabot_{module_label}"
-    longest = max([len(name) for name, _ in input_lines] + [len("source")])
-    lines = [f'module "{module_label}" {{', f'  source{" " * (longest - len("source") + 1)}= "{source}"']
-    if input_lines:
-        lines.append("")
-        for name, expression in input_lines:
-            lines.append(f"  {name}{' ' * (longest - len(name) + 1)}= {expression}")
-    lines.append("}")
-    module_block = "\n".join(lines).rstrip() + "\n"
-    # Consumer generation follows the live environment's existing file layout.
-    # For the normal tf-devops consolidated pattern this means full main.tf
-    # content plus one sibling module block, never a synthetic terrabot_*.tf.
-    content = consumer_existing_content.rstrip() + "\n\n" + module_block
-    filename = consumer_path
-    source_paths.append(consumer_path)
-
-    raw_payload = {
-        "mode": "infra",
-        "cloud": "aws",
-        "workflow": "aws_module_consumer",
-        "repo_target": "tf-devops",
-        "title": f"Create {module_path.rsplit('/', 1)[-1]} in {environment_path.rsplit('/', 1)[-1]}",
-        "branch_name": _teams_suggested_branch_name(
-            {"title": f"{module_path.rsplit('/', 1)[-1]} {environment_path.rsplit('/', 1)[-1]}"},
-            prompt,
-            context.get("thread_id") or "teams",
-        ),
-        "summary": (
-            f"Uses the verified tf-devops module `{module_path}` in `{environment_path}`. "
-            + ("Missing preferences are represented by reviewable __FILL__ tokens." if user_fillable else "Required values were inferred from the prompt or existing consumers.")
-        ),
-        "analysis": "\n".join([
-            f"Selected module: terraform/modules/{module_path}",
-            f"Consumer source: {source}",
-            f"Target branch context: {context.get('context_branch') or 'latest remote base branch'}",
-            f"Target consumer folder: {environment_path}",
-            f"Consumer file: {consumer_path} (selected from live tf-devops environment pattern; main.tf preferred when present)",
-            f"Value strategy: explicit prompt values, existing consumers, module defaults, then __FILL__ tokens ({len(user_fillable)} remaining).",
-        ]),
-        "source_paths_used": list(dict.fromkeys(source_paths)),
-        "files": [{"filename": filename, "content": content}],
-        "user_fillable": user_fillable,
-        "questions": [],
-        "validation_commands": ["terraform fmt -check -recursive", "terraform validate"],
-    }
-    parsed = parse_agent_output(json.dumps(raw_payload))
-    for key in ("analysis", "source_paths_used", "user_fillable", "questions", "validation_commands", "branch_name"):
-        parsed[key] = raw_payload.get(key)
-    return parsed
+    """Disabled: Terraform semantic generation belongs exclusively to Foundry."""
+    raise RuntimeError("Backend Terraform synthesis/materialization is disabled; retry through Foundry with live repository evidence.")
 
 
 def repair_and_parse_agent_output(
@@ -22575,24 +22159,9 @@ def repair_and_parse_agent_output(
     try:
         return try_parse_agent_output(repaired_reply), repaired_reply
     except Exception as repair_error:
-        try:
-            selected_context = _get_backend_existing_infra_context(context.get("retrieved_value_context") or [])
-            if isinstance(selected_context, dict) and selected_context.get("feature_flag_match"):
-                LOGGER.warning(
-                    "Foundry repair did not return feature-flag files; using deterministic live-repository flag update: %s",
-                    repair_error,
-                )
-                fallback = _teams_build_deterministic_feature_flag_payload(context)
-                return fallback, json.dumps(fallback)
-        except Exception as flag_fallback_error:
-            LOGGER.warning("Deterministic Teams feature-flag recovery failed: %s", flag_fallback_error)
-        if safe_normalize_cloud(context.get("expected_cloud")) == "aws" and _get_confirmed_aws_module_selection(context.get("retrieved_value_context") or []):
-            LOGGER.warning(
-                "Foundry repair did not return AWS files; using deterministic selected-module recovery: %s",
-                repair_error,
-            )
-            fallback = _teams_build_deterministic_aws_consumer_payload(context)
-            return fallback, json.dumps(fallback)
+        # No deterministic Terraform fallback is permitted. The backend may
+        # retry Foundry with better live evidence/validation feedback, but it
+        # must never generate a feature flag, module consumer, or HCL file.
         raise ValueError(
             "Teams Foundry generation did not return valid Terraform files after repair. "
             f"Original error: {parse_error}. Repair error: {repair_error}"
@@ -23147,6 +22716,10 @@ def _handle_teams_chat_request_safe(data: dict):
         or ""
     ).strip()
     state = load_teams_conversation_state(teams_conversation_id) if teams_conversation_id else {}
+    memory_conversation_id = str(
+        request_data.get("memory_conversation_id")
+        or teams_conversation_id
+    ).strip()
     conversation_id = str(
         request_data.get("thread_id")
         or state.get("workflow_thread_id")
@@ -23240,6 +22813,7 @@ def _handle_teams_chat_request_safe(data: dict):
     flow_context = {
         "active": True,
         "teams_conversation_id": teams_conversation_id,
+        "memory_conversation_id": memory_conversation_id,
         "thread_id": conversation_id,
         "effective_prompt": prompt,
         "reuse_branch": reuse_branch,
@@ -23368,7 +22942,7 @@ def _handle_teams_chat_request_safe(data: dict):
             )
         )
         if no_file_failure and safe_normalize_cloud(flow_context.get("expected_cloud")) == "aws" and confirmed_aws:
-            fallback = _teams_build_deterministic_aws_consumer_payload(flow_context)
+            fallback = None  # Terraform recovery must be performed by Foundry, never synthesized by backend.
             fallback_thread_id = str(
                 result.get("thread_id")
                 or flow_context.get("thread_id")
@@ -23378,6 +22952,8 @@ def _handle_teams_chat_request_safe(data: dict):
             ticket_number = str(request_data.get("jira_ticket") or state.get("ticket_number") or "").strip()
             ticket_link = str(request_data.get("ticket_link") or state.get("ticket_link") or "").strip()
             ticket_title = str(request_data.get("ticket_title") or state.get("ticket_title") or "").strip()
+            if fallback is None:
+                return result, status_code
             pending_key = store_pending_infra_change(
                 fallback_thread_id,
                 ticket_number,
@@ -24580,175 +24156,8 @@ def _teams_safe_materialize_nested_creation_map_entry(
     prompt: str,
     path: str,
 ) -> tuple[str, dict] | None:
-    """Materialize one requested generated-only map entry at any nesting depth.
-
-    This is the deterministic escape hatch for map-driven resource files such
-    as ACA collections nested inside ``locals``. It never accepts a rewritten
-    full file. Instead it finds the one generated-only sibling entry that
-    matches the resource name in the current request, inserts only that entry
-    into the corresponding live map assignment, and preserves every other
-    byte of the existing file.
-    """
-    phrase = _teams_safe_normalized_phrase(prompt)
-    if not re.search(r"\b(?:create|add|provision|deploy)\b", phrase):
-        return None
-
-    existing = str(existing_content or "").replace("\r\n", "\n")
-    generated = str(generated_content or "").replace("\r\n", "\n")
-    requested_name = _teams_safe_prompt_resource_name(prompt)
-
-    existing_spans = _teams_all_hcl_assignment_spans(existing)
-    generated_spans = _teams_all_hcl_assignment_spans(generated)
-    existing_by_key = {
-        (item["name"], int(item.get("occurrence") or 1)): item
-        for item in existing_spans
-    }
-
-    candidates: list[dict] = []
-    for generated_span in generated_spans:
-        key = (
-            generated_span["name"],
-            int(generated_span.get("occurrence") or 1),
-        )
-        existing_span = existing_by_key.get(key)
-        if not existing_span:
-            continue
-        existing_value = str(existing_span.get("value") or "")
-        generated_value = str(generated_span.get("value") or "")
-        if not (
-            _teams_is_multiline_map_value(existing_value)
-            and _teams_is_multiline_map_value(generated_value)
-        ):
-            continue
-
-        e_open, e_close = existing_value.find("{"), existing_value.rfind("}")
-        g_open, g_close = generated_value.find("{"), generated_value.rfind("}")
-        if min(e_open, e_close, g_open, g_close) < 0:
-            continue
-        existing_entries = _teams_map_entry_spans(
-            existing_value[e_open + 1:e_close]
-        )
-        generated_entries = _teams_map_entry_spans(
-            generated_value[g_open + 1:g_close]
-        )
-        existing_keys = {str(entry.get("key") or "") for entry in existing_entries}
-        new_entries = [
-            entry for entry in generated_entries
-            if str(entry.get("key") or "") not in existing_keys
-        ]
-        if not new_entries:
-            continue
-
-        if requested_name:
-            requested_norm = _teams_normalize_requested_identity(requested_name)
-            exact_entries = [
-                entry for entry in new_entries
-                if _teams_normalize_requested_identity(entry.get("key") or "") == requested_norm
-                or requested_name.lower() in str(entry.get("text") or "").lower()
-            ]
-            if exact_entries:
-                eligible_entries = exact_entries
-            elif len(new_entries) == 1:
-                # Foundry occasionally returns the correct sibling structure
-                # with the previous sibling's identity left in place. Because
-                # this entry is generated-only and mechanically unambiguous,
-                # retarget only its identity to the explicit user-requested
-                # name. Never use a stale name as the committed resource.
-                eligible_entries = [
-                    _teams_retarget_generated_map_entry(new_entries[0], requested_name)
-                ]
-            else:
-                # With an explicit requested name, multiple unrelated new
-                # entries are never safe to guess between.
-                eligible_entries = []
-        else:
-            eligible_entries = new_entries
-
-        for entry in eligible_entries:
-            score = _teams_safe_map_entry_relevance(entry, prompt)
-            if requested_name and _teams_normalize_requested_identity(entry.get("key") or "") == _teams_normalize_requested_identity(requested_name):
-                score += 3000
-            candidates.append({
-                "score": score,
-                "existing_span": existing_span,
-                "generated_span": generated_span,
-                "entry": entry,
-            })
-
-    if not candidates:
-        return None
-
-    candidates.sort(key=lambda item: int(item.get("score") or 0), reverse=True)
-    best_score = int(candidates[0].get("score") or 0)
-    best = [item for item in candidates if int(item.get("score") or 0) == best_score]
-
-    # With an explicit name, require a positive semantic hit. Without an
-    # explicit name, allow only one mechanically unambiguous new entry.
-    if requested_name and best_score <= 0:
-        return None
-    if len(best) != 1:
-        positive = [item for item in candidates if int(item.get("score") or 0) > 0]
-        if len(positive) != 1:
-            return None
-        best = positive
-
-    selected = best[0]
-    existing_span = selected["existing_span"]
-    generated_span = selected["generated_span"]
-    selected_entry = selected["entry"]
-
-    # Merge ONLY the selected generated entry. Passing the model's whole map
-    # here allowed unrelated/stale generated siblings to hitchhike into the
-    # commit even after the correct candidate had been selected.
-    existing_value = str(existing_span.get("value") or "")
-    selected_entry_text = str(selected_entry.get("text") or "").rstrip("\n")
-    generated_value = "{\n" + selected_entry_text + "\n}"
-    merged_value = _teams_safe_merge_map_value(
-        existing_value,
-        generated_value,
-        prompt,
-        path,
-    )
-    if _teams_safe_hcl_compare(merged_value) == _teams_safe_hcl_compare(existing_value):
-        return None
-
-    assignment_text = str(existing_span.get("text") or "")
-    name = str(existing_span.get("name") or "")
-    prefix_match = re.match(
-        rf'(?s)^([ \t]*{re.escape(name)}[ \t]*=[ \t]*)(.*)$',
-        assignment_text,
-    )
-    if not prefix_match:
-        return None
-    replacement = prefix_match.group(1) + merged_value
-    start = int(existing_span["start"])
-    end = int(existing_span["end"])
-    final = existing[:start] + replacement + existing[end:]
-    final = final.rstrip() + "\n"
-
-    if _teams_safe_hcl_compare(final) == _teams_safe_hcl_compare(existing):
-        return None
-    if not _teams_generated_preserves_existing_lines(
-        existing,
-        final,
-    ):
-        # Map insertion necessarily adds lines but must not alter any existing
-        # line. If this invariant is not satisfied, do not use this fallback.
-        return None
-
-    return final, {
-        "path": path,
-        "kind": "nested_map_entry_creation",
-        "applied": [
-            f"{name}.{str(selected_entry.get('key') or requested_name or 'new_entry')}"
-        ],
-        "ignored_generated": [],
-        "preserved_count": len([line for line in existing.splitlines() if line.strip()]),
-        "note": (
-            "materialized the requested generated-only map entry inside the "
-            "existing nested assignment while preserving the live file"
-        ),
-    }
+    """Disabled: Terraform semantic generation belongs exclusively to Foundry."""
+    raise RuntimeError("Backend Terraform synthesis/materialization is disabled; retry through Foundry with live repository evidence.")
 
 
 def _teams_safe_patch_tf_file(existing_content: str, generated_content: str, prompt: str, path: str) -> tuple[str, dict]:
@@ -24990,69 +24399,8 @@ def _teams_safe_materialize_modification(
     path: str,
     invocation_creation: bool = False,
 ) -> tuple[str, dict]:
-    """Surgical materialization first; if every surgical strategy fails,
-    accept the agent's full file only when it provably preserves every
-    existing line (pure additive change). Handles repo patterns the
-    surgical patchers cannot express — e.g. adding a new entry inside a
-    locals for_each map (the aca_apps.tf pattern)."""
-    existing_n = str(existing or "").replace("\r\n", "\n")
-    surgical_error: Exception
-    try:
-        strict_final, strict_detail = _teams_safe_materialize_modification_strict(
-            existing, generated, prompt, path,
-            invocation_creation=invocation_creation,
-        )
-        # HARD GATE: no result — surgical or otherwise — may erase existing
-        # content unless the user explicitly asked for deletion or the
-        # removals are paired same-key value updates. This closes the gap
-        # where a "successful" surgical patch replaced a whole map value.
-        removal_error = _teams_unauthorized_removals(
-            existing_n, str(strict_final or ""), prompt, path
-        )
-        if removal_error is None:
-            return strict_final, strict_detail
-        surgical_error = ValueError(removal_error)
-    except ValueError as err:
-        surgical_error = err
-
-    if True:
-        generated_n = str(generated or "").replace("\r\n", "\n").rstrip("\n") + "\n"
-        if (
-            generated_n.strip()
-            and _teams_safe_hcl_compare(generated_n) != _teams_safe_hcl_compare(existing_n)
-            and _teams_generated_preserves_existing_lines(existing_n, generated_n)
-        ):
-            existing_norm_lines = [
-                re.sub(r"\s+", " ", line).strip()
-                for line in existing_n.splitlines()
-                if line.strip()
-            ]
-            counts: dict[str, int] = {}
-            for line in existing_norm_lines:
-                counts[line] = counts.get(line, 0) + 1
-            added_lines = []
-            for line in generated_n.splitlines():
-                key = re.sub(r"\s+", " ", line).strip()
-                if not key:
-                    continue
-                if counts.get(key):
-                    counts[key] -= 1
-                else:
-                    added_lines.append(line.strip())
-            return generated_n, {
-                "path": path,
-                "kind": "agent_full_file_additive",
-                "applied": added_lines[:8] or ["additive full-file change"],
-                "added_line_count": len(added_lines),
-                "ignored_generated": [],
-                "preserved_count": len(existing_norm_lines),
-                "note": (
-                    "surgical patchers could not express this additive shape; "
-                    "accepted the agent's full file after proving every "
-                    "existing line is preserved in order"
-                ),
-            }
-        raise surgical_error
+    """Disabled: Terraform semantic generation belongs exclusively to Foundry."""
+    raise RuntimeError("Backend Terraform synthesis/materialization is disabled; retry through Foundry with live repository evidence.")
 
 
 def _teams_safe_materialize_modification_strict(
@@ -25062,29 +24410,8 @@ def _teams_safe_materialize_modification_strict(
     path: str,
     invocation_creation: bool = False,
 ) -> tuple[str, dict]:
-    if invocation_creation and path.endswith(".tf"):
-        # Map-driven creation files (for example locals-backed ACA collections)
-        # must be materialized before the generic new-invocation append path.
-        # Otherwise the append path treats a new sibling map entry as a nested
-        # modification and can fail with "could not isolate a safe nested
-        # Terraform change" even though the deterministic map materializer
-        # can safely insert exactly the requested entry.
-        nested_creation = _teams_safe_materialize_nested_creation_map_entry(
-            existing, generated, prompt, path
-        )
-        if nested_creation is not None:
-            return nested_creation
-
-        # Existing-invocation creation: preserve the file verbatim and append
-        # only the new block/assignments when this is not a nested-map shape.
-        return _teams_safe_append_new_invocation(existing, generated, prompt, path)
-    if invocation_creation and path.endswith(".tfvars"):
-        return _teams_safe_append_new_invocation(existing, generated, prompt, path)
-    if path.endswith(".tfvars"):
-        return _teams_safe_patch_hcl_assignments(existing, generated, prompt, path)
-    if path.endswith(".tf"):
-        return _teams_safe_patch_tf_file(existing, generated, prompt, path)
-    raise ValueError(f"Teams infrastructure modifications only support .tf and .tfvars targets: {path}")
+    """Disabled: Terraform semantic generation belongs exclusively to Foundry."""
+    raise RuntimeError("Backend Terraform synthesis/materialization is disabled; retry through Foundry with live repository evidence.")
 
 
 def _teams_safe_backend_analysis(
@@ -25908,162 +25235,8 @@ def _teams_synthesize_azure_object_backed_creation_draft(
     retrieved_value_context: list | None,
     workflow: str,
 ) -> dict | None:
-    """Build the first Azure creation draft directly from backend GitHub evidence.
-
-    Foundry is not needed to decide repository structure for a proven object-backed
-    sibling pattern.  This helper creates only the new sibling invocation; the
-    existing three-file materializer then deterministically adds variables.tf and
-    the target environment tfvars object from the same live evidence.
-
-    Returning None is deliberate: non-object-backed Azure creation and every AWS,
-    modification, flag, delete, and module-repository flow continue through the
-    pre-existing agent path unchanged.
-    """
-    ctx = _get_backend_existing_infra_context(retrieved_value_context or [])
-    if not isinstance(ctx, dict) or not ctx.get("invocation_generation"):
-        return None
-
-    selected_path = _teams_normalized_repo_path(
-        ctx.get("selected_path")
-        or ((ctx.get("matched_file_paths") or [""])[0])
-    )
-    requested_name = _teams_requested_resource_name(prompt)
-    if not selected_path or not requested_name:
-        return None
-
-    existing = ""
-    for item in ctx.get("matched_files") or []:
-        if not isinstance(item, dict):
-            continue
-        if _teams_normalized_repo_path(item.get("path") or "") == selected_path:
-            existing = str(item.get("content") or "")
-            if existing:
-                break
-    if not existing:
-        for item in ctx.get("environment_files") or []:
-            if not isinstance(item, dict):
-                continue
-            if _teams_normalized_repo_path(item.get("path") or "") == selected_path:
-                existing = str(item.get("content") or "")
-                if existing:
-                    break
-    if not existing:
-        return None
-
-    siblings: list[dict] = []
-    for match in re.finditer(r'module\s+"([A-Za-z0-9_]+)"\s*\{', existing):
-        label = match.group(1)
-        block = _teams_extract_module_block(existing, label)
-        root = _dominant_object_var_root(block)
-        source = _teams_module_source_literal(block)
-        if block and root and source:
-            siblings.append({
-                "label": label,
-                "block": block,
-                "root": root,
-                "source": source,
-                "position": match.start(),
-            })
-    if not siblings:
-        return None
-
-    # Restrict prefix inference to the nearest sibling's module source.  This
-    # keeps independent resource families in a shared .tf file from influencing
-    # the generated label/root convention.
-    nearest = siblings[-1]
-    same_source = [item for item in siblings if item["source"] == nearest["source"]]
-    sibling_labels = [item["label"] for item in same_source]
-    sibling_roots = [item["root"] for item in same_source]
-
-    safe_name = _terraform_safe_variable_name(requested_name)
-    label_prefix = _teams_common_module_label_prefix(sibling_labels)
-    root_prefix = _teams_common_module_label_prefix(sibling_roots)
-
-    # A single sibling cannot establish a common prefix.  Learn the exact
-    # label->object-root rule from that sibling when possible; otherwise keep
-    # its stable resource-family prefix and replace only the final instance
-    # suffix.  No repository-specific hardcoded module names are introduced.
-    if not label_prefix:
-        sibling_label = nearest["label"]
-        sibling_root = nearest["root"]
-        if sibling_label.endswith(sibling_root):
-            label_prefix = sibling_label[: -len(sibling_root)]
-        else:
-            label_tokens = sibling_label.split("_")
-            root_tokens = sibling_root.split("_")
-            shared_tail = 0
-            for left, right in zip(reversed(label_tokens), reversed(root_tokens)):
-                if left != right:
-                    break
-                shared_tail += 1
-            label_prefix = "_".join(label_tokens[:-shared_tail]) + ("_" if shared_tail and label_tokens[:-shared_tail] else "")
-
-    if not root_prefix:
-        root_tokens = nearest["root"].split("_")
-        # Preserve the resource-family portion and replace the existing
-        # instance suffix with the explicit requested instance name.  When the
-        # backend has multiple same-source siblings, root_prefix above is used
-        # instead and is stronger evidence.
-        if len(root_tokens) > 1:
-            root_prefix = "_".join(root_tokens[:-1]) + "_"
-
-    target_label = _terraform_safe_variable_name(f"{label_prefix}{safe_name}")
-    target_root = _terraform_safe_variable_name(f"{root_prefix}{safe_name}")
-    if not target_label or not target_root:
-        return None
-
-    # Prefer the repository-learned exact label->variable transformation when
-    # it can be applied to the new label.  This is authoritative over the
-    # fallback root-prefix inference above.
-    learned_root = _derive_expected_variable_name(target_label, existing)
-    if learned_root:
-        target_root = learned_root
-
-    # Name collision is handled by RULE 2 before this path.  Still refuse to
-    # synthesize a duplicate if stale evidence reaches this helper.
-    if _teams_extract_module_block(existing, target_label):
-        return None
-    if target_root in set(_extract_root_variable_names(existing)) and any(
-        _dominant_object_var_root(item["block"]) == target_root for item in siblings
-    ):
-        return None
-
-    sibling = nearest
-    new_block = _teams_clone_object_backed_module_invocation(
-        sibling_module_block=sibling["block"],
-        target_module_label=target_label,
-        source_object_root=sibling["root"],
-        target_object_root=target_root,
-    )
-    if not new_block or "__FILL__" in new_block:
-        return None
-
-    final_definition = _teams_append_repo_style_block(existing, new_block)
-    return {
-        "mode": "infra",
-        "cloud": "azure",
-        "workflow": workflow or "azure_infra_modification",
-        "repo_target": ctx.get("repo_target") or "tf-azure-hub",
-        "title": f"[AZURE] Create {requested_name}",
-        "summary": f"Creates {requested_name} using the existing live repository pattern.",
-        "analysis": (
-            f"Backend selected {selected_path} from live GitHub.\n"
-            f"Nearest object-backed sibling: module {sibling['label']} using var.{sibling['root']}.*.\n"
-            f"Generated sibling: module {target_label} using dedicated var.{target_root}.*.\n"
-            "variables.tf and the target environment values object are materialized from the same sibling before commit."
-        ),
-        "source_paths_used": [selected_path],
-        "files": [{
-            "filename": selected_path,
-            "path": selected_path,
-            "operation": "modify",
-            "content": final_definition,
-            "in_place": False,
-        }],
-        "user_fillable": [],
-        "questions": [],
-        "validation_commands": ["terraform fmt -check -recursive", "terraform validate"],
-    }
+    """Disabled: Terraform semantic generation belongs exclusively to Foundry."""
+    raise RuntimeError("Backend Terraform synthesis/materialization is disabled; retry through Foundry with live repository evidence.")
 
 def _teams_materialize_azure_object_backed_creation(
     transformed: dict,
@@ -26075,298 +25248,8 @@ def _teams_materialize_azure_object_backed_creation(
     repo_target: str,
     workflow: str,
 ) -> list[dict]:
-    """Deterministically materialize the repository's Azure three-file pattern.
-
-    A Foundry draft may return only a module block, may put __FILL__ tokens in
-    that block, or may point the block at an existing sibling object. For an
-    object-backed resource family the live repository already gives every
-    structural decision: clone the nearest sibling invocation, its exact
-    variables.tf object type, and its concrete target-environment tfvars
-    object. This function performs that conversion before validation/commit.
-    """
-    selected = _get_backend_existing_infra_context(
-        context.get("retrieved_value_context") or []
-    )
-    selected_path = _teams_normalized_repo_path(
-        selected.get("selected_path")
-        or ((selected.get("matched_file_paths") or [""])[0])
-    )
-    if not selected_path:
-        return []
-
-    definition_entry = None
-    for file_data in safe_files:
-        path = _teams_normalized_repo_path(
-            (file_data or {}).get("path") or (file_data or {}).get("filename") or ""
-        )
-        if path == selected_path:
-            definition_entry = file_data
-            break
-    if not definition_entry:
-        return []
-
-    existing_definition = _teams_live_content_for_materialization(
-        "azure",
-        selected_path,
-        source_branch,
-        repo_target,
-        workflow,
-    )
-    generated_definition = str(definition_entry.get("content") or "")
-    new_labels = _teams_find_new_module_labels(
-        existing_definition,
-        generated_definition,
-    )
-    if not new_labels:
-        return []
-
-    value_paths, variable_paths = _teams_azure_creation_evidence_paths(
-        prompt,
-        context,
-        source_branch,
-        repo_target,
-        workflow,
-    )
-    records: list[dict] = []
-
-    for label in new_labels:
-        current_block = _teams_extract_module_block(generated_definition, label)
-        if not current_block:
-            continue
-        sibling_block, source_root, module_source = (
-            _teams_object_backed_sibling_for_new_module(
-                existing_definition,
-                current_block,
-                label,
-            )
-        )
-        if not sibling_block or not source_root:
-            continue
-
-        target_root = (
-            _derive_expected_variable_name(label, existing_definition)
-            or _tfvars_object_name_from_module_name(label)
-        )
-        if not target_root or target_root == source_root:
-            continue
-
-        rewritten_block = _teams_clone_object_backed_module_invocation(
-            sibling_module_block=sibling_block,
-            target_module_label=label,
-            source_object_root=source_root,
-            target_object_root=target_root,
-        ).rstrip()
-        if not rewritten_block:
-            continue
-        if "__FILL__" in rewritten_block:
-            raise ValueError(
-                f"Repository-backed Azure module '{label}' still contains "
-                "__FILL__ placeholders after sibling-pattern materialization."
-            )
-        if target_root not in set(re.findall(r"var\.([A-Za-z0-9_]+)\.", rewritten_block)):
-            raise ValueError(
-                f"Repository-backed Azure module '{label}' was not wired to "
-                f"its dedicated var.{target_root} object."
-            )
-
-        generated_definition = generated_definition.replace(
-            current_block,
-            rewritten_block,
-            1,
-        )
-
-        variables_path, variables_live, source_declaration = (
-            _teams_pick_object_variables_file(
-                selected_path,
-                variable_paths,
-                source_root,
-                source_branch,
-                repo_target,
-                workflow,
-            )
-        )
-        if not variables_path or not source_declaration:
-            raise ValueError(
-                f"Could not find the live variables.tf declaration for "
-                f"var.{source_root}, which is required to clone the exact "
-                f"object type for var.{target_root}."
-            )
-
-        values_path, values_live, source_value = _teams_pick_object_values_file(
-            value_paths,
-            source_root,
-            source_branch,
-            repo_target,
-            workflow,
-        )
-        if not values_path or not source_value:
-            raise ValueError(
-                f"Could not find a concrete {source_root} assignment in the "
-                "target environment's live tfvars files. The new resource "
-                "cannot be committed with placeholders or guessed values."
-            )
-
-        current_variables_entry = next(
-            (
-                item for item in safe_files
-                if _teams_normalized_repo_path(
-                    (item or {}).get("path") or (item or {}).get("filename") or ""
-                ) == variables_path
-            ),
-            None,
-        )
-        variables_base = (
-            str(current_variables_entry.get("content") or "")
-            if current_variables_entry
-            else variables_live
-        )
-        if target_root not in set(_extract_root_variable_names(variables_base)):
-            cloned_declaration = _teams_clone_variable_declaration(
-                source_declaration,
-                source_root,
-                target_root,
-            )
-            variables_final = _teams_append_repo_style_block(
-                variables_base,
-                cloned_declaration,
-            )
-        else:
-            variables_final = variables_base.rstrip("\n") + "\n"
-        variables_final = _repair_unclosed_variables_tf_content_for_write(
-            existing_content=variables_live,
-            generated_content=variables_final,
-            path=variables_path,
-        )
-        _teams_upsert_materialized_file(
-            safe_files,
-            variables_path,
-            variables_final,
-            operation="modify" if variables_live else "create",
-        )
-
-        current_values_entry = next(
-            (
-                item for item in safe_files
-                if _teams_normalized_repo_path(
-                    (item or {}).get("path") or (item or {}).get("filename") or ""
-                ) == values_path
-            ),
-            None,
-        )
-        values_base = (
-            str(current_values_entry.get("content") or "")
-            if current_values_entry
-            else values_live
-        )
-        object_overrides = _teams_prompt_object_overrides(
-            prompt,
-            sibling_block,
-            source_root,
-            context.get("retrieved_value_context") or [],
-        )
-        target_value = _merge_hcl_object_field_overrides(
-            source_value,
-            target_root,
-            object_overrides,
-        )
-        if "__FILL__" in target_value:
-            raise ValueError(
-                f"The target-environment value for {target_root} contains an "
-                "unresolved __FILL__ placeholder; values must be cloned from "
-                "the live sibling assignment or supplied explicitly."
-            )
-        values_final = _teams_append_repo_style_tfvars_assignment(
-            values_base,
-            target_root,
-            target_value,
-        )
-        _teams_upsert_materialized_file(
-            safe_files,
-            values_path,
-            values_final,
-            operation="modify" if values_live else "create",
-        )
-
-        records.append({
-            "module_label": label,
-            "definition_path": selected_path,
-            "source_object_root": source_root,
-            "target_object_root": target_root,
-            "variables_path": variables_path,
-            "values_path": values_path,
-        })
-
-    if not records:
-        return []
-
-    _teams_upsert_materialized_file(
-        safe_files,
-        selected_path,
-        generated_definition,
-        operation="modify",
-    )
-
-    for record in records:
-        patch_details.extend([
-            {
-                "path": record["definition_path"],
-                "kind": "azure_object_backed_definition",
-                "applied": [
-                    f'module "{record["module_label"]}" wired to '
-                    f'var.{record["target_object_root"]}.*'
-                ],
-                "ignored_generated": ["module placeholders and inline guessed values"],
-                "preserved_count": len(existing_definition.splitlines()),
-                "note": (
-                    "nearest sibling invocation cloned; resource-specific values "
-                    "remain outside the definition file"
-                ),
-            },
-            {
-                "path": record["variables_path"],
-                "kind": "azure_object_backed_variable_declaration",
-                "applied": [f'variable "{record["target_object_root"]}"'],
-                "ignored_generated": [],
-                "note": (
-                    f'exact type shape cloned from variable '
-                    f'"{record["source_object_root"]}"'
-                ),
-            },
-            {
-                "path": record["values_path"],
-                "kind": "azure_object_backed_environment_values",
-                "applied": [f'{record["target_object_root"]} = {{ ... }}'],
-                "ignored_generated": [],
-                "note": (
-                    f'concrete values cloned from {record["source_object_root"]} '
-                    "inside the target environment's own values file"
-                ),
-            },
-        ])
-
-    remaining_blob = "\n".join(
-        str(item.get("content") or "")
-        for item in safe_files
-        if isinstance(item, dict)
-    )
-    transformed["user_fillable"] = [
-        item for item in (transformed.get("user_fillable") or [])
-        if isinstance(item, dict)
-        and str(item.get("token") or "")
-        and str(item.get("token") or "") in remaining_blob
-    ]
-    transformed["analysis"] = "\n".join([
-        f"Definition: `{records[0]['definition_path']}` contains only the repository-style module invocation wired to `var.{records[0]['target_object_root']}.*`.",
-        f"Declaration: `{records[0]['variables_path']}` appends `variable \"{records[0]['target_object_root']}\"` using the exact sibling object type.",
-        f"Values: `{records[0]['values_path']}` appends concrete values cloned from `{records[0]['source_object_root']}` in the target environment.",
-        "Self-check: the three files are complete, additive, placeholder-free for this object, and preserve the live repository's existing lines and formatting pattern.",
-    ])
-    transformed["summary"] = (
-        f"Added {records[0]['module_label']} using the repository's complete "
-        "Azure object-backed three-file pattern: invocation, variable "
-        "declaration, and target-environment values."
-    )
-    return records
+    """Disabled: Terraform semantic generation belongs exclusively to Foundry."""
+    raise RuntimeError("Backend Terraform synthesis/materialization is disabled; retry through Foundry with live repository evidence.")
 
 
 def _validate_azure_object_backed_three_file_write_set(
@@ -29071,6 +27954,7 @@ def _teams_build_chat_grounding_context(
         conversation_id=teams_conversation_id,
         cloud=cloud,
         repo_target=repo_target_hint,
+        prompt=prompt,
     )
 
     return {
@@ -29349,7 +28233,7 @@ def _teams_attach_agent_memory_context(agent_input: str, active: dict) -> str:
         prompt_for_relevance = str(active.get("effective_prompt") or "")
     try:
         memory_context = agent_memory_store.get_combined_memory_context(
-            conversation_id=str(active.get("teams_conversation_id") or ""),
+            conversation_id=str(active.get("memory_conversation_id") or active.get("teams_conversation_id") or ""),
             cloud=str(active.get("cloud") or ""),
             repo_target=str(active.get("repo_target") or ""),
             prompt=prompt_for_relevance,
@@ -29420,7 +28304,7 @@ def _teams_record_agent_memory_turn(active: dict, agent_input: str, reply: str) 
                 )
 
         agent_memory_store.record_agent_turn(
-            conversation_id=str(active.get("teams_conversation_id") or ""),
+            conversation_id=str(active.get("memory_conversation_id") or active.get("teams_conversation_id") or ""),
             cloud=str(active.get("cloud") or ""),
             repo_target=str(active.get("repo_target") or ""),
             workflow=str(payload.get("mode") or payload.get("workflow") or ""),
@@ -30079,6 +28963,10 @@ def _handle_teams_chat_request_multicloud(data: dict):
         or request_data.get("conversation_id")
         or ""
     ).strip()
+    memory_conversation_id = str(
+        request_data.get("memory_conversation_id")
+        or teams_conversation_id
+    ).strip()
     state = load_teams_conversation_state(teams_conversation_id) if teams_conversation_id else {}
     stage = str(state.get("stage") or "").strip()
 
@@ -30119,7 +29007,7 @@ def _handle_teams_chat_request_multicloud(data: dict):
     ):
         return _teams_plain_chat_reply(
             prompt,
-            teams_conversation_id=teams_conversation_id,
+            teams_conversation_id=memory_conversation_id,
             cloud_hint=str(state.get("cloud") or "").strip(),
             repo_target_hint=str(state.get("repo_target") or "").strip(),
             requester=str(request_data.get("teams_requester") or "").strip(),
@@ -30539,7 +29427,12 @@ def _handle_teams_chat_request_new_branch(data: dict):
     return _TEAMS_NEW_BRANCH_PREVIOUS_HANDLE_CHAT(request_data)
 
 # =============================================================================
-# Teams feature-flag disable symmetry and automatic target resolution
+# Teams feature-state requests are agent-resolved.
+# The backend supplies live repository evidence only; Foundry determines
+# whether the request maps to a Boolean flag, resource attribute, list entry,
+# or another repository-defined mechanism. No resource names or aliases are
+# hardcoded here.
+
 # =============================================================================
 # Teams must apply the same repository-aware feature-flag rules as the VS Code
 # workflow.  A disable/remove request for a bool-gated resource is an in-place
@@ -30549,118 +29442,6 @@ def _handle_teams_chat_request_new_branch(data: dict):
 _TEAMS_FEATURE_FLAG_PREVIOUS_BUILD_INPUT = _build_agent_input_for_infra_safe
 _TEAMS_FEATURE_FLAG_PREVIOUS_BUILD_MODIFICATION_CONTEXT = _build_backend_existing_infra_modification_context_teams_v2
 
-_TEAMS_DISABLE_ACTION_RE = re.compile(
-    r"\b(disable|remove|delete|decommission|turn\s+off|switch\s+off)\b",
-    re.IGNORECASE,
-)
-
-
-def _teams_requested_feature_flag_names(prompt: str) -> list[str]:
-    """Return likely repository feature-flag names for an explicit request.
-
-    The names are search candidates only.  The selected flag must still exist
-    in live GitHub content before it can be used.
-    """
-    text = normalize_yes_no_reply(prompt)
-    candidates: list[str] = []
-    known_resources = {
-        "cloudamqp": "cloudamqp",
-        "cloud amqp": "cloudamqp",
-        "rabbitmq": "cloudamqp",
-        "rabbit mq": "cloudamqp",
-    }
-    for phrase, slug in known_resources.items():
-        if phrase in text:
-            candidates.extend([
-                f"create_{slug}",
-                f"enable_{slug}",
-                f"{slug}_enabled",
-                f"deploy_{slug}",
-            ])
-
-    # Generic fallback derived only from the user's resource wording.  It does
-    # not authorize a flag: live repository evidence must contain the name.
-    subject_match = re.search(
-        r"\b(?:disable|remove|delete|decommission|turn\s+off|switch\s+off)\s+(?:the\s+)?([a-z0-9][a-z0-9 _-]{1,60}?)(?:\s+in\s+|\s+from\s+|$)",
-        text,
-        re.IGNORECASE,
-    )
-    if subject_match:
-        slug = re.sub(r"[^a-z0-9]+", "_", subject_match.group(1).lower()).strip("_")
-        if slug:
-            candidates.extend([
-                f"create_{slug}",
-                f"enable_{slug}",
-                f"{slug}_enabled",
-                f"deploy_{slug}",
-            ])
-    return _dedupe_preserving_order(candidates)
-
-
-def _teams_feature_flag_assignment(content: str, flag_names: list[str]) -> tuple[str, str]:
-    """Find an enabled bool feature flag in a Terraform consumer file."""
-    for flag_name in flag_names or []:
-        match = re.search(
-            rf"(?m)^\s*({re.escape(flag_name)})\s*=\s*(true|false)\s*(?:#.*)?$",
-            content or "",
-            re.IGNORECASE,
-        )
-        if match:
-            return match.group(1), match.group(2).lower()
-    return "", ""
-
-
-def _teams_auto_select_feature_flag_target(context: dict, prompt: str, cloud: str) -> dict:
-    """Select a unique live-repository bool flag for AWS or Azure.
-
-    The earlier cross-cloud matcher already ranks exact assignment ownership
-    from the candidate files. This final Teams layer preserves Azure scope
-    metadata and emits the same deterministic resolution contract for both
-    enable and disable requests.
-    """
-    normalized_cloud = safe_normalize_cloud(cloud)
-    action = _teams_feature_flag_intent(prompt)
-    if normalized_cloud not in {"aws", "azure"} or action not in {"enable", "disable"}:
-        return context
-
-    selected_context = _teams_auto_select_feature_flag_context(context, prompt)
-    if not selected_context:
-        return context
-
-    match = dict(selected_context.get("feature_flag_match") or {})
-    if not match:
-        return context
-
-    result = dict(selected_context)
-    # Preserve repository-scope evidence produced by the Azure live-GitHub
-    # resolver and any diagnostic context supplied by the original scan.
-    for key in (
-        "scope_root",
-        "scope_reason",
-        "analysis",
-        "repo_full_name",
-        "context_ref",
-        "search_terms",
-    ):
-        if context.get(key) not in (None, "") and result.get(key) in (None, ""):
-            result[key] = context.get(key)
-
-    result["feature_flag_resolution"] = {
-        "flag": match.get("flag") or "",
-        "current_value": match.get("current_value") or "",
-        "requested_value": match.get("new_value") or ("false" if action == "disable" else "true"),
-        "action": action,
-        "environment_path": result.get("scope_root") or "",
-        "selected_path": result.get("selected_path") or match.get("path") or "",
-        "decision": "in_place_bool_flag_update",
-    }
-    result["instructions"] = list(result.get("instructions") or []) + [
-        "Backend automatically selected the unique live-repository file that owns the requested Boolean feature flag.",
-        "Change only the selected Boolean assignment to the requested value and preserve the complete file, parent block, companion settings, comments, and unrelated code.",
-        "This rule applies equally to AWS tf-devops and Azure tf-azure-hub. Do not route an Azure modification to vena_repos module discovery.",
-    ]
-    return result
-
 
 def _build_backend_existing_infra_modification_context_stateless(
     prompt: str,
@@ -30669,18 +29450,14 @@ def _build_backend_existing_infra_modification_context_stateless(
     workflow: str,
     retrieved_value_context: list | None = None,
 ) -> dict:
-    """Apply Teams-only automatic selection for bool feature-flag disables."""
-    context = _TEAMS_FEATURE_FLAG_PREVIOUS_BUILD_MODIFICATION_CONTEXT(
+    """Evidence-only pass-through; Foundry owns resource/flag interpretation."""
+    return _TEAMS_FEATURE_FLAG_PREVIOUS_BUILD_MODIFICATION_CONTEXT(
         prompt,
         thread_id,
         cloud,
         workflow,
         retrieved_value_context=retrieved_value_context,
     )
-    active = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
-    if not active.get("active"):
-        return context
-    return _teams_auto_select_feature_flag_target(context, prompt, cloud)
 
 
 def _build_agent_input_for_infra_stateless(
@@ -30691,7 +29468,7 @@ def _build_agent_input_for_infra_stateless(
     retrieved_module_context: Optional[list] = None,
     retrieved_value_context: Optional[list] = None,
 ) -> str:
-    """Add the complete VS Code feature-flag disable contract to Teams."""
+    """Tell Foundry it owns semantic targeting and Terraform generation."""
     raw = _TEAMS_FEATURE_FLAG_PREVIOUS_BUILD_INPUT(
         prompt,
         thread_id,
@@ -30700,37 +29477,18 @@ def _build_agent_input_for_infra_stateless(
         retrieved_module_context=retrieved_module_context,
         retrieved_value_context=retrieved_value_context,
     )
-    active = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
-    if not active.get("active"):
-        return raw
     try:
         payload = json.loads(raw)
     except Exception:
         return raw
-
-    selected_context = _get_backend_existing_infra_context(retrieved_value_context or [])
-    flag_resolution = dict(selected_context.get("feature_flag_resolution") or {})
-    if flag_resolution:
-        payload["teams_feature_flag_resolution"] = flag_resolution
-
     instructions = list(payload.get("instructions") or [])
     instructions.extend([
-        "TEAMS MODULE FEATURE FLAGS (MANDATORY): use the same feature-flag discovery, precedence, already-exists, default-value ladder, insert-into-block, and delete/disable symmetry rules used by the VS Code Terrabot workflow.",
-        "Before creating or modifying a resource, inspect live GitHub evidence for declared bool inputs named create_<resource>, enable_<resource>, <resource>_enabled, or deploy_<resource>; trace the variable to any count/for_each gate and inspect sibling environment consumers.",
-        "For disable/remove/decommission requests, when the target environment already uses a bool feature flag, modify the existing consumer assignment to false (or remove it only when repository evidence consistently represents disabled state by omission and the variable default is false). Never delete the parent module block and never create a replacement standalone module/resource.",
-        "Repository-answerable questions are never user questions. Resolve file placement, module choice, naming, defaults, wiring, feature flags, environment paths, and companion values from the fresh live GitHub scan before generation.",
-        "Use existing defaults in this order: same resource in target environment, same resource in another environment, module variable defaults, closest comparable resource. Only then use __FILL__ tokens for non-sensitive preferences.",
-        "Do not ask the user to confirm a repository pattern. The live GitHub pattern is authoritative. If multiple patterns exist, choose the closest target-environment precedent; ask only when two genuinely equal structural targets remain after exhaustive scanning.",
-        "Keep Teams output compact: summary at most 3 sentences, analysis at most 6 short lines, no speculative design essay, and at most one genuinely blocking question.",
-        "A repository-answerable feature-flag decision is Bucket A. Do not ask the user how the resource is enabled, whether to keep the block for history/state, or whether to disable the existing instance when live repository evidence answers those questions.",
-        "When teams_feature_flag_resolution is present, it is backend-verified. Change exactly the named flag in the selected file from its current value to requested_value, preserve every unrelated byte of the file, and return the full final file as an in-place modification for the Teams branch writer.",
-        "For a request such as 'disable CloudAMQP in eu2', locate the eu2 consumer, confirm the declared CloudAMQP bool flag and its module gate from live repository evidence, set the existing flag to false, and proceed directly to branch generation without clarification.",
-        "State in analysis: the selected environment file, existing module block, exact flag, its prior and new values, module-internal gate evidence when available, and that the parent module plus companion settings were preserved.",
-        "TEAMS BASELINE INSTRUCTION INHERITANCE: apply every repository-inference, targeting, anti-hallucination, value-inference, preservation, validation, and Terraform-formatting rule defined for the VS Code workflow unless the rule specifically depends on a local editor, local filesystem, open tab, WorkspaceEdit, or VS Code UI.",
-        "For Teams, the backend live GitHub snapshot obtained with GitHub App authentication is the context_pack equivalent and is the authoritative repository state. Conversation memory is optional optimization only; a complete infrastructure prompt must be solvable from the prompt plus fresh live GitHub evidence.",
-        "Resolve the prompt environment before repository discovery. AWS environments target tf-devops; Azure hub/environments target tf-azure-hub. Search exact assignment ownership, module consumers, variables, implementation gates, sibling environments, and repository conventions before asking the user anything.",
-        "Never ask the user for a Terraform path, feature-flag name, module wiring, or repository layout when it can be discovered from the live repository. Never return the Azure vena_repos module-creation fallback for update, modify, enable, disable, remove, delete, fix, or decommission requests.",
-        "Azure module repository discovery is allowed only when the user's current prompt explicitly requests a new Azure module or repository. Existing Azure infrastructure modifications stay in tf-azure-hub and use the same feature-flag and surgical-edit rules as AWS and VS Code.",
+        "FOUNDRY OWNS TERRAFORM GENERATION: the backend supplies live GitHub evidence only and does not choose flags/resources or synthesize HCL.",
+        "For enable/disable requests, inspect the supplied repository code and infer the controlling repository-defined Boolean flag or equivalent mechanism from the Terraform itself. Never rely on backend aliases or hardcoded resource vocabulary.",
+        "Only Boolean assignments whose CURRENT value can transition in the requested direction are candidates: disable => current true; enable => current false. Ignore unrelated non-Boolean parameters, data sources, resources, backend/provider files, and unrelated flags.",
+        "If exactly one semantic flag/resource match exists, generate the full final file immediately and change only that target. If multiple genuine semantic matches remain, ask one numbered choice and describe each candidate from its enclosing Terraform block/module and nearby code.",
+        "Do not ask the user to choose a file when repository semantics identify the controlling flag. Do not show files that contain no semantic match.",
+        "All Terraform/HCL content must come from Foundry output. Backend validation/commit transport may reject invalid output but must never repair or generate Terraform on your behalf.",
     ])
     payload["instructions"] = instructions
     return json.dumps(payload, indent=2)
@@ -34527,263 +33285,13 @@ def handle_teams_chat_request(data: dict):
 
 
 # =============================================================================
-# 2026-08-13 Teams enable/disable flag-only disambiguation final override
+# 2026-08-18 AGENT-OWNED TERRAFORM GENERATION — FINAL ARCHITECTURE OVERRIDE
 # =============================================================================
-# For explicit feature-state requests, users choose a FLAG, never a Terraform
-# file. The backend inspects only the resolved environment's main.tf for this
-# workflow, derives repository context for each matching Boolean flag, preserves
-# the original enable/disable polarity across the selection turn, and then uses
-# the existing deterministic feature-flag materializer.
+# Backend responsibilities: live GitHub retrieval, auth, workflow/session state,
+# validation, branch/commit/PR transport, and supplying evidence. Foundry owns
+# ALL Terraform semantic interpretation and ALL Terraform/HCL generation.
 
-_TEAMS_FLAG_PICKER_PREVIOUS_BUILD_CONTEXT = build_backend_existing_infra_modification_context
-_TEAMS_FLAG_PICKER_PREVIOUS_BUILD_SELECTED = build_selected_infra_modification_context
-_TEAMS_FLAG_PICKER_PREVIOUS_SELECT_REPLY = select_infra_modification_candidate_from_reply
-_TEAMS_FLAG_PICKER_PREVIOUS_SELECTION_REPLY = build_infra_modification_selection_reply
-
-
-def _teams_flag_main_tf_path(prompt: str, cloud: str, workflow: str, context: dict) -> tuple[str, str]:
-    """Return (main.tf path, branch) for the prompt-resolved environment.
-
-    This function is intentionally scoped to Teams feature enable/disable.
-    Other modification/creation workflows retain their existing repository-
-    inferred target rules.
-    """
-    normalized_cloud = normalize_cloud(cloud)
-    repo_target = normalize_repo_target(normalized_cloud, workflow=workflow)
-    branch = str((context or {}).get("context_ref") or "").strip()
-    if not branch:
-        branch = _teams_remote_context_branch(normalized_cloud, repo_target, workflow)
-
-    if normalized_cloud == "aws":
-        env_path, env_error = resolve_aws_environment_path(prompt)
-        if env_error or not env_path:
-            return "", branch
-        return f"{str(env_path).strip().strip('/')}/main.tf", branch
-
-    # Azure environment roots are repository-specific. Reuse the existing live
-    # environment-folder resolver, then select only that folder's main.tf.
-    try:
-        entries, _write_paths, _debug = _teams_environment_folder_evidence(
-            prompt, normalized_cloud, repo_target, workflow, branch
-        )
-    except Exception:
-        entries = []
-    main_candidates = []
-    for entry in entries or []:
-        path = str((entry or {}).get("path") or "").strip().strip("/")
-        if path and path.rsplit("/", 1)[-1].lower() == "main.tf":
-            main_candidates.append(path)
-    main_candidates = list(dict.fromkeys(main_candidates))
-    if len(main_candidates) == 1:
-        return main_candidates[0], branch
-
-    # If the resolver returned more than one main.tf, prefer the deepest path
-    # containing the environment token(s) from the prompt. This is still a
-    # repository-derived decision and does not become a user file question.
-    env_tokens = _teams_prompt_environment_tokens(prompt)
-    ranked = []
-    for path in main_candidates:
-        lower = path.lower().replace("_", "-")
-        token_hits = sum(1 for token in env_tokens if token.replace("_", "-") in lower)
-        ranked.append((token_hits, path.count("/"), path))
-    if ranked:
-        ranked.sort(key=lambda item: (-item[0], -item[1], item[2]))
-        return ranked[0][2], branch
-    return "", branch
-
-
-def _teams_flag_block_context(content: str, flag: str) -> tuple[str, list[str]]:
-    """Return enclosing top-level block and nearby related assignments."""
-    enclosing = "root configuration"
-    related: list[str] = []
-    flag_l = str(flag or "").lower()
-    family_tokens = [
-        token for token in re.split(r"_+", re.sub(r"^(?:create|enable|enabled|deploy|use|has|is)_", "", flag_l))
-        if token and token not in {"enabled", "enable", "create", "deploy"}
-    ]
-    for block in _extract_top_level_tf_blocks(content or ""):
-        block_text = str(block.get("block") or "")
-        if re.search(rf"(?m)^\s*{re.escape(flag)}\s*=", block_text, re.IGNORECASE):
-            enclosing = str(block.get("header") or "root configuration").strip()
-            for name in re.findall(
-                r"(?m)^\s*((?:create|enable|enabled|deploy|use|has|is)_[A-Za-z0-9_]+|[A-Za-z0-9_]+_enabled|[A-Za-z0-9_]*patch[A-Za-z0-9_]*)\s*=",
-                block_text,
-                re.IGNORECASE,
-            ):
-                name_l = name.lower()
-                if name_l == flag_l:
-                    continue
-                if family_tokens and any(token in name_l for token in family_tokens):
-                    related.append(name)
-            break
-    return enclosing, list(dict.fromkeys(related))[:4]
-
-
-def _teams_feature_flag_candidates_from_main(
-    prompt: str,
-    cloud: str,
-    workflow: str,
-    context: dict,
-) -> dict:
-    """Resolve an explicit enable/disable request to flag candidates in main.tf."""
-    action = _teams_feature_flag_intent(prompt)
-    if action not in {"enable", "disable"}:
-        return context
-
-    main_path, branch = _teams_flag_main_tf_path(prompt, cloud, workflow, context)
-    if not main_path:
-        return context
-    normalized_cloud = normalize_cloud(cloud)
-    repo_target = normalize_repo_target(normalized_cloud, workflow=workflow)
-    try:
-        content = github_get_file_content(
-            normalized_cloud,
-            main_path,
-            branch,
-            repo_target=repo_target,
-            workflow=workflow,
-        )
-    except Exception:
-        content = None
-    if not content:
-        return context
-
-    desired_current = "true" if action == "disable" else "false"
-    requested_new = "false" if action == "disable" else "true"
-    semantic_terms = _teams_feature_flag_terms(prompt)
-    # Generic nouns such as setup/config should not create false positives.
-    weak_terms = {"setup", "config", "configuration", "feature", "service", "thing", "stuff"}
-    strong_terms = [term for term in semantic_terms if term not in weak_terms]
-    if not strong_terms:
-        strong_terms = semantic_terms
-
-    assignment_re = re.compile(
-        r"(?m)^(?P<indent>[ \t]*)(?P<name>(?:create|enable|enabled|deploy|use|has|is)_[A-Za-z0-9_]+|[A-Za-z0-9_]+_enabled)\s*=\s*(?P<value>true|false)\s*(?P<comment>#.*)?$",
-        re.IGNORECASE,
-    )
-    raw_matches: list[dict] = []
-    compact_prompt = re.sub(r"[^a-z0-9]+", "", str(prompt or "").lower())
-    for match in assignment_re.finditer(content):
-        flag = match.group("name")
-        current = match.group("value").lower()
-        if current != desired_current:
-            continue
-        normalized_flag = flag.lower()
-        stripped_flag = re.sub(r"^(?:create|enable|enabled|deploy|use|has|is)_", "", normalized_flag)
-        stripped_flag = stripped_flag.removesuffix("_enabled")
-        score = 0
-        matched_terms: list[str] = []
-        for term in strong_terms:
-            if term in stripped_flag or term in normalized_flag:
-                score += 100
-                matched_terms.append(term)
-        compact_flag = re.sub(r"[^a-z0-9]+", "", stripped_flag)
-        if compact_flag and compact_flag in compact_prompt:
-            score += 400
-        if score <= 0:
-            continue
-        block_header, related = _teams_flag_block_context(content, flag)
-        context_text = f"currently `{current}` in `{block_header}`"
-        if related:
-            context_text += "; related repo settings: " + ", ".join(f"`{name}`" for name in related)
-        context_text += f"; selecting it will set only this flag to `{requested_new}`"
-        raw_matches.append({
-            "path": main_path,
-            "filename": "main.tf",
-            "content": content,
-            "matched_blocks": [{"header": flag, "block": match.group(0)}],
-            "reason": "feature flag matched the user's approximate wording in the resolved environment main.tf",
-            "semantic_terms": list(dict.fromkeys(matched_terms)),
-            "feature_flag_match": {
-                "path": main_path,
-                "flag": flag,
-                "current_value": current,
-                "new_value": requested_new,
-                "action": action,
-                "matched_line": match.group(0),
-                "start": match.start(),
-                "end": match.end(),
-                "block": block_header,
-                "related_settings": related,
-                "context": context_text,
-                "score": score,
-            },
-            "score": score,
-        })
-
-    raw_matches.sort(key=lambda item: (-int(item.get("score") or 0), str((item.get("feature_flag_match") or {}).get("flag") or "")))
-    if not raw_matches:
-        # Keep this explicit workflow file-scoped. Never fall back to a picker
-        # containing backend.tf/outputs.tf/versions.tf/etc.
-        result = dict(context or {})
-        result.update({
-            "selection_state": "candidate_selection_required",
-            "feature_flag_selection": True,
-            "feature_flag_action": action,
-            "selected_path": "",
-            "matched_files": [],
-            "matched_file_paths": [],
-            "scope_root": main_path.rsplit("/", 1)[0] if "/" in main_path else "",
-            "context_ref": branch,
-            "analysis": (
-                f"Feature workflow: inspected `{main_path}` on `{branch}` for Boolean flags matching the request.\n"
-                f"Action polarity: `{action}` is preserved; only flags currently `{desired_current}` are eligible.\n"
-                "Result: no semantically matching eligible Boolean flag was found in the environment main.tf."
-            ),
-        })
-        return result
-
-    best_score = int(raw_matches[0].get("score") or 0)
-    best = [item for item in raw_matches if int(item.get("score") or 0) == best_score]
-    # Exact/unique semantic match is safe to execute immediately. Otherwise the
-    # user chooses among flags, not files.
-    if len(best) == 1 and (best_score >= 400 or len(raw_matches) == 1):
-        item = best[0]
-        selected = dict(item)
-        flag_match = dict(item.get("feature_flag_match") or {})
-        return {
-            "source": "backend_existing_infra_code_match",
-            "selection_state": "selected",
-            "feature_flag_selection": True,
-            "feature_flag_action": action,
-            "cloud": normalized_cloud,
-            "repo_target": repo_target,
-            "workflow": workflow,
-            "repo_full_name": (context or {}).get("repo_full_name") or f"{GITHUB_OWNER}/{github_repo_for_cloud(normalized_cloud, repo_target=repo_target, workflow=workflow)}",
-            "context_ref": branch,
-            "scope_root": main_path.rsplit("/", 1)[0] if "/" in main_path else "",
-            "selected_path": main_path,
-            "matched_files": [selected],
-            "matched_file_paths": [main_path],
-            "feature_flag_match": flag_match,
-            "analysis": (
-                f"Feature workflow: resolved `{prompt}` against `{main_path}`.\n"
-                f"Repository match: `{flag_match.get('flag')}` is {flag_match.get('context')}.\n"
-                f"Decision: unique semantic flag match; preserve `{action}` polarity and modify only that Boolean assignment."
-            ),
-        }
-
-    candidates = raw_matches[:8]
-    return {
-        "source": "backend_existing_infra_code_match",
-        "selection_state": "candidate_selection_required",
-        "feature_flag_selection": True,
-        "feature_flag_action": action,
-        "cloud": normalized_cloud,
-        "repo_target": repo_target,
-        "workflow": workflow,
-        "repo_full_name": (context or {}).get("repo_full_name") or f"{GITHUB_OWNER}/{github_repo_for_cloud(normalized_cloud, repo_target=repo_target, workflow=workflow)}",
-        "context_ref": branch,
-        "scope_root": main_path.rsplit("/", 1)[0] if "/" in main_path else "",
-        "selected_path": "",
-        "matched_files": candidates,
-        "matched_file_paths": [main_path],
-        "analysis": (
-            f"Feature workflow: inspected only `{main_path}` for the resolved environment.\n"
-            f"Action polarity: `{action}` is fixed from the original request; eligible flags are currently `{desired_current}`.\n"
-            f"Repository match: found {len(candidates)} semantically related Boolean flags; user choice is required only between these flags, not files."
-        ),
-    }
+_AGENT_OWNED_PREVIOUS_BUILD_EXISTING_CONTEXT = build_backend_existing_infra_modification_context
 
 
 def build_backend_existing_infra_modification_context(
@@ -34793,7 +33301,8 @@ def build_backend_existing_infra_modification_context(
     workflow: str,
     retrieved_value_context: list | None = None,
 ) -> dict:
-    context = _TEAMS_FLAG_PICKER_PREVIOUS_BUILD_CONTEXT(
+    """Supply live code to Foundry without backend resource/flag selection."""
+    context = _AGENT_OWNED_PREVIOUS_BUILD_EXISTING_CONTEXT(
         prompt,
         thread_id,
         cloud,
@@ -34801,123 +33310,779 @@ def build_backend_existing_infra_modification_context(
         retrieved_value_context=retrieved_value_context,
     )
     active = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
-    if not active.get("active") or _teams_feature_flag_intent(prompt) not in {"enable", "disable"}:
+    if active.get("active") and _teams_feature_flag_intent(prompt) in {"enable", "disable"}:
+        context = dict(context or {})
+        # Prevent the generic backend file-picker from intercepting the turn.
+        # matched_files retain complete live contents as evidence for Foundry.
+        context["selection_state"] = "selected"
+        context["selected_path"] = ""
+        context.pop("feature_flag_match", None)
+        context.pop("feature_flag_resolution", None)
+        context["agent_resolves_target"] = True
+        context["instructions"] = [
+            "Foundry must inspect the supplied live repository files and decide how the requested feature is controlled.",
+            "For enable/disable requests, consider only repository-defined Boolean assignments whose current value has the required polarity; do not treat unrelated parameters/resources/files as choices.",
+            "If one semantic match exists, Foundry generates the complete final file directly. If multiple semantic matches remain, Foundry asks one numbered choice with a short description inferred from the Terraform block.",
+            "No backend flag aliases, resource vocabulary, Boolean selection, or Terraform synthesis is authoritative.",
+        ]
+    return context
+
+
+def commit_terraform_files_to_branch_for_teams(agent_result: dict, prompt: str, thread_id: str) -> dict:
+    """Validate and transport Foundry output without rewriting Terraform."""
+    _prompt_guard_validate_semantic_relevance(agent_result, prompt)
+    _prompt_guard_validate_terraform_shape(agent_result)
+    _prompt_guard_agent_self_validate(agent_result, prompt)
+    # Use the branch writer that consumes agent_result files directly. The
+    # backend must not run surgical materializers, flag togglers, object
+    # synthesizers, tfvars mergers, brace repair, or repository-code generators.
+    return _commit_terraform_files_to_branch_for_teams_base(agent_result, prompt, thread_id)
+
+# =============================================================================
+# 2026-08-18 TARGET main.tf + AGENT-OWNED FLAG RESOLUTION + PRESERVATION GUARD
+# =============================================================================
+# Final override. The backend retrieves authoritative repository code and
+# validates preservation only. Foundry remains solely responsible for deciding
+# which module/Boolean implements the user's request and for generating HCL.
+
+_AGENT_MAIN_TF_PREVIOUS_BUILD_EXISTING_CONTEXT = build_backend_existing_infra_modification_context
+_AGENT_MAIN_TF_PREVIOUS_GITHUB_PUT_IF_CHANGED = github_put_file_if_changed
+
+
+def _teams_target_environment_main_tf_evidence(
+    prompt: str,
+    cloud: str,
+    workflow: str,
+    branch: str,
+) -> list[dict]:
+    """Return complete live target-environment main.tf files when they exist.
+
+    This is structural repository retrieval only. It deliberately does not
+    choose a module, resource, or flag. Foundry receives the complete consumer
+    file and performs the semantic resolution.
+    """
+    try:
+        normalized_cloud = normalize_cloud(cloud)
+    except Exception:
+        return []
+    if normalized_cloud != "aws":
+        return []
+
+    repo_target = normalize_repo_target(
+        normalized_cloud,
+        workflow=workflow,
+    )
+    environment_paths = _teams_requested_aws_environment_paths(prompt, branch=branch)
+    if not environment_paths:
+        exact_environment = _teams_exact_aws_environment_path(prompt)
+        if exact_environment:
+            environment_paths = [exact_environment]
+
+    evidence: list[dict] = []
+    for environment_path in environment_paths:
+        main_path = f"{str(environment_path).strip().strip('/')}/main.tf"
+        try:
+            content = github_get_file_content(
+                "aws",
+                main_path,
+                branch,
+                repo_target=repo_target,
+                workflow=workflow,
+            )
+        except Exception:
+            content = None
+        if content is None:
+            continue
+        evidence.append({
+            "path": main_path,
+            "filename": "main.tf",
+            "content": content,
+            "reason": (
+                "authoritative target-environment consumer main.tf from live GitHub; "
+                "Foundry must resolve the requested module and any controlling Boolean here"
+            ),
+        })
+    return evidence
+
+
+def build_backend_existing_infra_modification_context(
+    prompt: str,
+    thread_id: str,
+    cloud: str,
+    workflow: str,
+    retrieved_value_context: list | None = None,
+) -> dict:
+    """Prefer complete target main.tf evidence for Teams enable/disable turns.
+
+    No semantic module or flag decision is made here. The backend only resolves
+    the environment and reads the authoritative consumer file. This prevents
+    repository-wide keyword matches such as backend.tf, outputs.tf, SSM data
+    sources, or unrelated parameter files from becoming user choices.
+    """
+    context = _AGENT_MAIN_TF_PREVIOUS_BUILD_EXISTING_CONTEXT(
+        prompt,
+        thread_id,
+        cloud,
+        workflow,
+        retrieved_value_context=retrieved_value_context,
+    )
+    active = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
+    intent = _teams_feature_flag_intent(prompt)
+    if not (active.get("active") and intent in {"enable", "disable"}):
         return context
-    return _teams_feature_flag_candidates_from_main(prompt, cloud, workflow, context)
+
+    context = dict(context or {})
+    branch = str(context.get("context_ref") or "").strip()
+    if not branch:
+        try:
+            normalized_cloud = normalize_cloud(cloud)
+            repo_target = normalize_repo_target(normalized_cloud, workflow=workflow)
+            branch = _teams_remote_context_branch(normalized_cloud, repo_target, workflow)
+        except Exception:
+            branch = ""
+
+    main_tf_evidence = _teams_target_environment_main_tf_evidence(
+        prompt,
+        cloud,
+        workflow,
+        branch,
+    )
+    if main_tf_evidence:
+        # Replace broad keyword candidates with the authoritative environment
+        # consumer file(s). Foundry sees the full file and performs module/flag
+        # resolution itself.
+        context["matched_files"] = main_tf_evidence
+        context["matched_file_paths"] = [item["path"] for item in main_tf_evidence]
+        context["selection_state"] = "selected"
+        context["selected_path"] = main_tf_evidence[0]["path"] if len(main_tf_evidence) == 1 else ""
+        context["target_environment_main_tf_first"] = True
+        context["agent_resolves_target"] = True
+        context["instructions"] = [
+            "Treat each supplied target-environment main.tf as authoritative live repository content.",
+            "For enable/disable requests, first inspect module blocks in target main.tf. Resolve the user's resource wording to the relevant existing module from its module label, source, comments, arguments, and surrounding repository semantics.",
+            "Within semantically relevant module blocks, prefer repository-defined Boolean controls whose current literal value matches the requested transition: disable => true, enable => false. Typical naming shapes such as enable_*, create_*, *_enabled, deploy_*, use_* are examples only, not a whitelist.",
+            "Do not surface data sources, SSM parameters, backend/provider/version files, outputs, unrelated arguments, or plain keyword matches as choices when a semantically relevant Boolean control exists.",
+            "If exactly one relevant module/Boolean exists, generate the change directly without asking the user.",
+            "If multiple genuinely relevant modules remain, ask only which MODULE the user means. Each choice must show the module label and the relevant Boolean flag(s) found inside that module; do not ask the user to choose a file when all choices are in target main.tf.",
+            "Return the COMPLETE final file content for every modified existing file. Copy every unrelated existing line/block/comment exactly and change only the requested assignment(s). Never use placeholders such as '<existing content preserved as in evidence>', ellipses standing for omitted repository code, or abbreviated file bodies.",
+            "The backend will reject destructive/truncated full-file responses; it will not merge or synthesize Terraform on Foundry's behalf.",
+        ]
+    return context
+
+
+def _terrabot_placeholder_content_detected(content: str) -> bool:
+    text = str(content or "").lower()
+    markers = (
+        "<existing content preserved as in evidence>",
+        "existing content preserved as in evidence",
+        "<existing content preserved>",
+        "existing content unchanged",
+        "... existing content ...",
+        "# existing content preserved",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _validate_agent_full_file_preservation_for_write(
+    existing_content: str,
+    generated_content: str,
+    path: str,
+    workflow: str | None,
+) -> None:
+    """Reject destructive Foundry rewrites without generating any Terraform.
+
+    Validation may compare repository truth with Foundry's final file. It may
+    not repair, merge, append, toggle, or otherwise mutate the generated HCL.
+    """
+    if existing_content is None:
+        return
+    if _terrabot_placeholder_content_detected(generated_content):
+        raise ValueError(
+            f"Generated modification for {path} contains a repository-content placeholder. "
+            "Foundry must return the complete real file with unrelated content preserved."
+        )
+
+    normalized_workflow = str(workflow or "").strip()
+    if normalized_workflow not in INFRA_MODIFICATION_WORKFLOWS:
+        return
+
+    # Re-enable the existing non-mutating preservation validator. This function
+    # only rejects destructive replacements; it does not construct file content.
+    _validate_full_file_modification_preserves_existing(
+        existing_content,
+        generated_content,
+        path,
+    )
+
+    existing = (existing_content or "").replace("\r\n", "\n")
+    generated = (generated_content or "").replace("\r\n", "\n")
+    if not existing.strip():
+        return
+
+    # Modification requests must not silently delete existing top-level blocks
+    # unless the user explicitly requested deletion/removal.
+    flow_context = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
+    effective_prompt = str(flow_context.get("effective_prompt") or "").lower()
+    explicit_delete = bool(re.search(r"\b(?:delete|remove)\b", effective_prompt))
+    if path.endswith(".tf") and not explicit_delete:
+        existing_headers = _top_level_tf_headers_for_modification(existing)
+        generated_headers = _top_level_tf_headers_for_modification(generated)
+        missing_headers = sorted(existing_headers - generated_headers)
+        if missing_headers:
+            raise ValueError(
+                f"Generated modification for {path} removed existing Terraform blocks: "
+                + ", ".join(missing_headers[:12])
+                + ". Foundry must preserve unrelated repository content and edit only the requested code."
+            )
+
+    # A complete-file modification should remain close in size to repository
+    # truth. This catches one-line/single-block replacements while allowing
+    # ordinary targeted edits and additions. It is validation only.
+    existing_nonblank = [line for line in existing.splitlines() if line.strip()]
+    generated_nonblank = [line for line in generated.splitlines() if line.strip()]
+    if len(existing_nonblank) >= 20 and len(generated_nonblank) < max(8, int(len(existing_nonblank) * 0.70)):
+        raise ValueError(
+            f"Generated modification for {path} is substantially shorter than the live repository file "
+            f"({len(generated_nonblank)} vs {len(existing_nonblank)} nonblank lines). "
+            "Refusing a likely truncated overwrite; Foundry must return the complete final file."
+        )
+
+
+def github_put_file_if_changed(
+    cloud: str,
+    path: str,
+    content: str,
+    branch: str,
+    commit_message: str,
+    repo_target: Optional[str] = None,
+    workflow: Optional[str] = None,
+):
+    """Validate preservation, then transport Foundry content exactly as returned."""
+    existing_content = github_get_file_content(
+        cloud,
+        path,
+        branch,
+        repo_target=repo_target,
+        workflow=workflow,
+    )
+    final_content = str(content or "")
+
+    normalized_existing = (existing_content or "").replace("\r\n", "\n").strip()
+    normalized_new = final_content.replace("\r\n", "\n").strip()
+    if existing_content is not None and normalized_existing == normalized_new:
+        return {"changed": False, "path": path, "result": None}
+
+    if path.endswith((".tf", ".tfvars")):
+        _validate_hcl_content_complete(path, final_content)
+        if _has_git_conflict_markers(final_content):
+            raise ValueError(f"Generated {path} contains Git conflict markers.")
+        _validate_agent_full_file_preservation_for_write(
+            existing_content,
+            final_content,
+            path,
+            workflow,
+        )
+
+    # Transport only: no merge, repair, append, normalization, or flag toggle.
+    result = github_put_file(
+        cloud=cloud,
+        path=path,
+        content=final_content,
+        branch=branch,
+        commit_message=commit_message,
+        repo_target=repo_target,
+        workflow=workflow,
+    )
+    return {"changed": True, "path": path, "result": result}
+
+# =============================================================================
+# 2026-08-18 FOUNDRY SEMANTIC BOOLEAN CONTROL + EXACT PRESERVATION — FINAL OVERRIDE
+# =============================================================================
+# This layer intentionally does not infer resource vocabulary in Python. For a
+# Teams AWS modification, the backend resolves the target environment and reads
+# its complete main.tf, then asks Foundry whether the requested operation is
+# implemented by an existing literal Boolean control. Foundry owns semantic
+# interpretation; the backend only verifies that returned candidates literally
+# exist in live repository content and safely transports the final full file.
+
+_FINAL_BOOL_PREVIOUS_BUILD_EXISTING_CONTEXT = build_backend_existing_infra_modification_context
+_FINAL_BOOL_PREVIOUS_SELECT_CANDIDATE = select_infra_modification_candidate_from_reply
+_FINAL_BOOL_PREVIOUS_PATH_QUESTION = _teams_is_path_request_question
+_FINAL_BOOL_PREVIOUS_GITHUB_PUT = github_put_file_if_changed
+
+
+def _foundry_boolean_control_candidates(
+    prompt: str,
+    main_tf_evidence: list[dict],
+) -> dict:
+    """Ask Foundry to semantically identify actionable Boolean controls only.
+
+    This is classification, not Terraform generation. Python does not decide
+    that words such as enable/disable/remove imply a flag; Foundry decides
+    whether the requested repository change is represented by a Boolean gate.
+    """
+    files = [
+        {
+            "path": str(item.get("path") or "").strip(),
+            "content": str(item.get("content") or ""),
+        }
+        for item in (main_tf_evidence or [])
+        if isinstance(item, dict)
+        and str(item.get("path") or "").strip()
+        and str(item.get("content") or "").strip()
+    ]
+    if not files:
+        return {"applicable": False, "candidates": []}
+
+    request = {
+        "task": (
+            "Classify whether the user's requested existing-infrastructure modification can be fulfilled "
+            "by changing an existing literal Boolean assignment in the supplied target-environment main.tf. "
+            "This is semantic repository analysis only; do not generate Terraform."
+        ),
+        "user_request": str(prompt or "").strip(),
+        "target_environment_files": files,
+        "required_output": {
+            "applicable": "boolean",
+            "reason": "short repository-grounded explanation",
+            "candidates": [
+                {
+                    "path": "exact supplied main.tf path",
+                    "module": "exact Terraform module label containing the Boolean",
+                    "flag": "exact Boolean argument name",
+                    "current_value": "true|false",
+                    "new_value": "true|false",
+                    "description": "short description of what this Boolean controls, inferred from the module/source/nearby arguments/comments",
+                }
+            ],
+        },
+        "rules": [
+            "Return JSON only with keys applicable, reason, candidates.",
+            "Decide from the semantics of the user request and repository content; do not rely on a fixed action-word vocabulary supplied by the backend.",
+            "Set applicable=true only when an existing literal Boolean assignment in a semantically relevant module is a valid mechanism for the requested change.",
+            "Candidates must be direct Boolean arguments of semantically relevant module blocks in the supplied main.tf files.",
+            "Include only candidates whose value would actually change for this request; current_value and new_value must differ.",
+            "Do not return data sources, SSM parameters, URLs, secrets, numeric/string parameters, outputs, providers, backend/version settings, or keyword-only matches.",
+            "Do not invent a Boolean, module, path, alias, or value that is not present in the supplied repository content.",
+            "If one Boolean clearly controls the requested resource, return only that Boolean even if unrelated parameters contain similar words.",
+            "If multiple genuinely plausible Boolean controls remain, return all of those Boolean controls so the user can choose among parameters, not files.",
+            "If the repository does not support this request through an existing Boolean control, set applicable=false and return candidates=[].",
+        ],
+    }
+    try:
+        raw = call_named_agent(json.dumps(request, ensure_ascii=False), AGENT_NAME)
+        data = extract_json_from_text(raw)
+        if not isinstance(data, dict):
+            return {"applicable": False, "candidates": []}
+        return data
+    except Exception as exc:
+        LOGGER.warning("Foundry Boolean-control classification failed; continuing normal semantic workflow: %s", exc)
+        return {"applicable": False, "candidates": [], "error": str(exc)}
+
+
+def _literal_module_boolean_index(main_tf_evidence: list[dict]) -> dict[tuple[str, str, str], dict]:
+    """Index literal direct module Boolean assignments for validation only."""
+    index: dict[tuple[str, str, str], dict] = {}
+    for item in main_tf_evidence or []:
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("path") or "").strip().strip("/")
+        content = str(item.get("content") or "")
+        if not path or not content:
+            continue
+        for block in _extract_top_level_tf_blocks(content):
+            header = str(block.get("header") or "").strip()
+            module_match = re.fullmatch(r'module\s+"([^"]+)"', header)
+            if not module_match:
+                continue
+            module_name = module_match.group(1)
+            block_text = str(block.get("block") or "")
+            # Direct literal Boolean assignments are intentionally narrow. The
+            # semantic decision is Foundry's; this regex only proves the exact
+            # returned flag/value exists in the selected live module block.
+            for match in re.finditer(
+                r'(?m)^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(true|false)\s*(?:#.*)?$',
+                block_text,
+                re.IGNORECASE,
+            ):
+                flag = match.group(1)
+                current = match.group(2).lower()
+                index[(path, module_name, flag)] = {
+                    "path": path,
+                    "module": module_name,
+                    "flag": flag,
+                    "current_value": current,
+                }
+    return index
+
+
+def _validated_foundry_boolean_candidates(
+    prompt: str,
+    main_tf_evidence: list[dict],
+) -> tuple[bool, list[dict], str]:
+    classification = _foundry_boolean_control_candidates(prompt, main_tf_evidence)
+    applicable = bool(classification.get("applicable"))
+    if not applicable:
+        return False, [], str(classification.get("reason") or "")
+
+    literal_index = _literal_module_boolean_index(main_tf_evidence)
+    validated: list[dict] = []
+    seen: set[tuple[str, str, str]] = set()
+    for candidate in classification.get("candidates") or []:
+        if not isinstance(candidate, dict):
+            continue
+        path = str(candidate.get("path") or "").strip().strip("/")
+        module_name = str(candidate.get("module") or "").strip()
+        flag = str(candidate.get("flag") or "").strip()
+        current = str(candidate.get("current_value") or "").strip().lower()
+        new_value = str(candidate.get("new_value") or "").strip().lower()
+        key = (path, module_name, flag)
+        literal = literal_index.get(key)
+        if not literal:
+            continue
+        if current not in {"true", "false"} or new_value not in {"true", "false"}:
+            continue
+        if current == new_value or literal.get("current_value") != current:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        validated.append({
+            **literal,
+            "new_value": new_value,
+            "context": str(candidate.get("description") or "").strip()
+            or f'Controls the requested behavior in module "{module_name}".',
+            "description": str(candidate.get("description") or "").strip()
+            or f'Controls the requested behavior in module "{module_name}".',
+            "classification_reason": str(classification.get("reason") or "").strip(),
+        })
+    return bool(validated), validated, str(classification.get("reason") or "")
+
+
+def build_backend_existing_infra_modification_context(
+    prompt: str,
+    thread_id: str,
+    cloud: str,
+    workflow: str,
+    retrieved_value_context: list | None = None,
+) -> dict:
+    """Final modification resolver with Foundry-owned Boolean semantics.
+
+    For Teams AWS modifications, always inspect the resolved environment
+    main.tf first. If Foundry proves the requested operation is controlled by
+    literal Boolean argument(s), only those arguments become candidates. This
+    path is intentionally independent of hardcoded enable/disable keywords.
+    """
+    context = _FINAL_BOOL_PREVIOUS_BUILD_EXISTING_CONTEXT(
+        prompt,
+        thread_id,
+        cloud,
+        workflow,
+        retrieved_value_context=retrieved_value_context,
+    )
+    active = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
+    if not active.get("active"):
+        return context
+    try:
+        normalized_cloud = normalize_cloud(cloud)
+    except Exception:
+        return context
+    if normalized_cloud != "aws" or str(workflow or "").strip() not in INFRA_MODIFICATION_WORKFLOWS:
+        return context
+
+    context = dict(context or {})
+    branch = str(context.get("context_ref") or "").strip()
+    if not branch:
+        try:
+            branch = _teams_remote_context_branch(
+                "aws",
+                repo_target="tf-devops",
+                workflow=workflow,
+            )
+        except Exception:
+            branch = ""
+
+    main_tf_evidence = _teams_target_environment_main_tf_evidence(
+        prompt,
+        "aws",
+        workflow,
+        branch,
+    )
+    if not main_tf_evidence:
+        return context
+
+    applicable, candidates, reason = _validated_foundry_boolean_candidates(
+        prompt,
+        main_tf_evidence,
+    )
+    if not applicable or not candidates:
+        # Still make target main.tf the primary evidence for the agent, but do
+        # not invent a Boolean workflow when Foundry says the request is not
+        # controlled by a literal flag.
+        context["matched_files"] = main_tf_evidence
+        context["matched_file_paths"] = [item.get("path") for item in main_tf_evidence if item.get("path")]
+        context["selection_state"] = "selected"
+        context["selected_path"] = main_tf_evidence[0].get("path") if len(main_tf_evidence) == 1 else ""
+        context["target_environment_main_tf_first"] = True
+        context["agent_resolves_target"] = True
+        context["boolean_control_classification"] = {
+            "applicable": False,
+            "reason": reason,
+        }
+        context["instructions"] = list(context.get("instructions") or []) + [
+            "The target environment main.tf is already an authorized modification target. Never ask the user for permission to modify it or for an alternative repository path.",
+            "If repository semantics are genuinely ambiguous, ask only which resource/module the user means; never ask which file/path to use when the target environment has already been resolved.",
+        ]
+        return context
+
+    evidence_by_path = {
+        str(item.get("path") or "").strip().strip("/"): item
+        for item in main_tf_evidence
+        if isinstance(item, dict)
+    }
+    matched: list[dict] = []
+    for candidate in candidates:
+        source = dict(evidence_by_path.get(candidate["path"]) or {})
+        if not source:
+            continue
+        source["feature_flag_match"] = dict(candidate)
+        source["matched_blocks"] = [{
+            "header": f'module "{candidate["module"]}"',
+            "block": "",
+        }]
+        source["reason"] = "Foundry semantic Boolean-control match validated against live target main.tf"
+        matched.append(source)
+
+    if not matched:
+        return context
+
+    context["matched_files"] = matched
+    context["matched_file_paths"] = list(dict.fromkeys(item.get("path") for item in matched if item.get("path")))
+    context["feature_flag_selection"] = True
+    context["target_environment_main_tf_first"] = True
+    context["agent_resolves_target"] = False
+    context["boolean_control_classification"] = {
+        "applicable": True,
+        "reason": reason,
+        "candidate_count": len(matched),
+    }
+    context["instructions"] = [
+        "Foundry already semantically classified the requested operation as an existing Boolean-gated repository change; the backend verified every listed Boolean literally exists in live target main.tf.",
+        "Use only feature_flag_match. Do not change or surface any other parameter merely because its name/content resembles the user's resource wording.",
+        "The target main.tf is already authorized by the resolved environment. Never ask permission to modify it and never ask for an alternative path.",
+        "After one Boolean is selected, change only that exact Boolean assignment to feature_flag_match.new_value and return the COMPLETE final target file.",
+        "Preserve every unrelated byte/line/block/comment in the existing file. Do not reformat, reorder, truncate, summarize, or replace unrelated repository content.",
+    ]
+    if len(matched) == 1:
+        context["selection_state"] = "selected"
+        context["selected_path"] = matched[0].get("path") or ""
+    else:
+        context["selection_state"] = "candidate_selection_required"
+        context["selected_path"] = ""
+    return context
 
 
 def select_infra_modification_candidate_from_reply(reply: str, pending_selection: dict) -> int | None:
-    base = pending_selection.get("existing_infra_context") or {}
-    candidates = list(base.get("matched_files") or [])
-    if base.get("feature_flag_selection"):
-        text = str(reply or "").strip().strip("`'\" ")
-        number_match = re.fullmatch(r"(?:option|select|choose|pick)?\s*#?(\d+)", text, re.IGNORECASE)
-        if number_match:
-            index = int(number_match.group(1)) - 1
-            return index if 0 <= index < len(candidates) else None
-        normalized = text.lower().replace("-", "_")
-        for index, item in enumerate(candidates):
-            flag = str((item.get("feature_flag_match") or {}).get("flag") or "").lower().replace("-", "_")
-            if flag and normalized == flag:
-                return index
-        return None
-    return _TEAMS_FLAG_PICKER_PREVIOUS_SELECT_REPLY(reply, pending_selection)
-
-
-def build_selected_infra_modification_context(pending_selection: dict, selected_index: int) -> dict:
-    base = pending_selection.get("existing_infra_context") or {}
-    if not base.get("feature_flag_selection"):
-        return _TEAMS_FLAG_PICKER_PREVIOUS_BUILD_SELECTED(pending_selection, selected_index)
-    candidates = list(base.get("matched_files") or [])
-    if selected_index < 0 or selected_index >= len(candidates):
-        raise ValueError("Invalid feature-flag selection.")
-    chosen = dict(candidates[selected_index])
-    path = str(chosen.get("path") or "").strip()
-    cloud = normalize_cloud(base.get("cloud") or pending_selection.get("cloud"))
-    workflow = str(base.get("workflow") or pending_selection.get("workflow") or "").strip()
-    repo_target = str(base.get("repo_target") or normalize_repo_target(cloud, workflow=workflow)).strip()
-    branch = str(base.get("context_ref") or "").strip() or _teams_remote_context_branch(cloud, repo_target, workflow)
-    content = github_get_file_content(cloud, path, branch, repo_target=repo_target, workflow=workflow)
-    if content is None:
-        raise ValueError(f"The selected feature-flag file could not be read from GitHub: {path}")
-
-    original_prompt = str(pending_selection.get("original_prompt") or "").strip()
-    action = _teams_feature_flag_intent(original_prompt) or str(base.get("feature_flag_action") or "").strip().lower()
-    if action not in {"enable", "disable"}:
-        raise ValueError("The original feature-flag action was not preserved across selection.")
-    desired_current = "true" if action == "disable" else "false"
-    requested_new = "false" if action == "disable" else "true"
-    flag_match = dict(chosen.get("feature_flag_match") or {})
-    flag = str(flag_match.get("flag") or "").strip()
-    assignment = re.search(
-        rf"(?m)^\s*{re.escape(flag)}\s*=\s*(true|false)\s*(?:#.*)?$",
-        content,
-        re.IGNORECASE,
-    )
-    if not assignment:
-        raise ValueError(f"Selected flag `{flag}` is no longer present in `{path}`.")
-    current = assignment.group(1).lower()
-    # The branch may have changed since the picker. Do not invert the user's
-    # request. If already in the requested state, keep polarity and let the
-    # deterministic materializer/reporting path handle the no-op explicitly.
-    flag_match.update({
-        "path": path,
-        "flag": flag,
-        "current_value": current,
-        "new_value": requested_new,
-        "action": action,
-        "matched_line": assignment.group(0),
-        "start": assignment.start(),
-        "end": assignment.end(),
-    })
-    chosen["content"] = content
-    chosen["feature_flag_match"] = flag_match
-    chosen["selected_by_user"] = True
-    return {
-        "source": "backend_existing_infra_code_match",
-        "selection_state": "selected",
-        "feature_flag_selection": True,
-        "feature_flag_action": action,
-        "cloud": cloud,
-        "repo_target": repo_target,
-        "workflow": workflow,
-        "repo_full_name": base.get("repo_full_name") or "",
-        "context_ref": branch,
-        "scope_root": base.get("scope_root") or (path.rsplit("/", 1)[0] if "/" in path else ""),
-        "selected_path": path,
-        "matched_files": [chosen],
-        "matched_file_paths": [path],
-        "feature_flag_match": flag_match,
-        "analysis": (
-            f"Feature selection: user chose `{flag}` from live repository flags in `{path}`.\n"
-            f"Original action preserved: `{action}`; requested value remains `{requested_new}`.\n"
-            f"Repository context: {flag_match.get('context') or 'Boolean feature assignment in the target environment main.tf'}."
-        ),
-    }
+    """Allow Boolean picker follow-ups by number OR exact parameter name."""
+    selected = _FINAL_BOOL_PREVIOUS_SELECT_CANDIDATE(reply, pending_selection)
+    if selected is not None:
+        return selected
+    text = str(reply or "").strip().strip("`'\"").lower()
+    candidates = ((pending_selection.get("existing_infra_context") or {}).get("matched_files") or [])
+    for index, candidate in enumerate(candidates):
+        match = (candidate or {}).get("feature_flag_match") or {}
+        flag = str(match.get("flag") or "").strip().lower()
+        module_name = str(match.get("module") or "").strip().lower()
+        if flag and text == flag:
+            return index
+        if module_name and text in {module_name, f'module {module_name}'}:
+            return index
+    return None
 
 
 def build_infra_modification_selection_reply(existing_infra_context: dict) -> str:
-    if not existing_infra_context.get("feature_flag_selection"):
-        return _TEAMS_FLAG_PICKER_PREVIOUS_SELECTION_REPLY(existing_infra_context)
-    action = str(existing_infra_context.get("feature_flag_action") or "change").strip().lower()
+    """Render Boolean ambiguity as a parameter question, never a file picker."""
     candidates = list(existing_infra_context.get("matched_files") or [])
-    main_path = str((candidates[0].get("path") if candidates else "") or "").strip()
+    flag_items = []
+    for item in candidates:
+        if not isinstance(item, dict):
+            continue
+        match = item.get("feature_flag_match") or {}
+        if str(match.get("flag") or "").strip():
+            flag_items.append((item, match))
+    if flag_items:
+        lines = [
+            "I found multiple repository-backed Boolean parameters that can control this request. Which parameter should I change?",
+            "",
+        ]
+        for index, (item, match) in enumerate(flag_items, start=1):
+            flag = str(match.get("flag") or "").strip()
+            module_name = str(match.get("module") or "").strip()
+            current = str(match.get("current_value") or "").strip().lower()
+            target = str(match.get("new_value") or "").strip().lower()
+            description = str(match.get("context") or match.get("description") or "").strip()
+            path = str(item.get("path") or "").strip()
+            lines.append(f"{index}. **`{flag}`** — {description or f'Boolean control in module {module_name}'}")
+            lines.append(f"   Module: `module \"{module_name}\"` · `{current}` → `{target}` · `{path}`")
+        lines.extend([
+            "",
+            "Reply with the number or exact Boolean parameter name. Terrabot will change only that parameter and preserve the rest of the file unchanged.",
+        ])
+        return "\n".join(lines)
+    # Preserve every earlier non-Boolean clarification behavior.
+    return _teams_candidate_selection_reply_non_boolean(existing_infra_context)
+
+
+def _teams_candidate_selection_reply_non_boolean(existing_infra_context: dict) -> str:
+    candidates = list(existing_infra_context.get("matched_files") or [])[:6]
     if not candidates:
         return (
-            f"I inspected `{main_path or 'the target environment main.tf'}` but did not find an existing Boolean flag that matches this {action} request. "
-            "Please give a more specific feature name; you do not need to provide a Terraform file or path."
+            "I couldn't find a repository-backed Terraform target for that resource wording. "
+            "Reply with a more specific resource/module name; you do not need to provide a file path."
         )
-    verb = "disable" if action == "disable" else "enable"
     lines = [
-        f"I found multiple repository-backed flags that could match this request. Which flag should I {verb}?",
+        "I found a few similar repository resources. Which resource should I modify?",
         "",
     ]
     for index, item in enumerate(candidates, start=1):
-        match = item.get("feature_flag_match") or {}
-        flag = str(match.get("flag") or "").strip()
-        context_text = str(match.get("context") or "").strip()
-        lines.append(f"{index}. `{flag}` — {context_text}")
-    if main_path:
-        lines.extend(["", f"All choices are existing flags in `{main_path}`; the file is already resolved and is not a user choice."])
-    lines.extend(["", f"Reply with the number or exact flag name. Terrabot will {verb} that flag and continue validation/push automatically."])
+        label = _teams_candidate_friendly_label(item)
+        path = str(item.get("path") or "").strip()
+        lines.append(f"{index}. **{label}** — `{path}`")
+    lines.extend([
+        "",
+        "Reply with the number or resource/module name. Terrabot will use the already resolved repository path.",
+    ])
     return "\n".join(lines)
+
+
+def _teams_is_path_request_question(text: str) -> bool:
+    """Treat any resolved-target permission/path question as internally answerable."""
+    value = re.sub(r"\s+", " ", str(text or "").strip().lower())
+    if _FINAL_BOOL_PREVIOUS_PATH_QUESTION(value):
+        return True
+    forbidden = (
+        "path restriction",
+        "allow modifying",
+        "allow modification",
+        "alternative repo-approved path",
+        "alternative repository-approved path",
+        "provide an alternative",
+        "confirm how you want to proceed given the path",
+        "specify the exact file",
+        "which file should i modify",
+        "which path should i modify",
+        "permission to modify",
+    )
+    return any(marker in value for marker in forbidden)
+
+
+def _selected_feature_flag_match_from_active_context(path: str = "") -> dict:
+    active = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
+    wanted_path = str(path or "").strip().strip("/")
+    for ctx in active.get("retrieved_value_context") or []:
+        if not isinstance(ctx, dict) or ctx.get("source") != "backend_existing_infra_code_match":
+            continue
+        for item in ctx.get("matched_files") or []:
+            if not isinstance(item, dict):
+                continue
+            match = item.get("feature_flag_match") or {}
+            item_path = str(item.get("path") or "").strip().strip("/")
+            if match and (not wanted_path or item_path == wanted_path):
+                return dict(match)
+    return {}
+
+
+def _validate_selected_boolean_is_only_file_change(
+    existing_content: str,
+    generated_content: str,
+    path: str,
+) -> None:
+    """For a selected Boolean change, require exact preservation otherwise.
+
+    This is a validator only. It never constructs/merges Terraform. The model's
+    final file must differ from live repository truth by exactly one replacement
+    line: the selected literal Boolean assignment.
+    """
+    match = _selected_feature_flag_match_from_active_context(path)
+    if not match:
+        return
+    flag = str(match.get("flag") or "").strip()
+    current = str(match.get("current_value") or "").strip().lower()
+    target = str(match.get("new_value") or "").strip().lower()
+    if not flag or current not in {"true", "false"} or target not in {"true", "false"} or current == target:
+        raise ValueError("Selected Boolean modification context is incomplete or invalid.")
+
+    existing_lines = (existing_content or "").replace("\r\n", "\n").splitlines()
+    generated_lines = (generated_content or "").replace("\r\n", "\n").splitlines()
+    if len(existing_lines) != len(generated_lines):
+        raise ValueError(
+            f"Generated Boolean modification for {path} added/removed lines. "
+            "Only the selected Boolean assignment may change; all other repository content must remain exactly preserved."
+        )
+
+    assignment = re.compile(
+        rf'^(\s*){re.escape(flag)}(\s*=\s*)(true|false)(\s*(?:#.*)?)$',
+        re.IGNORECASE,
+    )
+    changed = 0
+    for old_line, new_line in zip(existing_lines, generated_lines):
+        if old_line == new_line:
+            continue
+        old_match = assignment.match(old_line)
+        new_match = assignment.match(new_line)
+        if not old_match or not new_match:
+            raise ValueError(
+                f"Generated Boolean modification for {path} changed unrelated repository content. "
+                f"Only `{flag} = {current}` may become `{flag} = {target}`."
+            )
+        if old_match.group(3).lower() != current or new_match.group(3).lower() != target:
+            raise ValueError(
+                f"Generated Boolean modification for {path} changed `{flag}` with unexpected values. "
+                f"Expected {current} -> {target}."
+            )
+        # Preserve indentation, spacing around '=', and any inline comment too.
+        if old_match.group(1) != new_match.group(1) or old_match.group(2) != new_match.group(2) or old_match.group(4) != new_match.group(4):
+            raise ValueError(
+                f"Generated Boolean modification for {path} reformatted the selected line. "
+                "Only the literal Boolean value may change."
+            )
+        changed += 1
+    if changed != 1:
+        raise ValueError(
+            f"Generated Boolean modification for {path} must change exactly one `{flag}` assignment; observed {changed}."
+        )
+
+
+def github_put_file_if_changed(
+    cloud: str,
+    path: str,
+    content: str,
+    branch: str,
+    commit_message: str,
+    repo_target: Optional[str] = None,
+    workflow: Optional[str] = None,
+):
+    """Add exact selected-Boolean preservation validation, then use prior writer."""
+    existing_content = github_get_file_content(
+        cloud,
+        path,
+        branch,
+        repo_target=repo_target,
+        workflow=workflow,
+    )
+    if existing_content is not None:
+        _validate_selected_boolean_is_only_file_change(
+            existing_content,
+            str(content or ""),
+            path,
+        )
+    return _FINAL_BOOL_PREVIOUS_GITHUB_PUT(
+        cloud=cloud,
+        path=path,
+        content=content,
+        branch=branch,
+        commit_message=commit_message,
+        repo_target=repo_target,
+        workflow=workflow,
+    )
+

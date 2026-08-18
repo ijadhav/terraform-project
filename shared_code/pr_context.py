@@ -30,11 +30,30 @@ DEFAULT_TIMEOUT = 15
 MAX_PULL_REQUESTS_FETCHED = 40
 
 _STOPWORDS = {
+    # grammar / generic request words
     "the", "a", "an", "and", "or", "for", "to", "in", "on", "of", "is",
-    "are", "with", "using", "create", "add", "new", "please", "can",
-    "you", "existing", "current", "this", "that", "terraform", "infra",
-    "infrastructure",
+    "are", "with", "using", "please", "can", "you", "existing", "current",
+    "this", "that", "terraform", "infra", "infrastructure", "request", "change",
+    "changes", "feature", "resource", "service", "setup", "config", "configuration",
+    # action words are intentionally non-discriminating for PR relevance
+    "create", "created", "add", "added", "new", "enable", "enabled", "disable",
+    "disabled", "remove", "removed", "delete", "deleted", "update", "updated",
+    "modify", "modified", "fix", "fixed", "turn", "switch", "decommission",
+    # cloud/environment words must never make two otherwise unrelated PRs match
+    "aws", "azure", "prod", "production", "dev", "development", "nonprod", "non",
+    "environment", "environments", "env", "main", "branch", "draft", "pull", "pr",
 }
+
+
+def _is_environment_token(token: str) -> bool:
+    token = str(token or "").lower()
+    return bool(
+        re.fullmatch(r"(?:us|eu|ca|ap|uk|au|sa)\d+(?:dr)?", token)
+        or re.fullmatch(r"(?:mini)?dev\d*", token)
+        or re.fullmatch(r"(?:prod|prd|npr|sbx|uat|stage|stg)\d*", token)
+        or token in {"global", "observe", "sqlstaging", "devops"}
+    )
+
 
 
 def _auth_headers(token: Optional[str]) -> Dict[str, str]:
@@ -98,36 +117,61 @@ def list_open_pull_requests(
 
 
 def _tokenize(text: str) -> set[str]:
-    tokens = {token for token in re.findall(r"[a-z0-9_-]{3,}", str(text or "").lower())}
-    return {token for token in tokens if token not in _STOPWORDS}
+    """Return semantic PR-match tokens, splitting branch/flag compounds.
+
+    Generic actions and environment labels are removed before scoring so a PR
+    cannot be deemed related merely because both requests say "disable" or
+    mention the same hub such as us1/us2.
+    """
+    normalized = str(text or "").lower().replace("_", " ").replace("-", " ")
+    aliases = {
+        "patching": "patch",
+        "patches": "patch",
+        "rabbitmq": "cloudamqp",
+    }
+    tokens: set[str] = set()
+    for raw in re.findall(r"[a-z0-9]{3,}", normalized):
+        token = aliases.get(raw, raw)
+        if token in _STOPWORDS or _is_environment_token(token):
+            continue
+        tokens.add(token)
+    return tokens
 
 
-def _score_pull_request(prompt_tokens: set[str], pull_request: dict) -> int:
-    title = str(pull_request.get("title") or "")
-    body = str(pull_request.get("body") or "")
-    branch = str((pull_request.get("head") or {}).get("ref") or "")
-    haystack_title = _tokenize(title)
-    haystack_branch = _tokenize(branch)
-    haystack_body = _tokenize(body)
+def _pull_request_token_sets(pull_request: dict) -> tuple[set[str], set[str], set[str]]:
+    title = _tokenize(str(pull_request.get("title") or ""))
+    branch = _tokenize(str((pull_request.get("head") or {}).get("ref") or ""))
+    body = _tokenize(str(pull_request.get("body") or ""))
+    return title, branch, body
 
+
+def _score_pull_request(prompt_tokens: set[str], pull_request: dict) -> tuple[int, set[str], set[str]]:
+    title_tokens, branch_tokens, body_tokens = _pull_request_token_sets(pull_request)
+    strong_overlap = prompt_tokens & (title_tokens | branch_tokens)
+    body_overlap = prompt_tokens & body_tokens
+
+    # Title/branch overlap is strong evidence. Body-only overlap is accepted
+    # only when at least two distinct semantic request terms agree, which
+    # avoids one incidental word surfacing an unrelated PR.
     score = 0
-    score += 6 * len(prompt_tokens & haystack_title)
-    score += 4 * len(prompt_tokens & haystack_branch)
-    score += 2 * len(prompt_tokens & haystack_body)
-    return score
+    score += 10 * len(prompt_tokens & title_tokens)
+    score += 8 * len(prompt_tokens & branch_tokens)
+    score += 4 * len(body_overlap)
+    return score, strong_overlap, body_overlap
 
 
 def match_pull_requests_for_prompt(
     prompt: str,
     pull_requests: List[dict],
     max_matches: int = 5,
-    min_score: int = 1,
+    min_score: int = 8,
 ) -> List[dict]:
-    """Rank pull requests by keyword overlap with ``prompt``.
+    """Return only resource-semantically related pull requests.
 
-    Returns the highest scoring pull requests (score >= ``min_score``),
-    best first. Pure function — no network calls — so it is easy to unit
-    test independent of GitHub access.
+    Generic action words and environment labels are ignored. A match requires
+    either a meaningful token in the PR title/branch or at least two meaningful
+    request tokens in the PR body. This prevents matches driven only by words
+    such as enable/disable/create/us1/us2.
     """
     prompt_tokens = _tokenize(prompt)
     if not prompt_tokens:
@@ -136,18 +180,18 @@ def match_pull_requests_for_prompt(
     for pull_request in pull_requests:
         if not isinstance(pull_request, dict):
             continue
-        score = _score_pull_request(prompt_tokens, pull_request)
-        if score >= min_score:
-            scored.append((score, pull_request))
-    scored.sort(key=lambda item: item[0], reverse=True)
-    matches = [item[1] for item in scored[:max_matches]]
+        score, strong_overlap, body_overlap = _score_pull_request(prompt_tokens, pull_request)
+        relevant = bool(strong_overlap) or len(body_overlap) >= 2
+        if relevant and score >= min_score:
+            scored.append((score, len(strong_overlap), len(body_overlap), pull_request))
+    scored.sort(key=lambda item: (-item[0], -item[1], -item[2]))
+    matches = [item[3] for item in scored[:max_matches]]
     LOGGER.info(
-        "pr_context: matched %s of %s pull request(s) against prompt_tokens=%s (best_score=%s)",
+        "pr_context: strictly matched %s of %s PR(s) prompt_tokens=%s best_score=%s",
         len(matches), len(pull_requests), sorted(prompt_tokens)[:10],
         scored[0][0] if scored else 0,
     )
     return matches
-
 
 def _summarize_pull_request(pull_request: dict) -> Dict[str, Any]:
     return {
