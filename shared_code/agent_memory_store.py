@@ -477,6 +477,39 @@ def record_agent_turn(
     return entry
 
 
+def record_agent_response(
+    conversation_id: str,
+    response_summary: str,
+    *,
+    source: str = "teams",
+    workflow: str = "rendered_response",
+) -> dict:
+    """Persist one delivered Terrabot response for conversation continuity.
+
+    Unlike :func:`record_agent_turn`, this intentionally writes only to the
+    per-conversation key. Rendered Teams responses can contain branch-choice,
+    clarification, Jira, PR, or other transport messages that are useful to
+    the same conversation later but must not pollute the cross-user
+    centralized repository memory.
+    """
+    entry = build_memory_entry(
+        workflow=workflow,
+        source=source,
+        response_summary=response_summary,
+        topic_tags=extract_topic_tags(response_summary),
+    )
+    key = _conversation_key(conversation_id)
+    if key:
+        try:
+            _append_entry(key, entry)
+        except Exception:
+            LOGGER.exception(
+                "agent_memory: unable to record delivered response key_hash=%s",
+                _row_key(key)[:12],
+            )
+    return entry
+
+
 def _format_entries(entries: List[dict], max_chars: int) -> str:
     if not entries:
         return ""

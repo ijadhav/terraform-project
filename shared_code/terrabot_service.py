@@ -8718,8 +8718,69 @@ def _teams_list_value_files_recursive(
     return results
 
 
+def _teams_requested_aws_environment_paths(prompt: str, branch: str = "") -> list[str]:
+    """Resolve every AWS environment explicitly requested by one Teams prompt.
+
+    This is deliberately plural. A prompt such as ``us1 and us2`` must not be
+    collapsed to the first match, and ``all prod environments`` expands from
+    the live ``terraform/prod_aws`` directory instead of assuming one default
+    production environment.
+    """
+    text = str(prompt or "").strip().lower().replace("-", "_")
+    paths: list[str] = []
+
+    all_prod = bool(re.search(r"\b(?:all|every)\s+(?:prod|production)(?:\s+(?:env|envs|environment|environments|hub|hubs))?\b", text))
+    if all_prod and branch:
+        try:
+            items = github_get_directory_listing(
+                "aws", "terraform/prod_aws", branch,
+                repo_target="tf-devops", workflow="aws_infra_modification",
+            ) or []
+            for item in items:
+                if isinstance(item, dict) and item.get("type") == "dir":
+                    path = str(item.get("path") or "").strip().strip("/")
+                    if path.startswith("terraform/prod_aws/") and path not in paths:
+                        paths.append(path)
+        except Exception:
+            LOGGER.debug("Unable to enumerate all live prod AWS environments", exc_info=True)
+
+    # Explicit environment names. Long/specific names are checked before their
+    # shorter base names so ``us1_dr`` does not also produce ``us1``.
+    aliases: list[tuple[str, str]] = []
+    for name, path in {**AWS_DEV_ENV_FOLDERS, **AWS_PROD_ENV_FOLDERS}.items():
+        aliases.append((str(name).lower(), str(path)))
+    aliases.sort(key=lambda item: len(item[0]), reverse=True)
+    consumed: list[tuple[int, int]] = []
+    for name, path in aliases:
+        forms = {name, name.replace("_", " "), name.replace("_", "-")}
+        for form in forms:
+            for match in re.finditer(rf"(?<![a-z0-9]){re.escape(form)}(?![a-z0-9])", text):
+                span = match.span()
+                if any(span[0] >= a and span[1] <= b for a, b in consumed):
+                    continue
+                if path not in paths:
+                    paths.append(path)
+                consumed.append(span)
+                break
+            else:
+                continue
+            break
+
+    # Region aliases not equal to folder names remain supported by the legacy
+    # singular resolver. Add that result when it represents another explicit
+    # target, but never use its minidev/us1 fallback for plural requests.
+    try:
+        legacy_path, legacy_error = detect_explicit_aws_environment(prompt)
+    except Exception:
+        legacy_path, legacy_error = None, None
+    if not legacy_error and legacy_path and legacy_path not in paths:
+        paths.append(str(legacy_path).strip().strip("/"))
+
+    return paths
+
+
 def _teams_exact_aws_environment_path(prompt: str) -> str:
-    """Return the deterministic tf-devops environment folder named by the prompt.
+    """Return one deterministic tf-devops environment folder when exactly one is requested.
 
     AWS repository layout is fixed at the tier boundary: non-production
     environments live under terraform/dev_aws and production environments live
@@ -8727,13 +8788,19 @@ def _teams_exact_aws_environment_path(prompt: str) -> str:
     repo-wide token walker so words such as ``ec2``, ``instance`` or ``dev_aws``
     can never become accidental environment matches.
     """
-    try:
-        path, error = resolve_aws_environment_path(prompt)
-    except Exception:
+    explicit_paths = _teams_requested_aws_environment_paths(prompt)
+    if len(explicit_paths) > 1:
         return ""
-    if error or not path:
-        return ""
-    normalized = str(path).strip().strip("/")
+    if explicit_paths:
+        normalized = explicit_paths[0]
+    else:
+        try:
+            path, error = resolve_aws_environment_path(prompt)
+        except Exception:
+            return ""
+        if error or not path:
+            return ""
+        normalized = str(path).strip().strip("/")
     allowed_prefixes = ("terraform/dev_aws/", "terraform/prod_aws/")
     if normalized == "terraform/root/global" or normalized.startswith(allowed_prefixes):
         return normalized
@@ -8840,21 +8907,33 @@ def _teams_locate_environment_value_files(
     # terraform/dev_aws/<env> or terraform/prod_aws/<env> first and read that
     # folder directly; do not depend on the bounded repo-wide token walk.
     if safe_normalize_cloud(cloud) == "aws":
-        exact_env = _teams_exact_aws_environment_path(prompt)
-        if exact_env:
-            entries, value_paths, exact_debug = _teams_read_exact_environment_folder(
-                exact_env, cloud, repo_target, workflow, branch
-            )
-            value_entries = [
-                entry for entry in entries
-                if str((entry or {}).get("path") or "").endswith((".tfvars", ".tfvars.json"))
-            ]
-            return value_entries, value_paths, {
-                "tokens": [exact_env.rsplit("/", 1)[-1]],
+        exact_envs = _teams_requested_aws_environment_paths(prompt, branch=branch)
+        if exact_envs:
+            combined_entries: list[dict] = []
+            combined_value_paths: list[str] = []
+            per_environment: list[dict] = []
+            for exact_env in exact_envs:
+                entries, value_paths, exact_debug = _teams_read_exact_environment_folder(
+                    exact_env, cloud, repo_target, workflow, branch
+                )
+                combined_entries.extend(
+                    entry for entry in entries
+                    if str((entry or {}).get("path") or "").endswith((".tfvars", ".tfvars.json"))
+                )
+                for path in value_paths:
+                    if path not in combined_value_paths:
+                        combined_value_paths.append(path)
+                per_environment.append({
+                    "path": exact_env,
+                    "files": exact_debug.get("files", 0),
+                    "value_files": list(value_paths),
+                })
+            return combined_entries, combined_value_paths, {
+                "tokens": [path.rsplit("/", 1)[-1] for path in exact_envs],
                 "walked": 0,
-                "matched": value_paths,
-                "exact_environment_path": exact_env,
-                "exact_folder_files": exact_debug.get("files", 0),
+                "matched": combined_value_paths,
+                "exact_environment_paths": exact_envs,
+                "environments": per_environment,
             }
 
     tokens = _teams_prompt_environment_tokens(prompt)
@@ -8932,18 +9011,32 @@ def _teams_environment_folder_evidence(
     file names anywhere in the live repository tree, exactly the way a human
     finds it. Returns (evidence_entries, value_write_paths, debug)."""
     if safe_normalize_cloud(cloud) == "aws":
-        exact_env = _teams_exact_aws_environment_path(prompt)
-        if exact_env:
-            entries, value_paths, exact_debug = _teams_read_exact_environment_folder(
-                exact_env, cloud, repo_target, workflow, branch
-            )
-            exact_debug.update({
-                "tokens": [exact_env.rsplit("/", 1)[-1]],
-                "matched_dirs": [exact_env],
-                "visited": 1,
-                "resolver": "deterministic_aws_environment_path",
-            })
-            return entries, value_paths, exact_debug
+        exact_envs = _teams_requested_aws_environment_paths(prompt, branch=branch)
+        if exact_envs:
+            combined_entries: list[dict] = []
+            combined_value_paths: list[str] = []
+            per_environment: list[dict] = []
+            for exact_env in exact_envs:
+                entries, value_paths, exact_debug = _teams_read_exact_environment_folder(
+                    exact_env, cloud, repo_target, workflow, branch
+                )
+                combined_entries.extend(entries)
+                for path in value_paths:
+                    if path not in combined_value_paths:
+                        combined_value_paths.append(path)
+                per_environment.append({
+                    "path": exact_env,
+                    "files": exact_debug.get("files", 0),
+                    "value_files": list(value_paths),
+                })
+            return combined_entries, combined_value_paths, {
+                "tokens": [path.rsplit("/", 1)[-1] for path in exact_envs],
+                "matched_dirs": exact_envs,
+                "visited": len(exact_envs),
+                "files": len(combined_entries),
+                "resolver": "deterministic_plural_aws_environment_paths",
+                "environments": per_environment,
+            }
 
     tokens = _teams_prompt_environment_tokens(prompt)
     debug: dict = {"tokens": tokens, "matched_dirs": [], "files": 0, "visited": 0}
@@ -29071,6 +29164,7 @@ def _teams_build_chat_grounding_context(
         conversation_id=teams_conversation_id,
         cloud=cloud,
         repo_target=repo_target_hint,
+        prompt=prompt,
     )
 
     return {

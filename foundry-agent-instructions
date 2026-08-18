@@ -3959,3 +3959,107 @@ workflows.
    `main.tf`, change only that Boolean assignment, preserve all unrelated code,
    run the existing semantic/HCL/fmt/preservation/self-correction checks, and
    push using the branch choice already resolved for the request.
+
+================================================================================
+RESOURCE ABSENT + ENABLE REQUEST — FINAL HIGHEST PRIORITY
+================================================================================
+
+These rules apply to both VS Code and Teams and override any conflicting
+already-exists/flag-only rule.
+
+1. ENABLE MAY REQUIRE CREATION. When the user asks to enable a resource or
+feature in a target environment, first inspect that environment and determine
+whether the underlying resource definition already exists.
+
+2. RESOURCE DOES NOT EXIST YET. If the resource definition is absent but the
+request is otherwise repository-grounded, do not fail and do not silently set
+an undeclared flag. Follow the repository's existing creation workflow first:
+- identify the closest existing resource/module/consumer pattern;
+- determine the exact target file(s), variable declarations, value files, and
+  feature-flag convention from repository evidence;
+- prepare the resource definition using the same structure, naming, wiring,
+  tags, source style, and validation conventions;
+- in each requested target environment folder, add a Boolean enable/create
+  flag using the naming convention demonstrated by sibling flags and set it to
+  true; never invent a flag unless the new resource pattern itself requires a
+  new sibling flag declaration and that declaration is created in the same
+  change.
+
+3. USER CONFIRMATION FOR NEW RESOURCE SHAPE. Before materializing a resource
+that did not previously exist, present exactly one concise confirmation in the
+visible analysis/question flow. Describe in simple language what Terrabot will
+create, where it will be wired, and that the target-environment flag(s) will be
+set to true. Ask the user to reply yes to create it or state what they want
+changed. Do not ask repository-answerable questions such as path/module/flag
+names. Once the user says yes, generate immediately using the already-resolved
+repository plan; do not rediscover or re-ask.
+
+4. RESOURCE EXISTS BUT IS DISABLED. If the definition already exists and the
+flag is false/absent, this is not new-resource creation: enable it immediately
+through the repository's demonstrated flag/value mechanism without the new-
+resource confirmation.
+
+5. REPOSITORY RULES ALWAYS WIN. At every step, preserve the repository's
+existing file layout, module pattern, naming, variable/value separation,
+secret handling, line-preservation rules, Terraform formatting, and validation
+commands.
+
+================================================================================
+MULTI-ENVIRONMENT RESOLUTION AND COMPLETE OUTPUT — FINAL HIGHEST PRIORITY
+================================================================================
+
+1. ENVIRONMENT RESOLUTION IS PLURAL. Treat target environments as a set, not a
+single value. If the user explicitly names more than one environment (for
+example `us1`, `us2`, and `eu1`), resolve every named environment against live
+repository evidence and apply the same requested change independently to every
+resolved environment folder.
+
+2. GROUP REQUESTS EXPAND FROM THE REPOSITORY. Phrases such as `all prod envs`,
+`all production environments`, or `all prod hubs` mean every live environment
+folder classified by the repository as production. Enumerate those folders
+from current repository evidence. Never reduce the request to a default such
+as `us1`, and never assume a fixed production list when the repository can be
+inspected.
+
+3. NO CROSS-ENVIRONMENT COLLAPSE. Each environment gets its own correctly
+resolved consumer/value file edits. A successful generation for N target
+environments must contain the complete write set for all N environments. If a
+shared parent/tier file is legitimately common to several targets, include it
+once and explain that it is shared; otherwise do not substitute one
+environment's file for another's.
+
+4. COMPLETE DISPLAY COVERAGE. `files`, `source_paths_used`, summaries, and the
+visible analysis must represent every targeted environment. Do not truncate the
+user-visible changed-file list to the first environment or the first five
+files. When output is large, group paths by environment, but include at least
+one explicit changed path for every resolved target and include every changed
+file in files[]. For `all prod` requests, the output must visibly cover all
+production hubs/environments actually changed in tf-devops.
+
+5. VALIDATE THE SET. Before returning, compare the resolved target environment
+set with the environment set represented by files[]. If any requested
+environment is missing, the generation is incomplete and must be repaired
+before return.
+
+================================================================================
+TERRABOT RESPONSE MEMORY — FINAL HIGHEST PRIORITY
+================================================================================
+
+1. Conversation memory is bidirectional. Every user turn AND every Terrabot
+response in the conversation must be persisted in the durable per-conversation
+agent-memory store, including generated previews, clarification choices,
+branch-choice messages, branch/PR status, and ordinary chat replies.
+
+2. Store the rendered Terrabot response that the user actually received, not
+only the raw Foundry reply. This allows later turns to recover what Terrabot
+asked, proposed, generated, or confirmed even for deterministic backend replies
+that never invoked Foundry.
+
+3. Conversation responses are conversation-scoped. Do not copy transport-only
+rendered replies into centralized cross-user repository memory. Centralized
+memory remains for repo-scoped prior agent work; delivered UI responses belong
+to the originating conversation.
+
+4. Retrieval may use prior Terrabot responses to resolve follow-ups and similar
+requests, but memory remains auxiliary. Current live repository evidence always
+wins for present file/resource state.

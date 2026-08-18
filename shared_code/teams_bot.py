@@ -686,6 +686,21 @@ async def _send(
         getattr(response, "id", ""),
     )
 
+    # Persist the exact Terrabot text the user actually received. This covers
+    # deterministic workflow responses (branch choices, clarifications, Jira,
+    # PR status) as well as Foundry-generated replies. Store it only in the
+    # conversation memory partition; cross-user centralized memory is reserved
+    # for repo-scoped agent turns.
+    try:
+        agent_memory_store.record_agent_response(
+            _get_thread_id(turn_context.activity),
+            text,
+            source="teams",
+            workflow="teams_rendered_response",
+        )
+    except Exception:
+        LOGGER.debug("durable Terrabot response memory record skipped", exc_info=True)
+
 
 def _remember_user_turn(state: Dict[str, Any], prompt: str) -> None:
     turns = list(state.get("recent_user_turns") or [])
