@@ -33575,3 +33575,495 @@ def github_put_file_if_changed(
         workflow=workflow,
     )
     return {"changed": True, "path": path, "result": result}
+
+# =============================================================================
+# 2026-08-18 FOUNDRY SEMANTIC BOOLEAN CONTROL + EXACT PRESERVATION — FINAL OVERRIDE
+# =============================================================================
+# This layer intentionally does not infer resource vocabulary in Python. For a
+# Teams AWS modification, the backend resolves the target environment and reads
+# its complete main.tf, then asks Foundry whether the requested operation is
+# implemented by an existing literal Boolean control. Foundry owns semantic
+# interpretation; the backend only verifies that returned candidates literally
+# exist in live repository content and safely transports the final full file.
+
+_FINAL_BOOL_PREVIOUS_BUILD_EXISTING_CONTEXT = build_backend_existing_infra_modification_context
+_FINAL_BOOL_PREVIOUS_SELECT_CANDIDATE = select_infra_modification_candidate_from_reply
+_FINAL_BOOL_PREVIOUS_PATH_QUESTION = _teams_is_path_request_question
+_FINAL_BOOL_PREVIOUS_GITHUB_PUT = github_put_file_if_changed
+
+
+def _foundry_boolean_control_candidates(
+    prompt: str,
+    main_tf_evidence: list[dict],
+) -> dict:
+    """Ask Foundry to semantically identify actionable Boolean controls only.
+
+    This is classification, not Terraform generation. Python does not decide
+    that words such as enable/disable/remove imply a flag; Foundry decides
+    whether the requested repository change is represented by a Boolean gate.
+    """
+    files = [
+        {
+            "path": str(item.get("path") or "").strip(),
+            "content": str(item.get("content") or ""),
+        }
+        for item in (main_tf_evidence or [])
+        if isinstance(item, dict)
+        and str(item.get("path") or "").strip()
+        and str(item.get("content") or "").strip()
+    ]
+    if not files:
+        return {"applicable": False, "candidates": []}
+
+    request = {
+        "task": (
+            "Classify whether the user's requested existing-infrastructure modification can be fulfilled "
+            "by changing an existing literal Boolean assignment in the supplied target-environment main.tf. "
+            "This is semantic repository analysis only; do not generate Terraform."
+        ),
+        "user_request": str(prompt or "").strip(),
+        "target_environment_files": files,
+        "required_output": {
+            "applicable": "boolean",
+            "reason": "short repository-grounded explanation",
+            "candidates": [
+                {
+                    "path": "exact supplied main.tf path",
+                    "module": "exact Terraform module label containing the Boolean",
+                    "flag": "exact Boolean argument name",
+                    "current_value": "true|false",
+                    "new_value": "true|false",
+                    "description": "short description of what this Boolean controls, inferred from the module/source/nearby arguments/comments",
+                }
+            ],
+        },
+        "rules": [
+            "Return JSON only with keys applicable, reason, candidates.",
+            "Decide from the semantics of the user request and repository content; do not rely on a fixed action-word vocabulary supplied by the backend.",
+            "Set applicable=true only when an existing literal Boolean assignment in a semantically relevant module is a valid mechanism for the requested change.",
+            "Candidates must be direct Boolean arguments of semantically relevant module blocks in the supplied main.tf files.",
+            "Include only candidates whose value would actually change for this request; current_value and new_value must differ.",
+            "Do not return data sources, SSM parameters, URLs, secrets, numeric/string parameters, outputs, providers, backend/version settings, or keyword-only matches.",
+            "Do not invent a Boolean, module, path, alias, or value that is not present in the supplied repository content.",
+            "If one Boolean clearly controls the requested resource, return only that Boolean even if unrelated parameters contain similar words.",
+            "If multiple genuinely plausible Boolean controls remain, return all of those Boolean controls so the user can choose among parameters, not files.",
+            "If the repository does not support this request through an existing Boolean control, set applicable=false and return candidates=[].",
+        ],
+    }
+    try:
+        raw = call_named_agent(json.dumps(request, ensure_ascii=False), AGENT_NAME)
+        data = extract_json_from_text(raw)
+        if not isinstance(data, dict):
+            return {"applicable": False, "candidates": []}
+        return data
+    except Exception as exc:
+        LOGGER.warning("Foundry Boolean-control classification failed; continuing normal semantic workflow: %s", exc)
+        return {"applicable": False, "candidates": [], "error": str(exc)}
+
+
+def _literal_module_boolean_index(main_tf_evidence: list[dict]) -> dict[tuple[str, str, str], dict]:
+    """Index literal direct module Boolean assignments for validation only."""
+    index: dict[tuple[str, str, str], dict] = {}
+    for item in main_tf_evidence or []:
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("path") or "").strip().strip("/")
+        content = str(item.get("content") or "")
+        if not path or not content:
+            continue
+        for block in _extract_top_level_tf_blocks(content):
+            header = str(block.get("header") or "").strip()
+            module_match = re.fullmatch(r'module\s+"([^"]+)"', header)
+            if not module_match:
+                continue
+            module_name = module_match.group(1)
+            block_text = str(block.get("block") or "")
+            # Direct literal Boolean assignments are intentionally narrow. The
+            # semantic decision is Foundry's; this regex only proves the exact
+            # returned flag/value exists in the selected live module block.
+            for match in re.finditer(
+                r'(?m)^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(true|false)\s*(?:#.*)?$',
+                block_text,
+                re.IGNORECASE,
+            ):
+                flag = match.group(1)
+                current = match.group(2).lower()
+                index[(path, module_name, flag)] = {
+                    "path": path,
+                    "module": module_name,
+                    "flag": flag,
+                    "current_value": current,
+                }
+    return index
+
+
+def _validated_foundry_boolean_candidates(
+    prompt: str,
+    main_tf_evidence: list[dict],
+) -> tuple[bool, list[dict], str]:
+    classification = _foundry_boolean_control_candidates(prompt, main_tf_evidence)
+    applicable = bool(classification.get("applicable"))
+    if not applicable:
+        return False, [], str(classification.get("reason") or "")
+
+    literal_index = _literal_module_boolean_index(main_tf_evidence)
+    validated: list[dict] = []
+    seen: set[tuple[str, str, str]] = set()
+    for candidate in classification.get("candidates") or []:
+        if not isinstance(candidate, dict):
+            continue
+        path = str(candidate.get("path") or "").strip().strip("/")
+        module_name = str(candidate.get("module") or "").strip()
+        flag = str(candidate.get("flag") or "").strip()
+        current = str(candidate.get("current_value") or "").strip().lower()
+        new_value = str(candidate.get("new_value") or "").strip().lower()
+        key = (path, module_name, flag)
+        literal = literal_index.get(key)
+        if not literal:
+            continue
+        if current not in {"true", "false"} or new_value not in {"true", "false"}:
+            continue
+        if current == new_value or literal.get("current_value") != current:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        validated.append({
+            **literal,
+            "new_value": new_value,
+            "context": str(candidate.get("description") or "").strip()
+            or f'Controls the requested behavior in module "{module_name}".',
+            "description": str(candidate.get("description") or "").strip()
+            or f'Controls the requested behavior in module "{module_name}".',
+            "classification_reason": str(classification.get("reason") or "").strip(),
+        })
+    return bool(validated), validated, str(classification.get("reason") or "")
+
+
+def build_backend_existing_infra_modification_context(
+    prompt: str,
+    thread_id: str,
+    cloud: str,
+    workflow: str,
+    retrieved_value_context: list | None = None,
+) -> dict:
+    """Final modification resolver with Foundry-owned Boolean semantics.
+
+    For Teams AWS modifications, always inspect the resolved environment
+    main.tf first. If Foundry proves the requested operation is controlled by
+    literal Boolean argument(s), only those arguments become candidates. This
+    path is intentionally independent of hardcoded enable/disable keywords.
+    """
+    context = _FINAL_BOOL_PREVIOUS_BUILD_EXISTING_CONTEXT(
+        prompt,
+        thread_id,
+        cloud,
+        workflow,
+        retrieved_value_context=retrieved_value_context,
+    )
+    active = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
+    if not active.get("active"):
+        return context
+    try:
+        normalized_cloud = normalize_cloud(cloud)
+    except Exception:
+        return context
+    if normalized_cloud != "aws" or str(workflow or "").strip() not in INFRA_MODIFICATION_WORKFLOWS:
+        return context
+
+    context = dict(context or {})
+    branch = str(context.get("context_ref") or "").strip()
+    if not branch:
+        try:
+            branch = _teams_remote_context_branch(
+                "aws",
+                repo_target="tf-devops",
+                workflow=workflow,
+            )
+        except Exception:
+            branch = ""
+
+    main_tf_evidence = _teams_target_environment_main_tf_evidence(
+        prompt,
+        "aws",
+        workflow,
+        branch,
+    )
+    if not main_tf_evidence:
+        return context
+
+    applicable, candidates, reason = _validated_foundry_boolean_candidates(
+        prompt,
+        main_tf_evidence,
+    )
+    if not applicable or not candidates:
+        # Still make target main.tf the primary evidence for the agent, but do
+        # not invent a Boolean workflow when Foundry says the request is not
+        # controlled by a literal flag.
+        context["matched_files"] = main_tf_evidence
+        context["matched_file_paths"] = [item.get("path") for item in main_tf_evidence if item.get("path")]
+        context["selection_state"] = "selected"
+        context["selected_path"] = main_tf_evidence[0].get("path") if len(main_tf_evidence) == 1 else ""
+        context["target_environment_main_tf_first"] = True
+        context["agent_resolves_target"] = True
+        context["boolean_control_classification"] = {
+            "applicable": False,
+            "reason": reason,
+        }
+        context["instructions"] = list(context.get("instructions") or []) + [
+            "The target environment main.tf is already an authorized modification target. Never ask the user for permission to modify it or for an alternative repository path.",
+            "If repository semantics are genuinely ambiguous, ask only which resource/module the user means; never ask which file/path to use when the target environment has already been resolved.",
+        ]
+        return context
+
+    evidence_by_path = {
+        str(item.get("path") or "").strip().strip("/"): item
+        for item in main_tf_evidence
+        if isinstance(item, dict)
+    }
+    matched: list[dict] = []
+    for candidate in candidates:
+        source = dict(evidence_by_path.get(candidate["path"]) or {})
+        if not source:
+            continue
+        source["feature_flag_match"] = dict(candidate)
+        source["matched_blocks"] = [{
+            "header": f'module "{candidate["module"]}"',
+            "block": "",
+        }]
+        source["reason"] = "Foundry semantic Boolean-control match validated against live target main.tf"
+        matched.append(source)
+
+    if not matched:
+        return context
+
+    context["matched_files"] = matched
+    context["matched_file_paths"] = list(dict.fromkeys(item.get("path") for item in matched if item.get("path")))
+    context["feature_flag_selection"] = True
+    context["target_environment_main_tf_first"] = True
+    context["agent_resolves_target"] = False
+    context["boolean_control_classification"] = {
+        "applicable": True,
+        "reason": reason,
+        "candidate_count": len(matched),
+    }
+    context["instructions"] = [
+        "Foundry already semantically classified the requested operation as an existing Boolean-gated repository change; the backend verified every listed Boolean literally exists in live target main.tf.",
+        "Use only feature_flag_match. Do not change or surface any other parameter merely because its name/content resembles the user's resource wording.",
+        "The target main.tf is already authorized by the resolved environment. Never ask permission to modify it and never ask for an alternative path.",
+        "After one Boolean is selected, change only that exact Boolean assignment to feature_flag_match.new_value and return the COMPLETE final target file.",
+        "Preserve every unrelated byte/line/block/comment in the existing file. Do not reformat, reorder, truncate, summarize, or replace unrelated repository content.",
+    ]
+    if len(matched) == 1:
+        context["selection_state"] = "selected"
+        context["selected_path"] = matched[0].get("path") or ""
+    else:
+        context["selection_state"] = "candidate_selection_required"
+        context["selected_path"] = ""
+    return context
+
+
+def select_infra_modification_candidate_from_reply(reply: str, pending_selection: dict) -> int | None:
+    """Allow Boolean picker follow-ups by number OR exact parameter name."""
+    selected = _FINAL_BOOL_PREVIOUS_SELECT_CANDIDATE(reply, pending_selection)
+    if selected is not None:
+        return selected
+    text = str(reply or "").strip().strip("`'\"").lower()
+    candidates = ((pending_selection.get("existing_infra_context") or {}).get("matched_files") or [])
+    for index, candidate in enumerate(candidates):
+        match = (candidate or {}).get("feature_flag_match") or {}
+        flag = str(match.get("flag") or "").strip().lower()
+        module_name = str(match.get("module") or "").strip().lower()
+        if flag and text == flag:
+            return index
+        if module_name and text in {module_name, f'module {module_name}'}:
+            return index
+    return None
+
+
+def build_infra_modification_selection_reply(existing_infra_context: dict) -> str:
+    """Render Boolean ambiguity as a parameter question, never a file picker."""
+    candidates = list(existing_infra_context.get("matched_files") or [])
+    flag_items = []
+    for item in candidates:
+        if not isinstance(item, dict):
+            continue
+        match = item.get("feature_flag_match") or {}
+        if str(match.get("flag") or "").strip():
+            flag_items.append((item, match))
+    if flag_items:
+        lines = [
+            "I found multiple repository-backed Boolean parameters that can control this request. Which parameter should I change?",
+            "",
+        ]
+        for index, (item, match) in enumerate(flag_items, start=1):
+            flag = str(match.get("flag") or "").strip()
+            module_name = str(match.get("module") or "").strip()
+            current = str(match.get("current_value") or "").strip().lower()
+            target = str(match.get("new_value") or "").strip().lower()
+            description = str(match.get("context") or match.get("description") or "").strip()
+            path = str(item.get("path") or "").strip()
+            lines.append(f"{index}. **`{flag}`** — {description or f'Boolean control in module {module_name}'}")
+            lines.append(f"   Module: `module \"{module_name}\"` · `{current}` → `{target}` · `{path}`")
+        lines.extend([
+            "",
+            "Reply with the number or exact Boolean parameter name. Terrabot will change only that parameter and preserve the rest of the file unchanged.",
+        ])
+        return "\n".join(lines)
+    # Preserve every earlier non-Boolean clarification behavior.
+    return _teams_candidate_selection_reply_non_boolean(existing_infra_context)
+
+
+def _teams_candidate_selection_reply_non_boolean(existing_infra_context: dict) -> str:
+    candidates = list(existing_infra_context.get("matched_files") or [])[:6]
+    if not candidates:
+        return (
+            "I couldn't find a repository-backed Terraform target for that resource wording. "
+            "Reply with a more specific resource/module name; you do not need to provide a file path."
+        )
+    lines = [
+        "I found a few similar repository resources. Which resource should I modify?",
+        "",
+    ]
+    for index, item in enumerate(candidates, start=1):
+        label = _teams_candidate_friendly_label(item)
+        path = str(item.get("path") or "").strip()
+        lines.append(f"{index}. **{label}** — `{path}`")
+    lines.extend([
+        "",
+        "Reply with the number or resource/module name. Terrabot will use the already resolved repository path.",
+    ])
+    return "\n".join(lines)
+
+
+def _teams_is_path_request_question(text: str) -> bool:
+    """Treat any resolved-target permission/path question as internally answerable."""
+    value = re.sub(r"\s+", " ", str(text or "").strip().lower())
+    if _FINAL_BOOL_PREVIOUS_PATH_QUESTION(value):
+        return True
+    forbidden = (
+        "path restriction",
+        "allow modifying",
+        "allow modification",
+        "alternative repo-approved path",
+        "alternative repository-approved path",
+        "provide an alternative",
+        "confirm how you want to proceed given the path",
+        "specify the exact file",
+        "which file should i modify",
+        "which path should i modify",
+        "permission to modify",
+    )
+    return any(marker in value for marker in forbidden)
+
+
+def _selected_feature_flag_match_from_active_context(path: str = "") -> dict:
+    active = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
+    wanted_path = str(path or "").strip().strip("/")
+    for ctx in active.get("retrieved_value_context") or []:
+        if not isinstance(ctx, dict) or ctx.get("source") != "backend_existing_infra_code_match":
+            continue
+        for item in ctx.get("matched_files") or []:
+            if not isinstance(item, dict):
+                continue
+            match = item.get("feature_flag_match") or {}
+            item_path = str(item.get("path") or "").strip().strip("/")
+            if match and (not wanted_path or item_path == wanted_path):
+                return dict(match)
+    return {}
+
+
+def _validate_selected_boolean_is_only_file_change(
+    existing_content: str,
+    generated_content: str,
+    path: str,
+) -> None:
+    """For a selected Boolean change, require exact preservation otherwise.
+
+    This is a validator only. It never constructs/merges Terraform. The model's
+    final file must differ from live repository truth by exactly one replacement
+    line: the selected literal Boolean assignment.
+    """
+    match = _selected_feature_flag_match_from_active_context(path)
+    if not match:
+        return
+    flag = str(match.get("flag") or "").strip()
+    current = str(match.get("current_value") or "").strip().lower()
+    target = str(match.get("new_value") or "").strip().lower()
+    if not flag or current not in {"true", "false"} or target not in {"true", "false"} or current == target:
+        raise ValueError("Selected Boolean modification context is incomplete or invalid.")
+
+    existing_lines = (existing_content or "").replace("\r\n", "\n").splitlines()
+    generated_lines = (generated_content or "").replace("\r\n", "\n").splitlines()
+    if len(existing_lines) != len(generated_lines):
+        raise ValueError(
+            f"Generated Boolean modification for {path} added/removed lines. "
+            "Only the selected Boolean assignment may change; all other repository content must remain exactly preserved."
+        )
+
+    assignment = re.compile(
+        rf'^(\s*){re.escape(flag)}(\s*=\s*)(true|false)(\s*(?:#.*)?)$',
+        re.IGNORECASE,
+    )
+    changed = 0
+    for old_line, new_line in zip(existing_lines, generated_lines):
+        if old_line == new_line:
+            continue
+        old_match = assignment.match(old_line)
+        new_match = assignment.match(new_line)
+        if not old_match or not new_match:
+            raise ValueError(
+                f"Generated Boolean modification for {path} changed unrelated repository content. "
+                f"Only `{flag} = {current}` may become `{flag} = {target}`."
+            )
+        if old_match.group(3).lower() != current or new_match.group(3).lower() != target:
+            raise ValueError(
+                f"Generated Boolean modification for {path} changed `{flag}` with unexpected values. "
+                f"Expected {current} -> {target}."
+            )
+        # Preserve indentation, spacing around '=', and any inline comment too.
+        if old_match.group(1) != new_match.group(1) or old_match.group(2) != new_match.group(2) or old_match.group(4) != new_match.group(4):
+            raise ValueError(
+                f"Generated Boolean modification for {path} reformatted the selected line. "
+                "Only the literal Boolean value may change."
+            )
+        changed += 1
+    if changed != 1:
+        raise ValueError(
+            f"Generated Boolean modification for {path} must change exactly one `{flag}` assignment; observed {changed}."
+        )
+
+
+def github_put_file_if_changed(
+    cloud: str,
+    path: str,
+    content: str,
+    branch: str,
+    commit_message: str,
+    repo_target: Optional[str] = None,
+    workflow: Optional[str] = None,
+):
+    """Add exact selected-Boolean preservation validation, then use prior writer."""
+    existing_content = github_get_file_content(
+        cloud,
+        path,
+        branch,
+        repo_target=repo_target,
+        workflow=workflow,
+    )
+    if existing_content is not None:
+        _validate_selected_boolean_is_only_file_change(
+            existing_content,
+            str(content or ""),
+            path,
+        )
+    return _FINAL_BOOL_PREVIOUS_GITHUB_PUT(
+        cloud=cloud,
+        path=path,
+        content=content,
+        branch=branch,
+        commit_message=commit_message,
+        repo_target=repo_target,
+        workflow=workflow,
+    )
+

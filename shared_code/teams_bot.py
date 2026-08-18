@@ -474,8 +474,8 @@ def _format_reply(result: Dict[str, Any]) -> str:
                     requested_value = str(flag_items[0].get("requested_value") or "").strip().lower()
                     verb = "disable" if requested_value == "false" else "enable"
                     lines.extend([
-                        "**Choose the feature flag**",
-                        f"I found multiple repository-backed flags that could match this request. Which flag should I {verb}?",
+                        "**Choose the Boolean parameter**",
+                        f"I found multiple repository-backed Boolean parameters that can control this request. Which parameter should I {verb}?",
                         "",
                     ])
                     for fallback_index, item in enumerate(flag_items[:8], start=1):
@@ -485,7 +485,7 @@ def _format_reply(result: Dict[str, Any]) -> str:
                         lines.append(f"{index}. **`{flag}`** — {flag_context or 'existing Boolean flag in the target environment main.tf'}")
                     lines.extend([
                         "",
-                        f"Reply with the number or exact flag name. Terrabot will {verb} the selected flag; the target file is already resolved from the environment.",
+                        f"Reply with the number or exact Boolean parameter name. Terrabot will {verb} only the selected parameter and preserve the rest of the file unchanged.",
                     ])
                     return "\n".join(lines)
                 lines = []
@@ -534,7 +534,7 @@ def _format_reply(result: Dict[str, Any]) -> str:
                     lines.extend(_format_analysis_block(analysis))
                     lines.append("")
                 lines.extend([
-                    "**Action required**",
+                    "**Terrabot question**",
                     questions[0],
                 ])
                 if related_pr_lines:
@@ -568,7 +568,7 @@ def _format_reply(result: Dict[str, Any]) -> str:
             ]
             if question_lines:
                 return "\n".join([
-                    "**Action required**",
+                    "**Terrabot question**",
                     question_lines[0][:700],
                 ])
 
@@ -578,7 +578,7 @@ def _format_reply(result: Dict[str, Any]) -> str:
                 maxsplit=1,
             )[0]
             return "\n".join([
-                "**Request could not be completed**",
+                "**Terrabot question**",
                 first_sentence[:700]
                 or "Terrabot could not complete this request.",
             ])
