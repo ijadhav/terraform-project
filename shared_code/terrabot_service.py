@@ -21716,47 +21716,92 @@ def _teams_feature_flag_intent(prompt: str) -> str:
 
 
 def _teams_feature_flag_terms(prompt: str) -> list[str]:
-    text = re.sub(r"[^a-z0-9]+", "_", str(prompt or "").lower()).strip("_")
+    """Return only resource-semantic terms for enable/disable matching.
+
+    Action verbs, generic workflow nouns, cloud names, and environment labels
+    are deliberately removed. They can describe almost every infrastructure
+    request and therefore must never make an unrelated Boolean flag relevant.
+    """
+    text = str(prompt or "").lower().replace("-", "_")
+    raw_tokens = [token for token in re.findall(r"[a-z0-9]+", text) if token]
     stop = {
-        "please", "can", "you", "disable", "enable", "turn", "switch", "off", "on",
-        "deactivate", "activate", "remove", "decommission", "in", "for", "the", "from",
-        "aws", "azure", "terraform", "environment", "env",
+        "please", "can", "you", "disable", "disabled", "enable", "enabled",
+        "turn", "switch", "off", "on", "deactivate", "activate", "remove",
+        "removed", "delete", "deleted", "decommission", "create", "created",
+        "add", "added", "update", "updated", "change", "changed", "modify",
+        "modified", "set", "setting", "setup", "config", "configuration",
+        "feature", "service", "resource", "parameter", "parameters", "flag",
+        "flags", "rule", "rules", "in", "for", "the", "from", "to", "of",
+        "aws", "azure", "terraform", "environment", "environments", "env",
+        "prod", "production", "nonprod", "non", "dev", "development",
+        "main", "branch", "pr", "pull", "request",
     }
-    return [token for token in text.split("_") if token and token not in stop and len(token) > 1]
+
+    def is_environment_token(token: str) -> bool:
+        return bool(
+            re.fullmatch(r"(?:us|eu|ca|ap|uk|au|sa)\d+(?:dr)?", token)
+            or re.fullmatch(r"(?:mini)?dev\d*", token)
+            or re.fullmatch(r"(?:prod|prd|npr|sbx|uat|stage|stg)\d*", token)
+        )
+
+    terms: list[str] = []
+    aliases = {
+        "patching": "patch",
+        "patches": "patch",
+        "monitor": "monitoring",
+        "rabbitmq": "cloudamqp",
+    }
+    for token in raw_tokens:
+        token = aliases.get(token, token)
+        if len(token) <= 1 or token in stop or is_environment_token(token):
+            continue
+        if token not in terms:
+            terms.append(token)
+    return terms
 
 
 def _teams_find_feature_flag_matches(existing_infra_context: dict, prompt: str) -> list[dict]:
-    """Find boolean feature assignments directly in live candidate files."""
+    """Find only semantically-related Boolean assignments in live candidates.
+
+    Non-Boolean attributes, data sources, resources, backend/provider settings,
+    and files with no matching Boolean assignment are excluded by construction.
+    """
     action = _teams_feature_flag_intent(prompt)
     if not action:
         return []
     desired_current = "true" if action == "disable" else "false"
     terms = _teams_feature_flag_terms(prompt)
+    if not terms:
+        return []
     matches: list[dict] = []
     assignment_re = re.compile(
         r"(?m)^(?P<indent>[ \t]*)(?P<name>(?:create|enable|enabled|deploy|use|has|is)_[A-Za-z0-9_]+|[A-Za-z0-9_]+_enabled)\s*=\s*(?P<value>true|false)\s*(?P<comment>#.*)?$",
         re.IGNORECASE,
     )
+    compact_prompt = re.sub(r"[^a-z0-9]+", "", str(prompt or "").lower())
     for index, item in enumerate(existing_infra_context.get("matched_files") or []):
         content = str((item or {}).get("content") or "")
         path = str((item or {}).get("path") or "")
+        if not content or not path:
+            continue
         for match in assignment_re.finditer(content):
             name = match.group("name")
             value = match.group("value").lower()
             if value != desired_current:
                 continue
             normalized_name = name.lower()
-            score = 0
-            for term in terms:
-                if term in normalized_name:
-                    score += 50
-            compact_prompt = re.sub(r"[^a-z0-9]+", "", str(prompt or "").lower())
-            compact_flag = re.sub(r"^(?:create|enable|enabled|deploy|use|has|is)_", "", normalized_name)
-            compact_flag = compact_flag.replace("_enabled", "").replace("_", "")
-            if compact_flag and compact_flag in compact_prompt:
-                score += 250
-            if not terms or score <= 0:
+            stripped = re.sub(r"^(?:create|enable|enabled|deploy|use|has|is)_", "", normalized_name)
+            stripped = stripped.removesuffix("_enabled")
+            flag_tokens = set(re.findall(r"[a-z0-9]+", stripped.replace("_", " ")))
+            overlap = [term for term in terms if term in flag_tokens or term in stripped]
+            if not overlap:
                 continue
+            score = 120 * len(overlap)
+            compact_flag = re.sub(r"[^a-z0-9]+", "", stripped)
+            if compact_flag and compact_flag in compact_prompt:
+                score += 500
+            # Prefer flags covering the largest share of the resource phrase.
+            score += int(100 * len(overlap) / max(1, len(terms)))
             matches.append({
                 "candidate_index": index,
                 "path": path,
@@ -21767,11 +21812,11 @@ def _teams_find_feature_flag_matches(existing_infra_context: dict, prompt: str) 
                 "start": match.start(),
                 "end": match.end(),
                 "matched_line": match.group(0),
+                "matched_terms": overlap,
                 "score": score,
             })
-    matches.sort(key=lambda item: (-int(item.get("score") or 0), item.get("path") or "", item.get("flag") or ""))
+    matches.sort(key=lambda item: (-int(item.get("score") or 0), item.get("path") or "", item.get("start") or 0))
     return matches
-
 
 def _teams_auto_select_feature_flag_context(existing_infra_context: dict, prompt: str) -> dict:
     matches = _teams_find_feature_flag_matches(existing_infra_context, prompt)
@@ -34729,7 +34774,14 @@ def _teams_feature_flag_candidates_from_main(
     workflow: str,
     context: dict,
 ) -> dict:
-    """Resolve an explicit enable/disable request to flag candidates in main.tf."""
+    """Resolve enable/disable to matching Boolean assignments only.
+
+    The historical function name is retained for compatibility, but discovery
+    now scans the resolved environment's Terraform/value files and returns only
+    files that contain a semantically matching Boolean assignment with the
+    polarity needed by the current request. Unrelated Terraform files can
+    never become user-visible candidates.
+    """
     action = _teams_feature_flag_intent(prompt)
     if action not in {"enable", "disable"}:
         return context
@@ -34739,86 +34791,139 @@ def _teams_feature_flag_candidates_from_main(
         return context
     normalized_cloud = normalize_cloud(cloud)
     repo_target = normalize_repo_target(normalized_cloud, workflow=workflow)
-    try:
-        content = github_get_file_content(
-            normalized_cloud,
-            main_path,
-            branch,
-            repo_target=repo_target,
-            workflow=workflow,
-        )
-    except Exception:
-        content = None
-    if not content:
-        return context
-
+    scope_root = main_path.rsplit("/", 1)[0] if "/" in main_path else ""
     desired_current = "true" if action == "disable" else "false"
     requested_new = "false" if action == "disable" else "true"
     semantic_terms = _teams_feature_flag_terms(prompt)
-    # Generic nouns such as setup/config should not create false positives.
-    weak_terms = {"setup", "config", "configuration", "feature", "service", "thing", "stuff"}
-    strong_terms = [term for term in semantic_terms if term not in weak_terms]
-    if not strong_terms:
-        strong_terms = semantic_terms
+    if not semantic_terms:
+        return context
+
+    # Candidate paths are sourced from the already-grounded context first,
+    # then completed from the live resolved environment directory. We inspect
+    # files internally, but only a file containing a relevant bool match can
+    # survive into matched_files / the Teams picker.
+    path_order: list[str] = []
+    content_by_path: dict[str, str] = {}
+    for item in (context or {}).get("matched_files") or []:
+        path = str((item or {}).get("path") or "").strip()
+        content = str((item or {}).get("content") or "")
+        if not path or (scope_root and not (path == scope_root or path.startswith(scope_root + "/"))):
+            continue
+        if not path.endswith((".tf", ".tfvars")):
+            continue
+        if path not in path_order:
+            path_order.append(path)
+        if content:
+            content_by_path[path] = content
+
+    if main_path not in path_order:
+        path_order.insert(0, main_path)
+
+    try:
+        for entry in github_get_directory_listing(
+            normalized_cloud,
+            scope_root,
+            branch,
+            repo_target=repo_target,
+            workflow=workflow,
+        ):
+            if not isinstance(entry, dict) or entry.get("type") != "file":
+                continue
+            path = str(entry.get("path") or "").strip()
+            if path.endswith((".tf", ".tfvars")) and path not in path_order:
+                path_order.append(path)
+    except Exception:
+        LOGGER.debug("Unable to expand feature-flag environment file listing", exc_info=True)
 
     assignment_re = re.compile(
         r"(?m)^(?P<indent>[ \t]*)(?P<name>(?:create|enable|enabled|deploy|use|has|is)_[A-Za-z0-9_]+|[A-Za-z0-9_]+_enabled)\s*=\s*(?P<value>true|false)\s*(?P<comment>#.*)?$",
         re.IGNORECASE,
     )
-    raw_matches: list[dict] = []
     compact_prompt = re.sub(r"[^a-z0-9]+", "", str(prompt or "").lower())
-    for match in assignment_re.finditer(content):
-        flag = match.group("name")
-        current = match.group("value").lower()
-        if current != desired_current:
-            continue
-        normalized_flag = flag.lower()
-        stripped_flag = re.sub(r"^(?:create|enable|enabled|deploy|use|has|is)_", "", normalized_flag)
-        stripped_flag = stripped_flag.removesuffix("_enabled")
-        score = 0
-        matched_terms: list[str] = []
-        for term in strong_terms:
-            if term in stripped_flag or term in normalized_flag:
-                score += 100
-                matched_terms.append(term)
-        compact_flag = re.sub(r"[^a-z0-9]+", "", stripped_flag)
-        if compact_flag and compact_flag in compact_prompt:
-            score += 400
-        if score <= 0:
-            continue
-        block_header, related = _teams_flag_block_context(content, flag)
-        context_text = f"currently `{current}` in `{block_header}`"
-        if related:
-            context_text += "; related repo settings: " + ", ".join(f"`{name}`" for name in related)
-        context_text += f"; selecting it will set only this flag to `{requested_new}`"
-        raw_matches.append({
-            "path": main_path,
-            "filename": "main.tf",
-            "content": content,
-            "matched_blocks": [{"header": flag, "block": match.group(0)}],
-            "reason": "feature flag matched the user's approximate wording in the resolved environment main.tf",
-            "semantic_terms": list(dict.fromkeys(matched_terms)),
-            "feature_flag_match": {
-                "path": main_path,
-                "flag": flag,
-                "current_value": current,
-                "new_value": requested_new,
-                "action": action,
-                "matched_line": match.group(0),
-                "start": match.start(),
-                "end": match.end(),
-                "block": block_header,
-                "related_settings": related,
-                "context": context_text,
-                "score": score,
-            },
-            "score": score,
-        })
+    raw_matches: list[dict] = []
 
-    raw_matches.sort(key=lambda item: (-int(item.get("score") or 0), str((item.get("feature_flag_match") or {}).get("flag") or "")))
+    for path in path_order:
+        content = content_by_path.get(path)
+        if content is None:
+            try:
+                content = github_get_file_content(
+                    normalized_cloud,
+                    path,
+                    branch,
+                    repo_target=repo_target,
+                    workflow=workflow,
+                )
+            except Exception:
+                content = None
+        if not content:
+            continue
+
+        for match in assignment_re.finditer(content):
+            flag = match.group("name")
+            current = match.group("value").lower()
+            if current != desired_current:
+                continue
+            normalized_flag = flag.lower()
+            stripped_flag = re.sub(r"^(?:create|enable|enabled|deploy|use|has|is)_", "", normalized_flag)
+            stripped_flag = stripped_flag.removesuffix("_enabled")
+            flag_tokens = set(re.findall(r"[a-z0-9]+", stripped_flag.replace("_", " ")))
+            matched_terms = [term for term in semantic_terms if term in flag_tokens or term in stripped_flag]
+            if not matched_terms:
+                continue
+
+            block_header, related = _teams_flag_block_context(content, flag)
+            block_text = block_header.lower().replace('"', ' ')
+            block_hits = [term for term in semantic_terms if term in block_text]
+            score = 140 * len(matched_terms) + 60 * len(block_hits)
+            compact_flag = re.sub(r"[^a-z0-9]+", "", stripped_flag)
+            if compact_flag and compact_flag in compact_prompt:
+                score += 500
+            # A block whose label is an exact/near-exact semantic family match
+            # beats a broader sibling such as Windows patch_management when the
+            # user simply asks for patch setup.
+            normalized_block_family = re.sub(r"[^a-z0-9]+", "", block_text)
+            compact_terms = "".join(semantic_terms)
+            if compact_terms and compact_terms in normalized_block_family:
+                score += 120
+
+            context_text = f"`{flag}` is currently `{current}` in `{block_header}`"
+            if related:
+                context_text += "; nearby same-family settings: " + ", ".join(f"`{name}`" for name in related)
+            context_text += f"; selecting this option changes only this Boolean to `{requested_new}`"
+            raw_matches.append({
+                "path": path,
+                "filename": path.rsplit("/", 1)[-1],
+                "content": content,
+                "matched_blocks": [{"header": block_header, "block": match.group(0)}],
+                "reason": "semantically matching Boolean feature assignment in the resolved environment",
+                "semantic_terms": list(dict.fromkeys(matched_terms)),
+                "feature_flag_match": {
+                    "path": path,
+                    "flag": flag,
+                    "current_value": current,
+                    "new_value": requested_new,
+                    "action": action,
+                    "matched_line": match.group(0),
+                    "start": match.start(),
+                    "end": match.end(),
+                    "block": block_header,
+                    "related_settings": related,
+                    "context": context_text,
+                    "score": score,
+                },
+                "score": score,
+            })
+
+    raw_matches.sort(
+        key=lambda item: (
+            -int(item.get("score") or 0),
+            str((item.get("feature_flag_match") or {}).get("block") or ""),
+            str((item.get("feature_flag_match") or {}).get("flag") or ""),
+            str(item.get("path") or ""),
+        )
+    )
+
     if not raw_matches:
-        # Keep this explicit workflow file-scoped. Never fall back to a picker
-        # containing backend.tf/outputs.tf/versions.tf/etc.
         result = dict(context or {})
         result.update({
             "selection_state": "candidate_selection_required",
@@ -34827,23 +34932,23 @@ def _teams_feature_flag_candidates_from_main(
             "selected_path": "",
             "matched_files": [],
             "matched_file_paths": [],
-            "scope_root": main_path.rsplit("/", 1)[0] if "/" in main_path else "",
+            "scope_root": scope_root,
             "context_ref": branch,
             "analysis": (
-                f"Feature workflow: inspected `{main_path}` on `{branch}` for Boolean flags matching the request.\n"
-                f"Action polarity: `{action}` is preserved; only flags currently `{desired_current}` are eligible.\n"
-                "Result: no semantically matching eligible Boolean flag was found in the environment main.tf."
+                f"Feature workflow: inspected the resolved environment `{scope_root}` for Boolean assignments related to `{', '.join(semantic_terms)}`.\n"
+                f"Action polarity: `{action}` only considers flags currently `{desired_current}`.\n"
+                "Result: no matching Boolean feature flag was found; unrelated Terraform files were excluded."
             ),
         })
         return result
 
     best_score = int(raw_matches[0].get("score") or 0)
-    best = [item for item in raw_matches if int(item.get("score") or 0) == best_score]
-    # Exact/unique semantic match is safe to execute immediately. Otherwise the
-    # user chooses among flags, not files.
-    if len(best) == 1 and (best_score >= 400 or len(raw_matches) == 1):
-        item = best[0]
-        selected = dict(item)
+    second_score = int(raw_matches[1].get("score") or 0) if len(raw_matches) > 1 else -1
+    # Auto-execute only a genuinely dominant semantic match. If two assignments
+    # remain materially plausible, show those flags (not files) to the user.
+    dominant = len(raw_matches) == 1 or best_score >= second_score + 120
+    if dominant:
+        item = raw_matches[0]
         flag_match = dict(item.get("feature_flag_match") or {})
         return {
             "source": "backend_existing_infra_code_match",
@@ -34855,19 +34960,22 @@ def _teams_feature_flag_candidates_from_main(
             "workflow": workflow,
             "repo_full_name": (context or {}).get("repo_full_name") or f"{GITHUB_OWNER}/{github_repo_for_cloud(normalized_cloud, repo_target=repo_target, workflow=workflow)}",
             "context_ref": branch,
-            "scope_root": main_path.rsplit("/", 1)[0] if "/" in main_path else "",
-            "selected_path": main_path,
-            "matched_files": [selected],
-            "matched_file_paths": [main_path],
+            "scope_root": scope_root,
+            "selected_path": item.get("path") or "",
+            "matched_files": [dict(item)],
+            "matched_file_paths": [item.get("path") or ""],
             "feature_flag_match": flag_match,
             "analysis": (
-                f"Feature workflow: resolved `{prompt}` against `{main_path}`.\n"
-                f"Repository match: `{flag_match.get('flag')}` is {flag_match.get('context')}.\n"
-                f"Decision: unique semantic flag match; preserve `{action}` polarity and modify only that Boolean assignment."
+                f"Feature workflow: resolved `{prompt}` to `{flag_match.get('flag')}` in `{flag_match.get('block')}`.\n"
+                f"Repository path: `{item.get('path')}`; current value `{flag_match.get('current_value')}`.\n"
+                f"Decision: unique dominant Boolean match; change only that flag to `{requested_new}` and preserve all unrelated code."
             ),
         }
 
-    candidates = raw_matches[:8]
+    # Keep only plausible near-best flags. A weak match must not appear just
+    # because it shares one generic fragment with the prompt.
+    cutoff = max(1, best_score - 160)
+    candidates = [item for item in raw_matches if int(item.get("score") or 0) >= cutoff][:8]
     return {
         "source": "backend_existing_infra_code_match",
         "selection_state": "candidate_selection_required",
@@ -34878,17 +34986,16 @@ def _teams_feature_flag_candidates_from_main(
         "workflow": workflow,
         "repo_full_name": (context or {}).get("repo_full_name") or f"{GITHUB_OWNER}/{github_repo_for_cloud(normalized_cloud, repo_target=repo_target, workflow=workflow)}",
         "context_ref": branch,
-        "scope_root": main_path.rsplit("/", 1)[0] if "/" in main_path else "",
+        "scope_root": scope_root,
         "selected_path": "",
         "matched_files": candidates,
-        "matched_file_paths": [main_path],
+        "matched_file_paths": list(dict.fromkeys(str(item.get("path") or "") for item in candidates if item.get("path"))),
         "analysis": (
-            f"Feature workflow: inspected only `{main_path}` for the resolved environment.\n"
-            f"Action polarity: `{action}` is fixed from the original request; eligible flags are currently `{desired_current}`.\n"
-            f"Repository match: found {len(candidates)} semantically related Boolean flags; user choice is required only between these flags, not files."
+            f"Feature workflow: inspected `{scope_root}` and retained only Boolean flags matching `{', '.join(semantic_terms)}`.\n"
+            f"Action polarity: `{action}` is fixed; candidates must currently be `{desired_current}`.\n"
+            f"Repository match: {len(candidates)} relevant Boolean assignment(s) remain; unrelated files and non-Boolean parameters were removed."
         ),
     }
-
 
 def build_backend_existing_infra_modification_context(
     prompt: str,
@@ -34920,11 +35027,12 @@ def select_infra_modification_candidate_from_reply(reply: str, pending_selection
             index = int(number_match.group(1)) - 1
             return index if 0 <= index < len(candidates) else None
         normalized = text.lower().replace("-", "_")
+        matching_indexes = []
         for index, item in enumerate(candidates):
             flag = str((item.get("feature_flag_match") or {}).get("flag") or "").lower().replace("-", "_")
             if flag and normalized == flag:
-                return index
-        return None
+                matching_indexes.append(index)
+        return matching_indexes[0] if len(matching_indexes) == 1 else None
     return _TEAMS_FLAG_PICKER_PREVIOUS_SELECT_REPLY(reply, pending_selection)
 
 
