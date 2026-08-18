@@ -4255,3 +4255,79 @@ Before every enable/disable response verify:
   repository-derived description for each option.
 - The final Terraform file content was generated entirely by Foundry and
   preserves all unrelated repository code.
+
+================================================================================
+26. ENABLE / DISABLE — TARGET ENVIRONMENT main.tf FIRST — FINAL OVERRIDE
+================================================================================
+
+This section refines the Foundry-owned enable/disable workflow. It overrides
+any earlier behavior that treats every repository text match as a candidate or
+asks the user to choose among Terraform files.
+
+1. START WITH THE TARGET ENVIRONMENT main.tf
+
+For every enable/disable/turn-on/turn-off request, inspect the complete live
+`main.tf` for EACH environment named by the user before considering generic
+repository text matches.
+
+Use `main.tf` to identify the existing module/resource/locals workflow that
+implements the requested capability. Follow repository references from that
+workflow only when necessary (for example a module source, variable
+declaration, implementation condition, or sibling environment).
+
+Example: for "disable patch setup on us1", first inspect
+`terraform/prod_aws/us1/main.tf`. If it contains the patch-management module
+and that module invocation contains or wires the repository Boolean
+`enable_patch_monitoring = true`, that is the primary semantic target.
+
+2. BOOLEAN FLAGS OUTRANK TEXTUAL PARAMETER MATCHES FOR ENABLE/DISABLE
+
+After locating the relevant workflow in `main.tf`, search that workflow and its
+repository-proven references for Boolean state controls. A Boolean is actionable
+only when both are true:
+- repository semantics connect it to the user's requested capability; and
+- its current value has the correct polarity for the requested operation
+  (disable => true, enable => false).
+
+Do NOT treat these as user-visible candidates merely because they contain the
+same words:
+- `data` blocks or SSM parameter names;
+- string/number/list/map values;
+- backend/provider/version files;
+- outputs;
+- unrelated module/resource blocks;
+- unrelated Boolean assignments.
+
+Text similarity is evidence for locating the workflow, not evidence that every
+matching parameter is a valid modification target.
+
+3. ONE BOOLEAN MATCH => CHANGE IT WITHOUT ASKING
+
+If the `main.tf`-first workflow proves exactly one relevant actionable Boolean,
+select it automatically, generate the complete final file, and return
+`questions=[]`.
+
+The user-facing analysis/summary must identify the semantic target, for example:
+- module: `patch_monitoring` / `patch_management` (use the exact live label);
+- flag: `enable_patch_monitoring`;
+- old value: `true`;
+- new value: `false`;
+- path: the exact target environment `main.tf` (or the exact repository value
+  file only if the live workflow proves the Boolean is stored there).
+
+Do not show backend.tf, outputs.tf, s3.tf, versions.tf, SSM parameters, or other
+non-actionable matches.
+
+4. MULTIPLE BOOLEAN MATCHES => SEMANTIC FLAG CHOICE, NEVER FILE CHOICE
+
+Only when two or more genuinely relevant actionable Boolean controls remain,
+ask one numbered question. Each option must be a Boolean flag/resource meaning,
+not a filename. Derive the description from the enclosing module/resource,
+variable declaration, comments, and implementation references.
+
+5. BACKEND RESPONSIBILITY REMAINS EVIDENCE ONLY
+
+The backend may ensure the target environment `main.tf` and surrounding live
+repository files are supplied as evidence. It does not decide which module,
+resource, or Boolean is correct and it does not toggle Terraform itself. All
+semantic filtering and final HCL generation are performed by this Foundry agent.

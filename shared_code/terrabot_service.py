@@ -33318,3 +33318,166 @@ def commit_terraform_files_to_branch_for_teams(agent_result: dict, prompt: str, 
     # backend must not run surgical materializers, flag togglers, object
     # synthesizers, tfvars mergers, brace repair, or repository-code generators.
     return _commit_terraform_files_to_branch_for_teams_base(agent_result, prompt, thread_id)
+
+# =============================================================================
+# 2026-08-18 ENABLE/DISABLE MAIN.TF-FIRST EVIDENCE ROUTING — FINAL OVERRIDE
+# =============================================================================
+# Enable/disable semantics remain Foundry-owned. The backend only guarantees
+# that the complete target-environment main.tf is supplied first as live code
+# evidence, followed by the rest of the environment files. It never extracts,
+# ranks, selects, or toggles Boolean flags itself.
+
+_AGENT_FLAG_MAIN_FIRST_PREVIOUS_SELECTED_CHECK = _backend_existing_infra_context_is_selected
+_AGENT_FLAG_MAIN_FIRST_PREVIOUS_BUILD_CONTEXT = build_backend_existing_infra_modification_context
+
+
+def _backend_existing_infra_context_is_selected(context: dict | None) -> bool:
+    """Treat agent-resolved feature-state context as generation-ready.
+
+    A feature-state request can intentionally contain several live files because
+    Foundry, not the backend, must decide which repository-defined Boolean is the
+    controlling flag. Do not convert that evidence set into a user file picker.
+    """
+    if (
+        isinstance(context, dict)
+        and context.get("agent_resolves_target")
+        and context.get("selection_state") == "selected"
+        and bool(context.get("matched_files"))
+    ):
+        return True
+    return _AGENT_FLAG_MAIN_FIRST_PREVIOUS_SELECTED_CHECK(context)
+
+
+def _teams_agent_owned_main_tf_evidence(
+    prompt: str,
+    branch: str,
+    workflow: str,
+) -> list[dict]:
+    """Return complete target AWS main.tf file(s), in prompt environment order.
+
+    This function performs repository retrieval only. It deliberately does not
+    parse resource names, module names, aliases, or Boolean assignments.
+    """
+    entries: list[dict] = []
+    for environment_path in _teams_requested_aws_environment_paths(prompt, branch=branch):
+        main_path = f"{environment_path.rstrip('/')}/main.tf"
+        try:
+            content = github_get_file_content(
+                "aws",
+                main_path,
+                branch,
+                repo_target="tf-devops",
+                workflow=workflow,
+            )
+        except Exception:
+            content = None
+        if content is None:
+            continue
+        entries.append({
+            "path": main_path,
+            "filename": "main.tf",
+            "content": content,
+            "matched_blocks": [],
+            "reason": (
+                "authoritative target-environment main.tf supplied first for "
+                "Foundry-owned resource/module and Boolean-state resolution"
+            ),
+        })
+    return entries
+
+
+def build_backend_existing_infra_modification_context(
+    prompt: str,
+    thread_id: str,
+    cloud: str,
+    workflow: str,
+    retrieved_value_context: list | None = None,
+) -> dict:
+    """Feature-state routing: main.tf first, Foundry decides the actual flag."""
+    context = _AGENT_FLAG_MAIN_FIRST_PREVIOUS_BUILD_CONTEXT(
+        prompt,
+        thread_id,
+        cloud,
+        workflow,
+        retrieved_value_context=retrieved_value_context,
+    )
+    active = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
+    if not (
+        active.get("active")
+        and safe_normalize_cloud(cloud) == "aws"
+        and _teams_feature_flag_intent(prompt) in {"enable", "disable"}
+    ):
+        return context
+
+    context = dict(context or {})
+    branch = str(
+        context.get("context_ref")
+        or _teams_remote_context_branch(
+            "aws",
+            repo_target="tf-devops",
+            workflow=workflow,
+        )
+        or ""
+    ).strip()
+
+    # Guarantee target environment main.tf is present first. Existing context
+    # remains available afterwards as additional live repository evidence, but
+    # none of it is presented to the user as a file choice.
+    main_entries = _teams_agent_owned_main_tf_evidence(prompt, branch, workflow)
+    existing_entries = [
+        dict(item)
+        for item in (context.get("matched_files") or [])
+        if isinstance(item, dict)
+    ]
+    ordered: list[dict] = []
+    seen: set[str] = set()
+    for item in main_entries + existing_entries:
+        path = str(item.get("path") or "").strip().strip("/")
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        ordered.append(item)
+
+    # Also supply the complete files from each explicitly requested environment
+    # when they were not already found by the generic retrieval path. This is
+    # evidence only; Foundry filters it semantically and emits only actionable
+    # Boolean choices when genuine ambiguity remains.
+    try:
+        env_entries, _value_paths, _debug = _teams_environment_folder_evidence(
+            prompt,
+            "aws",
+            "tf-devops",
+            workflow,
+            branch,
+        )
+    except Exception:
+        env_entries = []
+    for item in env_entries:
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("path") or "").strip().strip("/")
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        ordered.append(dict(item))
+
+    context["selection_state"] = "selected"
+    context["selected_path"] = ""
+    context["agent_resolves_target"] = True
+    context["main_tf_first"] = True
+    context["matched_files"] = ordered
+    context["matched_file_paths"] = [
+        str(item.get("path") or "").strip().strip("/")
+        for item in ordered
+        if str(item.get("path") or "").strip()
+    ]
+    context["instructions"] = [
+        "Foundry owns all resource/module/flag semantic resolution and all Terraform generation.",
+        "For each requested environment, inspect its complete main.tf FIRST and locate the existing module/resource that implements the user's requested feature.",
+        "Inside that repository-proven workflow, prefer actionable Boolean assignments for enable/disable when they exist; apply requested-state polarity before deciding whether a candidate is actionable.",
+        "Do not expose files, SSM/data parameters, backend/provider/version files, or non-Boolean values merely because their text resembles the user request.",
+        "If exactly one relevant actionable Boolean flag is proven, change it immediately and return no target-selection question.",
+        "If multiple genuinely relevant actionable Boolean flags remain, ask one numbered semantic flag choice generated from the Terraform context; never ask the user to choose a file.",
+        "The backend has not selected a module, resource, or flag and will not modify Terraform content itself.",
+    ]
+    return context
