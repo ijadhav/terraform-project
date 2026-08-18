@@ -19508,7 +19508,26 @@ def handle_chat_request(data: dict):
 
             if effective_workflow in INFRA_MODIFICATION_WORKFLOWS:
                 existing_infra_context = _get_backend_existing_infra_context(retrieved_value_context)
-                if not existing_infra_context:
+
+                # FINAL TEAMS MODIFICATION REFRESH:
+                # Broad backend_existing_infra_code_match context may have been populated
+                # earlier in the same request by repository-wide/environment discovery.
+                # Reusing that candidate set here bypasses the final target-main.tf +
+                # Foundry Boolean-control resolver and causes the legacy file picker
+                # (main.tf/backend.tf/outputs.tf/...) to be rendered.
+                #
+                # For a fresh Teams AWS modification turn, always rebuild the context
+                # unless this is already a user-selected pending target. The final
+                # resolver semantically classifies the complete target environment
+                # main.tf and validates any returned Boolean against literal live HCL.
+                # This is intentionally independent of hardcoded enable/disable words.
+                _teams_modification_refresh_required = bool(
+                    (_ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}).get("active")
+                    and str(target_cloud or "").strip().lower() == "aws"
+                    and not _backend_existing_infra_context_is_selected(existing_infra_context)
+                )
+
+                if not existing_infra_context or _teams_modification_refresh_required:
                     existing_infra_context = build_backend_existing_infra_modification_context(
                         prompt=effective_prompt,
                         thread_id=conversation_id,
