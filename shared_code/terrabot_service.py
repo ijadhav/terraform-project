@@ -17700,6 +17700,7 @@ def _handle_teams_chat_request_base(data: dict):  # pyright: ignore[reportGenera
         "source": "teams",
         "github_token": installation_token,
         "teams_conversation_id": teams_conversation_id,
+        "memory_conversation_id": str(data.get("memory_conversation_id") or teams_conversation_id).strip(),
     })
 
     with github_token_context(installation_token), teams_requester_context(requester):
@@ -23240,6 +23241,10 @@ def _handle_teams_chat_request_safe(data: dict):
         or ""
     ).strip()
     state = load_teams_conversation_state(teams_conversation_id) if teams_conversation_id else {}
+    memory_conversation_id = str(
+        request_data.get("memory_conversation_id")
+        or teams_conversation_id
+    ).strip()
     conversation_id = str(
         request_data.get("thread_id")
         or state.get("workflow_thread_id")
@@ -23333,6 +23338,7 @@ def _handle_teams_chat_request_safe(data: dict):
     flow_context = {
         "active": True,
         "teams_conversation_id": teams_conversation_id,
+        "memory_conversation_id": memory_conversation_id,
         "thread_id": conversation_id,
         "effective_prompt": prompt,
         "reuse_branch": reuse_branch,
@@ -29443,7 +29449,7 @@ def _teams_attach_agent_memory_context(agent_input: str, active: dict) -> str:
         prompt_for_relevance = str(active.get("effective_prompt") or "")
     try:
         memory_context = agent_memory_store.get_combined_memory_context(
-            conversation_id=str(active.get("teams_conversation_id") or ""),
+            conversation_id=str(active.get("memory_conversation_id") or active.get("teams_conversation_id") or ""),
             cloud=str(active.get("cloud") or ""),
             repo_target=str(active.get("repo_target") or ""),
             prompt=prompt_for_relevance,
@@ -29514,7 +29520,7 @@ def _teams_record_agent_memory_turn(active: dict, agent_input: str, reply: str) 
                 )
 
         agent_memory_store.record_agent_turn(
-            conversation_id=str(active.get("teams_conversation_id") or ""),
+            conversation_id=str(active.get("memory_conversation_id") or active.get("teams_conversation_id") or ""),
             cloud=str(active.get("cloud") or ""),
             repo_target=str(active.get("repo_target") or ""),
             workflow=str(payload.get("mode") or payload.get("workflow") or ""),
@@ -30173,6 +30179,10 @@ def _handle_teams_chat_request_multicloud(data: dict):
         or request_data.get("conversation_id")
         or ""
     ).strip()
+    memory_conversation_id = str(
+        request_data.get("memory_conversation_id")
+        or teams_conversation_id
+    ).strip()
     state = load_teams_conversation_state(teams_conversation_id) if teams_conversation_id else {}
     stage = str(state.get("stage") or "").strip()
 
@@ -30213,7 +30223,7 @@ def _handle_teams_chat_request_multicloud(data: dict):
     ):
         return _teams_plain_chat_reply(
             prompt,
-            teams_conversation_id=teams_conversation_id,
+            teams_conversation_id=memory_conversation_id,
             cloud_hint=str(state.get("cloud") or "").strip(),
             repo_target_hint=str(state.get("repo_target") or "").strip(),
             requester=str(request_data.get("teams_requester") or "").strip(),

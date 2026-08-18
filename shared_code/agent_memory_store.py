@@ -477,6 +477,51 @@ def record_agent_turn(
     return entry
 
 
+def start_conversation_memory(
+    conversation_id: str,
+    *,
+    requester: str = "",
+    source: str = "teams",
+    reason: str = "new_conversation",
+    previous_conversation_id: str = "",
+) -> dict:
+    """Create a durable row for a newly-started logical conversation.
+
+    A Teams transport thread can host many logical Terrabot conversations.
+    This marker makes each logical conversation visible as its own Azure Table
+    entity immediately, even before the first Foundry turn is recorded.  Old
+    conversation rows are intentionally preserved for historical retrieval.
+    """
+    entry = build_memory_entry(
+        workflow="conversation_started",
+        requester=requester,
+        source=source,
+        response_summary=f"New Terrabot conversation started ({reason}).",
+        topic_tags=["conversation", "started", reason],
+        extra={
+            "event": "conversation_started",
+            "reason": reason,
+            "previous_conversation_id": previous_conversation_id,
+        },
+    )
+    key = _conversation_key(conversation_id)
+    if key:
+        try:
+            _append_entry(key, entry)
+            LOGGER.info(
+                "agent_memory: started logical conversation key_hash=%s reason=%s previous_present=%s",
+                _row_key(key)[:12],
+                reason,
+                bool(previous_conversation_id),
+            )
+        except Exception:
+            LOGGER.exception(
+                "agent_memory: unable to start logical conversation key_hash=%s",
+                _row_key(key)[:12],
+            )
+    return entry
+
+
 def record_agent_response(
     conversation_id: str,
     response_summary: str,

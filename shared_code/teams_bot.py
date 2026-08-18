@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import uuid
 from types import SimpleNamespace
 from typing import Any, Dict, Optional
 
@@ -205,6 +206,64 @@ def _get_thread_id(activity: Activity) -> str:
     )
     sender_hash = hashlib.sha256(sender_id.encode("utf-8")).hexdigest()[:20]
     return f"{conversation_id}::user::{sender_hash}"
+
+
+def _new_memory_conversation_id(thread_id: str) -> str:
+    """Return a unique logical-memory id inside one stable Teams thread."""
+    return f"{thread_id}::memory::{uuid.uuid4().hex}"
+
+
+async def _ensure_memory_conversation(
+    thread_id: str,
+    state: Dict[str, Any],
+    requester: str,
+    *,
+    reason: str = "initial_conversation",
+    previous_conversation_id: str = "",
+) -> str:
+    memory_id = str(state.get("memory_conversation_id") or "").strip()
+    if memory_id:
+        return memory_id
+    memory_id = _new_memory_conversation_id(thread_id)
+    state["memory_conversation_id"] = memory_id
+    await _persist_thread_state(thread_id, state)
+    try:
+        await asyncio.to_thread(
+            agent_memory_store.start_conversation_memory,
+            memory_id,
+            requester=requester,
+            source="teams",
+            reason=reason,
+            previous_conversation_id=previous_conversation_id,
+        )
+    except Exception:
+        LOGGER.exception("Unable to create durable logical conversation memory row")
+    return memory_id
+
+
+async def _rotate_memory_conversation(
+    thread_id: str,
+    requester: str,
+    *,
+    reason: str,
+    previous_conversation_id: str = "",
+) -> str:
+    fresh_state: Dict[str, Any] = {}
+    memory_id = _new_memory_conversation_id(thread_id)
+    fresh_state["memory_conversation_id"] = memory_id
+    await _persist_thread_state(thread_id, fresh_state)
+    try:
+        await asyncio.to_thread(
+            agent_memory_store.start_conversation_memory,
+            memory_id,
+            requester=requester,
+            source="teams",
+            reason=reason,
+            previous_conversation_id=previous_conversation_id,
+        )
+    except Exception:
+        LOGGER.exception("Unable to rotate durable logical conversation memory row")
+    return memory_id
 
 
 async def _load_thread_state(thread_id: str) -> Dict[str, Any]:
@@ -692,8 +751,13 @@ async def _send(
     # conversation memory partition; cross-user centralized memory is reserved
     # for repo-scoped agent turns.
     try:
+        _thread_id = _get_thread_id(turn_context.activity)
+        _memory_id = str(
+            (TEAMS_THREAD_STATE.get(_thread_id) or {}).get("memory_conversation_id")
+            or _thread_id
+        ).strip()
         agent_memory_store.record_agent_response(
-            _get_thread_id(turn_context.activity),
+            _memory_id,
             text,
             source="teams",
             workflow="teams_rendered_response",
@@ -823,6 +887,10 @@ class TerrabotTeamsBot(ActivityHandler):
             return
 
         state = await _load_thread_state(thread_id)
+        requester = _get_teams_requester(activity)
+        memory_conversation_id = await _ensure_memory_conversation(
+            thread_id, state, requester
+        )
         _remember_user_turn(state, prompt)
         teams_conversation_memory.record_user_message(thread_id, prompt)
         set_teams_conversation_context(
@@ -859,12 +927,17 @@ class TerrabotTeamsBot(ActivityHandler):
                 )
                 return
 
+            previous_memory_id = memory_conversation_id
             TEAMS_THREAD_STATE.pop(thread_id, None)
             teams_conversation_memory.clear(thread_id)
-            try:
-                agent_memory_store.clear_conversation_memory(thread_id)
-            except Exception:
-                LOGGER.debug("agent memory reset skipped", exc_info=True)
+            # Preserve the completed memory row. A clear starts a brand-new
+            # logical conversation row instead of emptying/reusing the old one.
+            memory_conversation_id = await _rotate_memory_conversation(
+                thread_id,
+                requester,
+                reason="clear_chat",
+                previous_conversation_id=previous_memory_id,
+            )
             set_teams_short_follow_up(False)
             set_teams_conversation_context("")
             cleared_workflows = int(reset_result.get("workflow_states_cleared") or 0)
@@ -1237,7 +1310,8 @@ class TerrabotTeamsBot(ActivityHandler):
             # Only deterministic protocol replies are handled locally.
 
         request["teams_conversation_id"] = thread_id
-        request["teams_requester"] = _get_teams_requester(activity)
+        request["memory_conversation_id"] = memory_conversation_id
+        request["teams_requester"] = requester
 
         try:
             LOGGER.info(
@@ -1285,7 +1359,7 @@ class TerrabotTeamsBot(ActivityHandler):
             backend_state = {}
         if isinstance(backend_state, dict) and backend_state:
             state = dict(backend_state)
-            for local_key in ("recent_user_turns", "last_infra_prompt"):
+            for local_key in ("recent_user_turns", "last_infra_prompt", "memory_conversation_id"):
                 if local_state_before_backend.get(local_key) not in (None, "", []):
                     state[local_key] = local_state_before_backend[local_key]
 
@@ -1426,6 +1500,41 @@ class TerrabotTeamsBot(ActivityHandler):
             return
 
         await _send(turn_context, _format_reply(result))
+
+        # A successfully raised PR closes the logical request conversation.
+        # Keep its completed memory row intact, clear transient workflow state,
+        # and immediately create a fresh memory row for the next user request.
+        if mode == "pr_created" or result.get("pr_url"):
+            completed_memory_id = str(
+                state.get("memory_conversation_id") or memory_conversation_id
+            ).strip()
+            completed_workflow_thread = str(
+                state.get("workflow_thread_id")
+                or state.get("foundry_conversation_id")
+                or workflow_thread_id
+                or ""
+            ).strip()
+            try:
+                await asyncio.to_thread(
+                    reset_teams_chat_session,
+                    thread_id,
+                    completed_workflow_thread,
+                )
+            except Exception:
+                LOGGER.exception(
+                    "Unable to reset Teams workflow after PR creation: conversation=%s",
+                    thread_id,
+                )
+            TEAMS_THREAD_STATE.pop(thread_id, None)
+            teams_conversation_memory.clear(thread_id)
+            await _rotate_memory_conversation(
+                thread_id,
+                requester,
+                reason="pull_request_created",
+                previous_conversation_id=completed_memory_id,
+            )
+            set_teams_short_follow_up(False)
+            set_teams_conversation_context("")
 
     async def on_members_added_activity(self, members_added, turn_context: TurnContext):
         for member in members_added:
