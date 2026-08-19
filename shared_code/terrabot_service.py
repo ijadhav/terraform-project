@@ -9802,7 +9802,9 @@ def parse_agent_output(agent_text: str) -> dict:
 
         cleaned_files.append({
             "filename": filename,
-            "content": content.strip() + "\n",
+            # Teams branch writes must transport Foundry's complete file exactly.
+            # Do not trim, normalize, merge, or otherwise rewrite generated HCL.
+            "content": content if (_ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}).get("active") else content.strip() + "\n",
         })
 
     if cloud == "aws" and workflow == "aws_module_creation":
@@ -35726,3 +35728,431 @@ def _teams_ensure_flag_enable_in_env_values(
         cloud=cloud,
         workflow=workflow,
     )
+
+# =============================================================================
+# 2026-08-19 GENERIC REPOSITORY-DRIVEN CHANGE STRATEGY — FINAL OVERRIDE
+# =============================================================================
+# Foundry owns every semantic infrastructure decision and every Terraform/HCL
+# edit. The backend only retrieves live repository evidence, validates literal
+# repository facts/preservation, and transports Foundry's complete final files.
+# No resource, environment, flag, module, or repository-specific mapping is
+# encoded in this override.
+
+_GENERIC_STRATEGY_PREVIOUS_BUILD_CONTEXT = build_backend_existing_infra_modification_context
+_GENERIC_STRATEGY_PREVIOUS_BOOL_VALIDATOR = _validate_selected_boolean_is_only_file_change
+_GENERIC_STRATEGY_PREVIOUS_NORMALIZE_MODULE_VARIABLES = normalize_module_variables_tf_content
+_GENERIC_STRATEGY_PREVIOUS_AZURE_COMMIT_VALIDATOR = validate_azure_consumer_two_file_payload_for_commit
+
+
+def _repository_boolean_scope_ranges(content: str) -> list[dict]:
+    """Return balanced top-level HCL block ranges for descriptive validation.
+
+    This is structural parsing only. It does not infer what any block or Boolean
+    means and it never mutates repository content.
+    """
+    text = str(content or "")
+    ranges: list[dict] = []
+    for match in _top_level_tf_block_matches(text):
+        brace_start = text.find("{", match.end() - 1)
+        block_end = _find_balanced_curly_end(text, brace_start)
+        if brace_start < 0 or block_end < 0:
+            continue
+        header = text[match.start():brace_start].strip()
+        ranges.append({
+            "start": match.start(),
+            "end": block_end,
+            "header": re.sub(r"\s+", " ", header),
+        })
+    return ranges
+
+
+def _repository_literal_boolean_inventory(repository_evidence: list[dict]) -> list[dict]:
+    """Index literal Boolean assignments from any supplied Terraform evidence.
+
+    The inventory is intentionally resource-agnostic. It includes literal
+    assignments in .tf and .tfvars files and records their exact line number and
+    enclosing top-level block, when one exists. Foundry decides which (if any)
+    implements the user's requested behavior.
+    """
+    inventory: list[dict] = []
+    for item in repository_evidence or []:
+        if not isinstance(item, dict):
+            continue
+        path = _teams_context_file_identity(item)
+        content = str(item.get("content") or "")
+        if not path or not content or not path.endswith((".tf", ".tfvars")):
+            continue
+
+        ranges = _repository_boolean_scope_ranges(content)
+        offset = 0
+        for line_number, line in enumerate(content.replace("\r\n", "\n").splitlines(), start=1):
+            match = re.match(
+                r'^(\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*=\s*)(true|false)(\s*(?:#.*)?)$',
+                line,
+                re.IGNORECASE,
+            )
+            line_start = offset
+            offset += len(line) + 1
+            if not match:
+                continue
+
+            containing = [entry for entry in ranges if entry["start"] <= line_start < entry["end"]]
+            scope = max(containing, key=lambda entry: entry["start"]) if containing else None
+            inventory.append({
+                "path": path,
+                "line_number": line_number,
+                "flag": match.group(2),
+                "current_value": match.group(4).lower(),
+                "scope": str((scope or {}).get("header") or "top-level assignment"),
+                "exact_line": line,
+            })
+    return inventory
+
+
+def _foundry_repository_change_strategy(
+    prompt: str,
+    repository_evidence: list[dict],
+) -> dict:
+    """Ask Foundry whether the request uses an existing Boolean repository gate.
+
+    This semantic classification is deliberately action- and resource-agnostic.
+    It covers creation, enablement, disablement, modification, and deletion
+    without a Python keyword table. Foundry may choose a Boolean only when live
+    repository semantics prove that the Boolean is the repository's mechanism
+    for the requested operation.
+    """
+    evidence = [
+        {"path": _teams_context_file_identity(item), "content": str(item.get("content") or "")}
+        for item in repository_evidence or []
+        if isinstance(item, dict) and _teams_context_file_identity(item) and str(item.get("content") or "")
+    ]
+    inventory = _repository_literal_boolean_inventory(repository_evidence)
+    if not evidence:
+        return {"operation": "unknown", "boolean_applicable": False, "candidates": [], "inventory": inventory}
+
+    request = {
+        "task": (
+            "Infer the repository implementation strategy for the CURRENT infrastructure request from live evidence. "
+            "Decide whether an existing literal Boolean assignment is the repository-proven mechanism for this request. "
+            "This is semantic analysis only; do not generate or rewrite Terraform."
+        ),
+        "user_request": str(prompt or "").strip(),
+        "repository_evidence": evidence,
+        "literal_boolean_inventory": inventory,
+        "required_output": {
+            "operation": "create|enable|disable|modify|delete|unknown",
+            "boolean_applicable": "boolean",
+            "reason": "short repository-grounded explanation",
+            "candidates": [{
+                "path": "exact path from literal_boolean_inventory",
+                "line_number": 1,
+                "flag": "exact flag from literal_boolean_inventory",
+                "current_value": "true|false",
+                "new_value": "true|false",
+                "confidence": 0.0,
+                "description": "what this Boolean controls in repository terms",
+            }],
+        },
+        "rules": [
+            "Return JSON only with operation, boolean_applicable, reason, candidates.",
+            "Infer operation from the user's meaning; the backend does not provide an action-keyword mapping.",
+            "Choose only entries that literally exist in literal_boolean_inventory; never invent a path, line, flag, module, resource, or value.",
+            "Set boolean_applicable=true only when repository evidence proves that changing an existing Boolean is the minimal correct implementation of the CURRENT request.",
+            "A create request may use an existing Boolean only when the resource/consumer definition already exists and the repository uses that Boolean to materialize/activate it.",
+            "A delete request may use an existing Boolean only when repository evidence proves that changing the Boolean is the established decommission/removal mechanism; otherwise deletion must remain a normal code-generation request.",
+            "For ordinary modifications, use a Boolean only when that Boolean directly implements the requested behavior; do not convert arbitrary setting changes into feature-flag changes.",
+            "Include only candidates whose literal value must change. current_value and new_value must differ.",
+            "Do not return unrelated Booleans merely because their names share words with the user request.",
+            "When one candidate is materially strongest, return only that candidate. Return multiple candidates only for genuine semantic ambiguity.",
+            "Prefer boolean_applicable=false over a weak or speculative Boolean match.",
+        ],
+    }
+    try:
+        raw = call_named_agent(json.dumps(request, ensure_ascii=False), AGENT_NAME)
+        parsed = extract_json_from_text(raw)
+        if not isinstance(parsed, dict):
+            parsed = {}
+    except Exception as exc:
+        LOGGER.warning("Generic repository strategy classification failed: %s", exc)
+        parsed = {"operation": "unknown", "boolean_applicable": False, "reason": str(exc), "candidates": []}
+    parsed["inventory"] = inventory
+    return parsed
+
+
+def _validated_repository_boolean_strategy(
+    prompt: str,
+    repository_evidence: list[dict],
+) -> tuple[dict, list[dict]]:
+    """Validate Foundry-selected Boolean candidates against literal live evidence."""
+    strategy = _foundry_repository_change_strategy(prompt, repository_evidence)
+    if not strategy.get("boolean_applicable"):
+        return strategy, []
+
+    inventory = strategy.get("inventory") or []
+    literal_index = {
+        (
+            str(item.get("path") or "").strip().strip("/"),
+            int(item.get("line_number") or 0),
+            str(item.get("flag") or "").strip(),
+        ): item
+        for item in inventory
+        if isinstance(item, dict)
+    }
+    validated: list[dict] = []
+    seen: set[tuple[str, int, str]] = set()
+    for candidate in strategy.get("candidates") or []:
+        if not isinstance(candidate, dict):
+            continue
+        path = str(candidate.get("path") or "").strip().strip("/")
+        flag = str(candidate.get("flag") or "").strip()
+        try:
+            line_number = int(candidate.get("line_number") or 0)
+        except (TypeError, ValueError):
+            line_number = 0
+        key = (path, line_number, flag)
+        literal = literal_index.get(key)
+        if not literal or key in seen:
+            continue
+        current = str(candidate.get("current_value") or "").strip().lower()
+        target = str(candidate.get("new_value") or "").strip().lower()
+        if current not in {"true", "false"} or target not in {"true", "false"}:
+            continue
+        if current == target or current != literal.get("current_value"):
+            continue
+        try:
+            confidence = max(0.0, min(float(candidate.get("confidence") or 0.0), 1.0))
+        except (TypeError, ValueError):
+            confidence = 0.0
+        seen.add(key)
+        validated.append({
+            **literal,
+            "new_value": target,
+            "confidence": confidence,
+            "context": str(candidate.get("description") or "").strip(),
+            "description": str(candidate.get("description") or "").strip(),
+            "classification_reason": str(strategy.get("reason") or "").strip(),
+            "operation": str(strategy.get("operation") or "unknown").strip().lower(),
+        })
+
+    ranked = sorted(validated, key=lambda item: float(item.get("confidence") or 0.0), reverse=True)
+    if len(ranked) > 1:
+        top = float(ranked[0].get("confidence") or 0.0)
+        second = float(ranked[1].get("confidence") or 0.0)
+        if top >= 0.80 and top - second >= 0.15:
+            ranked = [ranked[0]]
+    return strategy, ranked
+
+
+def build_backend_existing_infra_modification_context(
+    prompt: str,
+    thread_id: str,
+    cloud: str,
+    workflow: str,
+    retrieved_value_context: list | None = None,
+) -> dict:
+    """Generic Teams repository strategy with Foundry-owned semantics.
+
+    The prior repository retriever remains intact. This final layer removes any
+    AWS/main.tf/resource-name dependency from feature-flag selection by running
+    the same semantic Boolean strategy over all live Terraform evidence already
+    gathered for the resolved request.
+    """
+    context = _GENERIC_STRATEGY_PREVIOUS_BUILD_CONTEXT(
+        prompt,
+        thread_id,
+        cloud,
+        workflow,
+        retrieved_value_context=retrieved_value_context,
+    )
+    active = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
+    if not active.get("active") or str(workflow or "").strip() not in INFRA_MODIFICATION_WORKFLOWS:
+        return context
+
+    context = dict(context or {})
+
+    # Re-read the resolved environment evidence independently of any earlier
+    # feature-flag shortcut. This prevents a prior AWS/main.tf-only classifier
+    # from narrowing the evidence before the generic strategy runs. Repository
+    # discovery remains structural; Foundry performs all semantic selection.
+    extra_environment_evidence: list[dict] = []
+    try:
+        normalized_cloud = normalize_cloud(cloud)
+        repo_target = normalize_repo_target(normalized_cloud, workflow=workflow)
+        branch = str(context.get("context_ref") or "").strip() or _teams_remote_context_branch(
+            normalized_cloud, repo_target, workflow
+        )
+        extra_environment_evidence, _write_paths, _debug = _teams_environment_folder_evidence(
+            prompt, normalized_cloud, repo_target, workflow, branch
+        )
+    except Exception as exc:
+        LOGGER.debug("Generic strategy environment evidence refresh skipped: %s", exc)
+
+    evidence = _teams_merge_repository_evidence(
+        list(context.get("matched_files") or []) + list(context.get("environment_files") or []),
+        extra_environment_evidence,
+    )
+    if not evidence:
+        return context
+
+    strategy, candidates = _validated_repository_boolean_strategy(prompt, evidence)
+    context["repository_change_strategy"] = {
+        "operation": str(strategy.get("operation") or "unknown"),
+        "boolean_applicable": bool(candidates),
+        "reason": str(strategy.get("reason") or ""),
+    }
+
+    # A non-Boolean result remains a normal Foundry generation request. The
+    # backend supplies live files but does not select or edit a resource.
+    if not candidates:
+        context.pop("feature_flag_selection", None)
+        context["matched_files"] = evidence
+        context["matched_file_paths"] = [_teams_context_file_identity(item) for item in evidence]
+        context["selection_state"] = "selected"
+        context["selected_path"] = ""
+        context["agent_resolves_target"] = True
+        context["instructions"] = list(context.get("instructions") or []) + [
+            "Foundry classified this request as not safely reducible to an existing literal Boolean gate. Continue with repository-semantic generation for the requested create/modify/delete operation.",
+            "Generate the minimal repository delta from live evidence. The backend validates and transports only; it never constructs, merges, repairs, appends, removes, or toggles Terraform.",
+        ]
+        return context
+
+    evidence_by_path = {
+        _teams_context_file_identity(item): item
+        for item in evidence
+        if isinstance(item, dict) and _teams_context_file_identity(item)
+    }
+    matched: list[dict] = []
+    for candidate in candidates:
+        source = dict(evidence_by_path.get(str(candidate.get("path") or "").strip().strip("/")) or {})
+        if not source:
+            continue
+        source["feature_flag_match"] = dict(candidate)
+        source["reason"] = "Foundry semantic Boolean strategy validated against exact live repository assignment"
+        matched.append(source)
+    if not matched:
+        return context
+
+    context["matched_files"] = matched
+    context["matched_file_paths"] = list(dict.fromkeys(_teams_context_file_identity(item) for item in matched))
+    context["feature_flag_selection"] = True
+    context["agent_resolves_target"] = False
+    context["instructions"] = [
+        "Foundry semantically proved that the CURRENT request is implemented by an existing literal Boolean assignment and the backend verified the exact live path/line/value.",
+        "Use only feature_flag_match. Do not infer another flag or edit any unrelated repository content.",
+        "Return the COMPLETE final selected file with only feature_flag_match.current_value changed to feature_flag_match.new_value on feature_flag_match.line_number.",
+        "Preserve every other line exactly. The backend performs exact-diff validation and will block unrelated changes without synthesizing a repair.",
+    ]
+    if len(matched) == 1:
+        context["selection_state"] = "selected"
+        context["selected_path"] = _teams_context_file_identity(matched[0])
+    else:
+        context["selection_state"] = "candidate_selection_required"
+        context["selected_path"] = ""
+    return context
+
+
+def _validate_selected_boolean_is_only_file_change(
+    existing_content: str,
+    generated_content: str,
+    path: str,
+) -> None:
+    """Require exactly the validated Boolean line to change, independent of resource type."""
+    match = _selected_feature_flag_match_from_active_context(path)
+    if not match:
+        return _GENERIC_STRATEGY_PREVIOUS_BOOL_VALIDATOR(existing_content, generated_content, path)
+
+    flag = str(match.get("flag") or "").strip()
+    current = str(match.get("current_value") or "").strip().lower()
+    target = str(match.get("new_value") or "").strip().lower()
+    try:
+        line_number = int(match.get("line_number") or 0)
+    except (TypeError, ValueError):
+        line_number = 0
+    if not flag or line_number <= 0 or current not in {"true", "false"} or target not in {"true", "false"} or current == target:
+        raise UnsafeGeneratedChangeError("Selected Boolean repository context is incomplete or invalid.")
+
+    existing_lines = (existing_content or "").replace("\r\n", "\n").splitlines()
+    generated_lines = (generated_content or "").replace("\r\n", "\n").splitlines()
+    if len(existing_lines) != len(generated_lines):
+        raise UnsafeGeneratedChangeError(
+            f"Generated Boolean modification for {path} added or removed lines; only the selected literal Boolean may change."
+        )
+    if line_number > len(existing_lines):
+        raise UnsafeGeneratedChangeError("Selected Boolean line no longer exists in the live repository file.")
+
+    assignment = re.compile(
+        rf'^(\s*){re.escape(flag)}(\s*=\s*)(true|false)(\s*(?:#.*)?)$',
+        re.IGNORECASE,
+    )
+    changed_lines = [index for index, pair in enumerate(zip(existing_lines, generated_lines), start=1) if pair[0] != pair[1]]
+    if changed_lines != [line_number]:
+        raise UnsafeGeneratedChangeError(
+            f"Generated Boolean modification for {path} changed unrelated repository content. "
+            f"Only line {line_number} (`{flag}`) may change."
+        )
+    old_match = assignment.match(existing_lines[line_number - 1])
+    new_match = assignment.match(generated_lines[line_number - 1])
+    if not old_match or not new_match:
+        raise UnsafeGeneratedChangeError("The selected Boolean assignment was structurally changed instead of only toggling its literal value.")
+    if old_match.group(3).lower() != current or new_match.group(3).lower() != target:
+        raise UnsafeGeneratedChangeError(
+            f"Generated Boolean modification for {path} has the wrong transition; expected {current} -> {target}."
+        )
+    if old_match.group(1) != new_match.group(1) or old_match.group(2) != new_match.group(2) or old_match.group(4) != new_match.group(4):
+        raise UnsafeGeneratedChangeError("The selected Boolean line was reformatted; only the literal true/false value may change.")
+
+
+def normalize_module_variables_tf_content(
+    content: str,
+    filename: str,
+    workflow: str,
+    user_prompt: str = "",
+) -> tuple[str, list[str]]:
+    """Teams backend is validation/transport only; never rewrite Foundry HCL."""
+    if (_ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}).get("active"):
+        issues: list[str] = []
+        if filename.endswith(("variables.tf", "vars.tf")):
+            for item in _iter_variable_blocks_with_names(content or ""):
+                block = str(item.get("block") or "")
+                name = str(item.get("name") or "")
+                if not _variable_attr_present(block, "description"):
+                    issues.append(f'variable "{name}" is missing description')
+                if not _variable_attr_present(block, "type"):
+                    issues.append(f'variable "{name}" is missing type')
+        return str(content or ""), issues
+    return _GENERIC_STRATEGY_PREVIOUS_NORMALIZE_MODULE_VARIABLES(
+        content,
+        filename,
+        workflow,
+        user_prompt=user_prompt,
+    )
+
+
+def validate_azure_consumer_two_file_payload_for_commit(agent_result: dict) -> None:
+    """Teams commit guard validates Foundry files but never repairs them."""
+    if not (_ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}).get("active"):
+        return _GENERIC_STRATEGY_PREVIOUS_AZURE_COMMIT_VALIDATOR(agent_result)
+    if not isinstance(agent_result, dict):
+        return
+    if safe_normalize_cloud(agent_result.get("cloud")) != "azure":
+        return
+    if str(agent_result.get("workflow") or "").strip() != "azure_consumer_generation":
+        return
+    routing_summary = agent_result.get("routing_summary") or {}
+    files = [item for item in (agent_result.get("files") or []) if isinstance(item, dict)]
+    filenames = {
+        normalize_agent_relative_tf_path(str(item.get("filename") or item.get("path") or ""), "azure")
+        for item in files
+    }
+    required = [
+        normalize_agent_relative_tf_path(str(routing_summary.get(key) or ""), "azure")
+        for key in ("consumer_file", "tfvars_file")
+        if str(routing_summary.get(key) or "").strip()
+    ]
+    missing = [name for name in required if name not in filenames]
+    if missing:
+        raise ValueError("Azure consumer output is missing backend-routed Foundry file(s): " + ", ".join(missing))
+    for item in files:
+        name = normalize_agent_relative_tf_path(str(item.get("filename") or item.get("path") or ""), "azure")
+        if name.endswith((".tf", ".tfvars")):
+            _validate_hcl_content_complete(name, str(item.get("content") or ""))

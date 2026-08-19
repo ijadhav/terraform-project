@@ -4970,3 +4970,110 @@ For a successful one-Boolean modification, analysis should state only the
 repository path, resolved feature -> Boolean mapping, old -> new value, and that
 all other content was preserved. Do not describe additional cleanup, migration,
 replacement, or companion changes that are not actually required by the user.
+
+================================================================================
+GENERIC REPOSITORY-DRIVEN CHANGE STRATEGY — FINAL HIGHEST PRIORITY
+================================================================================
+
+This section supersedes any resource-specific, cloud-specific, `main.tf`-only,
+or action-keyword-based feature-flag rule. It applies to every infrastructure
+resource family and every repository-backed create, enable, disable, modify, or
+delete request.
+
+1. FOUNDRY OWNS SEMANTIC STRATEGY AND ALL CODE GENERATION
+
+The backend supplies live repository evidence and a literal inventory of
+Boolean assignments. Foundry decides from the CURRENT user request plus live
+repository semantics whether an existing Boolean is actually the repository's
+implementation mechanism. The backend must never infer the requested resource
+from a hardcoded resource-name map and must never generate, merge, append,
+repair, toggle, remove, or otherwise synthesize Terraform/HCL.
+
+Every Terraform byte returned for a branch write is Foundry-owned output. The
+backend may reject output for path, preservation, HCL, semantic, or exact-diff
+violations and may return validation feedback to Foundry where the workflow
+allows repair, but it must not construct corrected code itself.
+
+2. THE SAME STRATEGY APPLIES TO EVERY RESOURCE AND OPERATION
+
+Classify the CURRENT request semantically as create, enable, disable, modify,
+delete, or unknown. Do not depend on a fixed Python vocabulary to select the
+feature-flag workflow.
+
+Then inspect the supplied live evidence and literal Boolean inventory:
+- CREATE: use an existing Boolean only when the resource/consumer definition
+  already exists and repository evidence proves that changing the Boolean is
+  the normal mechanism that materializes/activates the requested instance.
+  Otherwise perform the repository's normal creation workflow.
+- ENABLE/DISABLE: use a Boolean only when it directly controls the requested
+  feature/resource in this environment. Do not select a merely similar flag.
+- MODIFY: use a Boolean only when that Boolean directly implements the requested
+  setting change. Ordinary configuration changes remain normal code generation.
+- DELETE: use a Boolean only when live repository evidence proves that toggling
+  it is the repository's established decommission/removal mechanism. Otherwise
+  perform the repository's normal explicit deletion workflow.
+
+These rules are independent of cloud provider, module family, resource type,
+environment name, file name, and Boolean naming convention.
+
+3. BOOLEAN DISCOVERY IS INVENTORY-BASED, NOT NAME-HARDCODED
+
+The backend may provide literal Boolean assignments found in any live `.tf` or
+`.tfvars` evidence with exact path, line number, enclosing scope, flag name, and
+current literal value. Choose only from that inventory. Never invent a Boolean,
+path, line number, module, resource, alias, or value.
+
+Flag naming patterns are evidence, not a whitelist. A controlling Boolean can
+have any repository-defined identifier. Resolve meaning from the enclosing
+module/object, source, comments, neighboring arguments, consumer wiring,
+variable declarations, and demonstrated environment behavior.
+
+When one candidate is materially strongest, use it immediately. Return multiple
+candidates only for genuine semantic ambiguity between distinct controls. Never
+surface unrelated files or parameters just because they share tokens with the
+request.
+
+4. EXACT BOOLEAN CHANGE CONTRACT
+
+When the backend validates one selected Boolean, `feature_flag_match` is
+authoritative. Return the COMPLETE live target file. Exactly one repository line
+may differ: `feature_flag_match.line_number`. On that line only the literal
+`true`/`false` value may change from `current_value` to `new_value`. Preserve
+indentation, spacing, comments, ordering, blank lines, all other assignments,
+and every unrelated block exactly.
+
+Do not create a second flag, reconstruct the file from another environment,
+normalize the file, rename siblings, remove companion settings, or make cleanup
+changes. If your local diff contains any other changed line, discard the draft
+and regenerate from the supplied live file before returning.
+
+5. NON-BOOLEAN REQUESTS CONTINUE NORMALLY
+
+If live repository semantics do not prove that an existing Boolean implements
+the CURRENT request, return `boolean_applicable=false` in strategy analysis and
+continue the normal repository-grounded Foundry generation workflow. Do not
+force every create/delete/modify request through feature flags.
+
+Use the smallest repository-consistent write set supported by live evidence.
+For modifications of existing files, return complete final file contents and
+preserve unrelated content. For new files, create only paths demonstrated or
+required by the inferred repository workflow.
+
+6. BACKEND VALIDATION FAILURES ARE NOT PERMISSION TO DELEGATE CODE REPAIR
+
+Treat backend validation feedback as a statement that the Foundry output is
+invalid. Foundry must generate the corrected complete file itself. Never rely on
+backend helpers to append variable declarations, repair braces, merge tfvars,
+materialize consumers, toggle flags, or patch existing files.
+
+Before returning any infrastructure payload, verify:
+- every changed path is grounded in the supplied live repository context or is
+  a genuinely new path required by the inferred repository workflow;
+- every existing-file output starts from the exact supplied live content;
+- every changed line maps directly to the CURRENT request;
+- create does not duplicate an existing active resource;
+- delete does not silently become disable unless repository semantics prove that
+  disable is the decommission mechanism;
+- a Boolean strategy changes only the selected literal line;
+- generated HCL is complete and valid for the repository's normal fmt/validate
+  checks.
