@@ -14909,12 +14909,17 @@ def build_user_friendly_error(message: str) -> str:
     text = (message or "").strip()
     lower = text.lower()
 
-    if "terrabot blocked the generated change before any branch write" in lower or "unsafe_generated_change" in lower:
+    if (
+        "terrabot blocked the generated change before any branch write" in lower
+        or "unsafe_generated_change" in lower
+        or "substantially shorter than the live repository file" in lower
+        or "does not preserve any existing terraform block" in lower
+        or "removes too many existing" in lower
+        or "repository-content placeholder" in lower
+    ):
         return (
-            "Terrabot blocked this change before writing to GitHub because the generated file "
-            "contained unrelated or unpreserved edits. No automatic code-repair attempt was "
-            "sent to Foundry; retry the original request so it is regenerated from fresh live "
-            "repository evidence."
+            "Terrabot could not produce a backend-valid Terraform change after internal "
+            "repair attempts. No repository changes were written."
         )
 
     if "cloud must be either" in lower:
@@ -19895,38 +19900,126 @@ def handle_chat_request(data: dict):
                         agent_result.get("repo_target"),
                         effective_workflow,
                     )
-                    try:
-                        agent_result = enforce_modification_uses_backend_matched_files(
-                            agent_result, retrieved_value_context
+                    # Repository-preservation failures are backend validation failures,
+                    # including UnsafeGeneratedChangeError. Keep them private and give
+                    # Foundry bounded repair attempts before any pending change/branch is
+                    # exposed to Teams. The backend validates only; it never repairs HCL.
+                    validation_error = None
+                    for repair_attempt in range(1, MAX_TEAMS_SELF_CORRECTION_ATTEMPTS + 1):
+                        try:
+                            agent_result = enforce_modification_uses_backend_matched_files(
+                                agent_result, retrieved_value_context
+                            )
+                            validation_error = None
+                            break
+                        except ValueError as enforce_error:
+                            validation_error = enforce_error
+                            _teams_diag_log(
+                                "generation_validation_failed",
+                                level="warning",
+                                thread=conversation_id,
+                                attempt=f"{repair_attempt}/{MAX_TEAMS_SELF_CORRECTION_ATTEMPTS}",
+                                error=str(enforce_error)[:300],
+                            )
+                            if repair_attempt >= MAX_TEAMS_SELF_CORRECTION_ATTEMPTS:
+                                break
+
+                            repair_payload = {
+                                "task": (
+                                    "SELF-CORRECTION LOOP: the backend rejected your generated "
+                                    "Terraform before it was shown or written. Repair the exact "
+                                    "validation failure and return corrected complete files now. "
+                                    "Do not ask the user anything."
+                                ),
+                                "channel": "teams",
+                                "original_user_request": effective_prompt,
+                                "backend_validation_error": str(enforce_error),
+                                "previous_generated_files": [
+                                    {
+                                        "filename": (item or {}).get("filename"),
+                                        "content": (item or {}).get("content"),
+                                    }
+                                    for item in (agent_result.get("files") or [])
+                                    if isinstance(item, dict)
+                                ],
+                                "expected_cloud": target_cloud,
+                                "expected_workflow": effective_workflow,
+                                "expected_repo_target": agent_result.get("repo_target"),
+                                "retrieved_module_context": retrieved_module_context,
+                                "retrieved_value_context": retrieved_value_context,
+                                "correction_instructions": [
+                                    "Fix the exact backend_validation_error; do not change unrelated repository content.",
+                                    "For an existing file, return the COMPLETE final live file, preserving every unrelated line, comment, block, blank line, and ordering exactly.",
+                                    "Do not abbreviate, truncate, summarize, or use placeholders for unchanged repository content.",
+                                    "Make only the modification requested by original_user_request.",
+                                    "Return strict infrastructure JSON with corrected files[] and no blocking questions.",
+                                ],
+                            }
+                            selected_repair_context = _get_backend_existing_infra_context(
+                                retrieved_value_context
+                            )
+                            if isinstance(selected_repair_context, dict):
+                                selected_path = str(
+                                    selected_repair_context.get("selected_path") or ""
+                                ).strip()
+                                selected_content = ""
+                                for matched in selected_repair_context.get("matched_files") or []:
+                                    if not isinstance(matched, dict):
+                                        continue
+                                    matched_path = str(
+                                        matched.get("path") or matched.get("filename") or ""
+                                    ).strip()
+                                    if not selected_path or matched_path == selected_path:
+                                        selected_content = str(matched.get("content") or "")
+                                        if selected_content:
+                                            selected_path = selected_path or matched_path
+                                            break
+                                if selected_path and selected_content:
+                                    repair_payload["teams_exact_target_file"] = {
+                                        "path": selected_path,
+                                        "content": selected_content,
+                                        "must_preserve_verbatim": True,
+                                    }
+
+                            _teams_diag_log(
+                                "sending_generation_validation_repair_to_agent",
+                                thread=conversation_id,
+                                attempt=f"{repair_attempt}/{MAX_TEAMS_SELF_CORRECTION_ATTEMPTS}",
+                            )
+                            conversation_id, agent_reply = call_agent(
+                                conversation_id, json.dumps(repair_payload, indent=2)
+                            )
+                            agent_reply = _teams_apply_agent_identity(
+                                agent_reply, target_cloud, effective_workflow
+                            )
+                            agent_result = try_parse_agent_output(agent_reply)
+                            agent_result = finalize_agent_result_after_parse(
+                                agent_result,
+                                retrieved_module_context,
+                                retrieved_value_context,
+                            )
+                            agent_result["workflow"] = effective_workflow
+                            agent_result["repo_target"] = normalize_repo_target(
+                                agent_result["cloud"],
+                                repo_target=agent_result.get("repo_target"),
+                                workflow=effective_workflow,
+                            )
+                            agent_result["state_bucket"] = state_bucket_for_target(
+                                agent_result["cloud"],
+                                agent_result.get("repo_target"),
+                                effective_workflow,
+                            )
+
+                    if validation_error is not None:
+                        _teams_diag_log(
+                            "generation_validation_repair_exhausted",
+                            level="error",
+                            thread=conversation_id,
+                            error=str(validation_error)[:300],
                         )
-                    except UnsafeGeneratedChangeError:
-                        # Unsafe semantic/preservation failures are terminal for this
-                        # generation. Do not send the rejected code back to Foundry: a
-                        # second draft can accidentally make unrelated edits look valid.
-                        raise
-                    except ValueError as enforce_error:
-                        # Mechanical/shape failures may still use the existing single
-                        # correction path; unsafe unrelated-change failures never do.
-                        corrective = (
-                            f"CORRECTION: {enforce_error} Return the SAME change "
-                            "again, writing ONLY within the allowed paths. Append "
-                            "the new *_enabled variable declaration to the "
-                            "existing variables file present in the evidence — "
-                            "never create a new file. Return complete final "
-                            "contents for every file."
-                        )
-                        conversation_id, agent_reply = call_agent(conversation_id, corrective)
-                        agent_reply = _teams_apply_agent_identity(
-                            agent_reply, target_cloud, effective_workflow
-                        )
-                        agent_result = try_parse_agent_output(agent_reply)
-                        agent_result = finalize_agent_result_after_parse(
-                            agent_result,
-                            retrieved_module_context,
-                            retrieved_value_context,
-                        )
-                        agent_result = enforce_modification_uses_backend_matched_files(
-                            agent_result, retrieved_value_context
+                        raise ValueError(
+                            "Terrabot could not produce a backend-valid Terraform change "
+                            "after internal repair attempts. No repository changes were written."
                         )
 
                 agent_result = _teams_ensure_flag_enable_in_env_values(
