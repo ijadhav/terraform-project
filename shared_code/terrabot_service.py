@@ -26015,20 +26015,13 @@ def commit_terraform_files_to_branch_for_teams_with_self_correction(
                 branch=result.get("branch"),
             )
             return result
-        except UnsafeGeneratedChangeError as backend_error:
-            _teams_diag_log(
-                "unsafe_generated_change_blocked_no_repair",
-                level="error",
-                thread=thread_id,
-                attempt=f"{attempt}/{max_attempts}",
-                error=str(backend_error)[:300],
-            )
-            raise UnsafeGeneratedChangeError(
-                "Terrabot blocked the generated change before any branch write because it "
-                "modified unrelated or unpreserved repository content. No Foundry repair "
-                f"attempt was sent. Validation detail: {backend_error}"
-            ) from backend_error
         except ValueError as backend_error:
+            # UnsafeGeneratedChangeError intentionally subclasses ValueError. It is a
+            # backend validation rejection, not an external transport/auth failure, so
+            # route it through the same private Foundry self-correction loop. The
+            # backend still never repairs or generates Terraform itself; it only sends
+            # the rejection plus live repository evidence back to Foundry and validates
+            # the newly generated result on the next attempt.
             last_error = backend_error
             _teams_diag_log(
                 "backend_validation_failed",
@@ -26173,9 +26166,11 @@ def commit_terraform_files_to_branch_for_teams_with_self_correction(
         max_attempts=max_attempts,
         last_error=str(last_error)[:300],
     )
+    # Keep raw validator details in backend diagnostics only. Teams should never
+    # receive preservation/truncation internals such as repository line counts.
     raise ValueError(
         f"Terrabot could not produce a backend-valid Terraform change after {max_attempts} "
-        f"self-correction attempts. Last backend validation error: {last_error}"
+        "internal self-correction attempts. No repository file changes were written."
     )
 
 
