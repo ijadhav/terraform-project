@@ -4890,3 +4890,83 @@ It overrides any generic grounding-rescue or broad identifier-picker behavior.
    ask one concise question about what feature/resource the user's phrase means
    in plain language. Do not ask for a file path or Terraform identifier, and do
    not show unrelated repository options.
+
+================================================================================
+TEAMS MODIFICATION DELTA SAFETY — FINAL HARD OVERRIDE
+================================================================================
+
+This section applies to every Teams modification, especially enable/disable
+requests against large `.tfvars` files. It overrides any instruction that could
+permit regenerating, shortening, normalizing, or opportunistically cleaning up
+unrelated repository content.
+
+1. MINIMAL REPOSITORY DELTA IS THE PRIMARY IMPLEMENTATION STRATEGY
+
+Before generating code, infer the repository's existing control mechanism from
+live evidence and choose the smallest change that fulfills the user's request.
+For an existing feature controlled by one Boolean assignment, the complete
+requested change is that one Boolean transition. Do not rebuild the surrounding
+object, remove companion settings, add a second flag, rename sibling resources,
+or regenerate the environment values file from another environment/template.
+
+Example: for a request such as `disable homepage application in npr-int`, if
+live `npr-int` evidence contains one repository-proven homepage application
+Boolean whose current value is `true`, return the complete live file with only
+that exact literal changed to `false`. Do not introduce a new `*_enabled_2`
+flag, do not copy a different environment's values, and do not alter storage,
+lifecycle, database, Kusto, retention, container, or unrelated ACA settings.
+
+2. LIVE FILE IS AN IMMUTABLE BASELINE
+
+For every existing file modification:
+- start from the exact live file content supplied in repository evidence;
+- preserve every unrelated line byte-for-byte, including comments, blank lines,
+  ordering, names, values, nested blocks, and list entries;
+- apply only the line(s) required by the current user request;
+- never reconstruct a large file from memory or from a sibling environment;
+- never use a shorter partial file as the final `content`;
+- never treat your previous generated draft as repository truth.
+
+If the requested change is one Boolean transition, perform a final local diff
+check before returning: exactly one line may differ, and within that line only
+the Boolean literal may differ. If more than one line differs, discard the
+draft and regenerate from the supplied live file before returning it.
+
+3. UNRELATED-CHANGE DETECTION IS A GENERATION FAILURE
+
+Before returning files[], compare the proposed final file against live evidence.
+For each changed line, be able to map that line directly to the CURRENT user's
+request. If a changed line cannot be justified by the request, it is unrelated
+and MUST be removed from the output before returning.
+
+Forbidden examples for a one-flag disable request include:
+- deleting existing storage account/container entries;
+- changing lifecycle prefixes or retention periods;
+- changing database/Kusto/backup settings;
+- changing versioning/change-feed settings;
+- renaming unrelated resources;
+- adding placeholder flags or second-instance flags;
+- formatting or reordering unrelated groups.
+
+4. DO NOT RELY ON BACKEND REPAIR TO FIX SEMANTIC DRIFT
+
+The backend may reject unsafe output, but semantic correctness must be achieved
+on the FIRST generation. An unrelated-change/preservation rejection is a hard
+safety failure and may be blocked without a Foundry code-repair attempt. Do not
+assume a rejected draft will be sent back for another regeneration pass.
+
+Therefore, the pre-return self-check for modifications MUST verify all of:
+- target file comes from current live evidence;
+- requested resource/feature is present in that file;
+- selected assignment/block semantically matches the user's words;
+- current value supports the requested transition;
+- no new resource/flag is created for a request to modify an existing one;
+- every unrelated existing line remains exactly preserved;
+- the output is complete HCL and not shorter/truncated.
+
+5. RESPONSE ANALYSIS MUST DESCRIBE THE EXECUTED MINIMAL CHANGE
+
+For a successful one-Boolean modification, analysis should state only the
+repository path, resolved feature -> Boolean mapping, old -> new value, and that
+all other content was preserved. Do not describe additional cleanup, migration,
+replacement, or companion changes that are not actually required by the user.

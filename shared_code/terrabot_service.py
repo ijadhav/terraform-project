@@ -14907,6 +14907,14 @@ def build_user_friendly_error(message: str) -> str:
     text = (message or "").strip()
     lower = text.lower()
 
+    if "terrabot blocked the generated change before any branch write" in lower or "unsafe_generated_change" in lower:
+        return (
+            "Terrabot blocked this change before writing to GitHub because the generated file "
+            "contained unrelated or unpreserved edits. No automatic code-repair attempt was "
+            "sent to Foundry; retry the original request so it is regenerated from fresh live "
+            "repository evidence."
+        )
+
     if "cloud must be either" in lower:
         return "Please specify which cloud you want to use: AWS or Azure."
 
@@ -19889,9 +19897,14 @@ def handle_chat_request(data: dict):
                         agent_result = enforce_modification_uses_backend_matched_files(
                             agent_result, retrieved_value_context
                         )
+                    except UnsafeGeneratedChangeError:
+                        # Unsafe semantic/preservation failures are terminal for this
+                        # generation. Do not send the rejected code back to Foundry: a
+                        # second draft can accidentally make unrelated edits look valid.
+                        raise
                     except ValueError as enforce_error:
-                        # The agent wrote outside the allowed set (e.g. invented a
-                        # new variables file). Correct it once instead of failing:
+                        # Mechanical/shape failures may still use the existing single
+                        # correction path; unsafe unrelated-change failures never do.
                         corrective = (
                             f"CORRECTION: {enforce_error} Return the SAME change "
                             "again, writing ONLY within the allowed paths. Append "
@@ -21487,14 +21500,107 @@ def _teams_feature_flag_intent(prompt: str) -> str:
 
 
 def _teams_auto_select_feature_flag_context(existing_infra_context: dict, prompt: str) -> dict:
-    """Compatibility no-op: feature/flag selection is Foundry-owned.
+    """Select one unambiguous live Boolean feature flag for enable/disable.
 
-    The backend deliberately does not tokenize resource names, rank Boolean
-    assignments, infer aliases, or choose a Terraform flag. It only supplies
-    live repository files to Foundry.
+    This is repository validation/targeting only: it never generates or mutates
+    Terraform. The selected literal assignment is later enforced byte-for-byte
+    by _validate_selected_boolean_is_only_file_change.
     """
-    del existing_infra_context, prompt
-    return {}
+    intent = _teams_feature_flag_intent(prompt)
+    if intent not in {"enable", "disable"}:
+        return {}
+    context = dict(existing_infra_context or {})
+    if not context:
+        return {}
+
+    text = str(prompt or "").lower().replace("_", "-")
+    stop = {
+        "enable", "disable", "turn", "switch", "on", "off", "remove",
+        "decommission", "activate", "deactivate", "in", "for", "the",
+        "a", "an", "application", "applications", "resource", "feature",
+    }
+    prompt_tokens = {
+        token for token in re.findall(r"[a-z0-9]+", text)
+        if len(token) > 2 and token not in stop
+    }
+    # Repository vocabulary commonly abbreviates application as app. Keep the
+    # alias generic rather than hardcoding any product/resource name.
+    if re.search(r"\bapplications?\b|\bapps?\b", text):
+        prompt_tokens.add("app")
+
+    target_current = "true" if intent == "disable" else "false"
+    target_new = "false" if intent == "disable" else "true"
+    candidates = []
+    evidence = list(context.get("matched_files") or []) + list(context.get("environment_files") or [])
+    seen = set()
+    for item in evidence:
+        if not isinstance(item, dict):
+            continue
+        path = _teams_context_file_identity(item)
+        content = str(item.get("content") or "")
+        if not path or not content or path in seen:
+            continue
+        seen.add(path)
+        for line_no, line in enumerate(content.splitlines(), start=1):
+            match = re.match(r'^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(true|false)\s*(?:#.*)?$', line, re.IGNORECASE)
+            if not match:
+                continue
+            flag = match.group(1)
+            current = match.group(2).lower()
+            if current != target_current:
+                continue
+            flag_tokens = {t for t in re.findall(r"[a-z0-9]+", flag.lower()) if len(t) > 1}
+            overlap = prompt_tokens & flag_tokens
+            if not overlap:
+                continue
+            # Require at least one resource-specific token beyond generic app
+            # when possible. This makes "homepage application" resolve to the
+            # homepage app flag while unrelated aca_app_* flags remain below it.
+            specific_overlap = overlap - {"app", "enabled", "enable", "create", "deploy"}
+            score = (len(specific_overlap) * 10) + len(overlap)
+            if flag.lower().endswith("_enabled"):
+                score += 2
+            candidates.append({
+                "score": score,
+                "path": path,
+                "item": item,
+                "flag": flag,
+                "current_value": current,
+                "new_value": target_new,
+                "line": line_no,
+                "context": line.strip(),
+            })
+
+    if not candidates:
+        return {}
+    candidates.sort(key=lambda c: (-c["score"], c["path"], c["flag"]))
+    best = candidates[0]
+    # Never auto-select a tie: leave the normal evidence-backed clarification
+    # path in place when two distinct Boolean controls are equally plausible.
+    if len(candidates) > 1 and candidates[1]["score"] == best["score"]:
+        return {}
+    if best["score"] < 10:
+        return {}
+
+    selected_item = dict(best["item"] or {})
+    selected_item["feature_flag_match"] = {
+        "flag": best["flag"],
+        "current_value": best["current_value"],
+        "new_value": best["new_value"],
+        "context": best["context"],
+        "line": best["line"],
+    }
+    context["matched_files"] = [selected_item]
+    context["matched_file_paths"] = [best["path"]]
+    context["selected_path"] = best["path"]
+    context["selection_state"] = "selected"
+    context["feature_flag_selection"] = True
+    context["agent_resolves_target"] = False
+    context["instructions"] = list(context.get("instructions") or []) + [
+        f"Backend live-evidence target: `{best['flag']} = {best['current_value']}` in `{best['path']}` line {best['line']}; requested transition is {best['current_value']} -> {best['new_value']}.",
+        "Return the COMPLETE final file and change only the literal Boolean value on that assignment. Do not add, remove, rename, reorder, or reformat any other line.",
+    ]
+    return context
 
 def _teams_repo_target_for_expected(cloud: str, workflow: str) -> str:
     return normalize_repo_target(cloud, workflow=workflow)
@@ -25907,6 +26013,19 @@ def commit_terraform_files_to_branch_for_teams_with_self_correction(
                 branch=result.get("branch"),
             )
             return result
+        except UnsafeGeneratedChangeError as backend_error:
+            _teams_diag_log(
+                "unsafe_generated_change_blocked_no_repair",
+                level="error",
+                thread=thread_id,
+                attempt=f"{attempt}/{max_attempts}",
+                error=str(backend_error)[:300],
+            )
+            raise UnsafeGeneratedChangeError(
+                "Terrabot blocked the generated change before any branch write because it "
+                "modified unrelated or unpreserved repository content. No Foundry repair "
+                f"attempt was sent. Validation detail: {backend_error}"
+            ) from backend_error
         except ValueError as backend_error:
             last_error = backend_error
             _teams_diag_log(
@@ -34490,7 +34609,7 @@ def _validate_agent_full_file_preservation_for_write(
     if existing_content is None:
         return
     if _terrabot_placeholder_content_detected(generated_content):
-        raise ValueError(
+        raise UnsafeGeneratedChangeError(
             f"Generated modification for {path} contains a repository-content placeholder. "
             "Foundry must return the complete real file with unrelated content preserved."
         )
@@ -34501,11 +34620,14 @@ def _validate_agent_full_file_preservation_for_write(
 
     # Re-enable the existing non-mutating preservation validator. This function
     # only rejects destructive replacements; it does not construct file content.
-    _validate_full_file_modification_preserves_existing(
-        existing_content,
-        generated_content,
-        path,
-    )
+    try:
+        _validate_full_file_modification_preserves_existing(
+            existing_content,
+            generated_content,
+            path,
+        )
+    except ValueError as exc:
+        raise UnsafeGeneratedChangeError(str(exc)) from exc
 
     existing = (existing_content or "").replace("\r\n", "\n")
     generated = (generated_content or "").replace("\r\n", "\n")
@@ -34522,7 +34644,7 @@ def _validate_agent_full_file_preservation_for_write(
         generated_headers = _top_level_tf_headers_for_modification(generated)
         missing_headers = sorted(existing_headers - generated_headers)
         if missing_headers:
-            raise ValueError(
+            raise UnsafeGeneratedChangeError(
                 f"Generated modification for {path} removed existing Terraform blocks: "
                 + ", ".join(missing_headers[:12])
                 + ". Foundry must preserve unrelated repository content and edit only the requested code."
@@ -34534,7 +34656,7 @@ def _validate_agent_full_file_preservation_for_write(
     existing_nonblank = [line for line in existing.splitlines() if line.strip()]
     generated_nonblank = [line for line in generated.splitlines() if line.strip()]
     if len(existing_nonblank) >= 20 and len(generated_nonblank) < max(8, int(len(existing_nonblank) * 0.70)):
-        raise ValueError(
+        raise UnsafeGeneratedChangeError(
             f"Generated modification for {path} is substantially shorter than the live repository file "
             f"({len(generated_nonblank)} vs {len(existing_nonblank)} nonblank lines). "
             "Refusing a likely truncated overwrite; Foundry must return the complete final file."
@@ -35092,6 +35214,15 @@ def _selected_feature_flag_match_from_active_context(path: str = "") -> dict:
     return {}
 
 
+class UnsafeGeneratedChangeError(ValueError):
+    """Generated Terraform is unsafe to write and must not be auto-repaired.
+
+    These failures indicate semantic drift, unrelated edits, or destructive
+    preservation violations. Retrying the same draft through Foundry can turn
+    a blocked bad diff into a different bad diff, so the branch write stops.
+    """
+
+
 def _validate_selected_boolean_is_only_file_change(
     existing_content: str,
     generated_content: str,
@@ -35110,12 +35241,12 @@ def _validate_selected_boolean_is_only_file_change(
     current = str(match.get("current_value") or "").strip().lower()
     target = str(match.get("new_value") or "").strip().lower()
     if not flag or current not in {"true", "false"} or target not in {"true", "false"} or current == target:
-        raise ValueError("Selected Boolean modification context is incomplete or invalid.")
+        raise UnsafeGeneratedChangeError("Selected Boolean modification context is incomplete or invalid.")
 
     existing_lines = (existing_content or "").replace("\r\n", "\n").splitlines()
     generated_lines = (generated_content or "").replace("\r\n", "\n").splitlines()
     if len(existing_lines) != len(generated_lines):
-        raise ValueError(
+        raise UnsafeGeneratedChangeError(
             f"Generated Boolean modification for {path} added/removed lines. "
             "Only the selected Boolean assignment may change; all other repository content must remain exactly preserved."
         )
@@ -35131,24 +35262,24 @@ def _validate_selected_boolean_is_only_file_change(
         old_match = assignment.match(old_line)
         new_match = assignment.match(new_line)
         if not old_match or not new_match:
-            raise ValueError(
+            raise UnsafeGeneratedChangeError(
                 f"Generated Boolean modification for {path} changed unrelated repository content. "
                 f"Only `{flag} = {current}` may become `{flag} = {target}`."
             )
         if old_match.group(3).lower() != current or new_match.group(3).lower() != target:
-            raise ValueError(
+            raise UnsafeGeneratedChangeError(
                 f"Generated Boolean modification for {path} changed `{flag}` with unexpected values. "
                 f"Expected {current} -> {target}."
             )
         # Preserve indentation, spacing around '=', and any inline comment too.
         if old_match.group(1) != new_match.group(1) or old_match.group(2) != new_match.group(2) or old_match.group(4) != new_match.group(4):
-            raise ValueError(
+            raise UnsafeGeneratedChangeError(
                 f"Generated Boolean modification for {path} reformatted the selected line. "
                 "Only the literal Boolean value may change."
             )
         changed += 1
     if changed != 1:
-        raise ValueError(
+        raise UnsafeGeneratedChangeError(
             f"Generated Boolean modification for {path} must change exactly one `{flag}` assignment; observed {changed}."
         )
 
@@ -35382,7 +35513,7 @@ def enforce_modification_uses_backend_matched_files(agent_result: dict, retrieve
             normalized = normalize_iac_relative_path(raw, allow_tfvars=True).strip("/")
             returned.append(normalized)
             if allowed and normalized not in allowed:
-                raise ValueError(
+                raise UnsafeGeneratedChangeError(
                     f"Generated modification path `{normalized}` is not present in the live repository evidence for this request. "
                     "Foundry must choose only repository-grounded target files supplied by the backend."
                 )
