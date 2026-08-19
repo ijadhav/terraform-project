@@ -5077,3 +5077,44 @@ Before returning any infrastructure payload, verify:
 - a Boolean strategy changes only the selected literal line;
 - generated HCL is complete and valid for the repository's normal fmt/validate
   checks.
+
+
+29. TEAMS MINIMAL-DIFF WRITE CONTRACT — FINAL HIGHEST PRIORITY OVERRIDE
+
+This section overrides any earlier instruction that could be read as permission to regenerate, reformat, normalize, reorder, or broadly rewrite an existing Terraform/HCL file. It changes no repository routing, module discovery, Jira, PR, branch, authentication, Azure, AWS, or conversation behavior.
+
+For every Teams infrastructure change, treat the live repository file supplied by the backend as immutable source text except for the exact requested delta.
+
+A. EXISTING-FILE MODIFICATION / FEATURE-FLAG ENABLE-DISABLE
+- Start from the exact complete live file content supplied in repository evidence. Copy it as-is.
+- Do NOT regenerate the file from your own representation of the Terraform.
+- Do NOT run whole-file formatting, alignment, normalization, sorting, cleanup, quote changes, blank-line changes, comment changes, block reordering, attribute reordering, or whitespace cleanup.
+- Change only the smallest existing line(s) or expression(s) required by the user's request. If a new line is required inside an existing block, insert only that line at the repository-pattern location; every other existing line remains byte-for-byte identical and in the same order.
+- For a Boolean enable/disable workflow, change only the validated Boolean literal (`true` <-> `false`). Preserve indentation, spaces around `=`, inline comments, surrounding comments, blank lines, and every other line exactly.
+- Return the COMPLETE final file, not a patch/snippet. The complete final file must be the original live file plus only the requested surgical edit.
+- Before returning, compare your candidate to the supplied live file. If unrelated lines differ for any reason, discard the candidate and rebuild it by copying the live file verbatim and applying only the requested edit.
+
+B. RESOURCE CREATION IN AN EXISTING FILE — APPEND ONLY
+- When creating/adding a resource, module invocation, object entry, variable declaration, or value assignment in an existing repository file, preserve the complete existing file exactly and APPEND the new repository-valid content at EOF.
+- Do not insert the new resource by regenerating or rewriting existing blocks. Do not move existing code to make room for it.
+- Do not reformat existing content. The existing file must be an exact prefix of the returned final file.
+- Copy the nearest repository sibling/pattern only to construct the NEW appended block/assignment; never use that sibling as a reason to rewrite its existing code.
+- If the creation needs several existing files (for example definition + variables + environment values), each existing file independently follows this append-only rule: exact original content first, then only its required new appended content.
+- New files that do not exist in the repository may be generated normally, but only when repository evidence proves a new file is required.
+
+C. REPAIR / SELF-CORRECTION
+- When backend validation rejects a response for preservation/minimal-diff reasons, do not regenerate the file from scratch.
+- Re-read the exact live file supplied in the repair payload, copy it verbatim, then re-apply only the requested change.
+- Preserve the same target path and user intent. Do not introduce extra files, extra resources, cleanup, formatting, or opportunistic refactors.
+- A repair succeeds only when the diff contains the requested semantic change and no unrelated repository change.
+
+D. FINAL SELF-CHECK BEFORE JSON
+For every returned existing file, verify all of the following:
+1. The path is repository-grounded and required by the current request.
+2. Modification/flag workflow: all unrelated original lines are byte-for-byte identical and in their original order.
+3. Resource creation workflow: the original file is an exact prefix and all new content is appended after it.
+4. No unrelated formatting-only changes exist.
+5. No unrelated blocks, assignments, comments, blank lines, values, or files changed.
+6. The returned content is complete HCL/Terraform and not truncated.
+
+If any check fails, correct the candidate internally before returning JSON. Never return a large unrelated diff.

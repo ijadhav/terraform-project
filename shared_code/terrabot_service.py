@@ -36305,3 +36305,205 @@ def validate_azure_consumer_two_file_payload_for_commit(agent_result: dict) -> N
         name = normalize_agent_relative_tf_path(str(item.get("filename") or item.get("path") or ""), "azure")
         if name.endswith((".tf", ".tfvars")):
             _validate_hcl_content_complete(name, str(item.get("content") or ""))
+
+# =============================================================================
+# 2026-08-19 THREE-MODE FOUNDRY OUTPUT ENFORCEMENT — FINAL OVERRIDE
+# =============================================================================
+# Foundry owns Terraform generation. The backend only retrieves repository
+# truth, classifies the write policy from already-resolved workflow context,
+# validates the returned full file, and transports it. It never edits HCL.
+
+_THREE_MODE_PREVIOUS_FULL_FILE_VALIDATOR = _validate_agent_full_file_preservation_for_write
+
+
+def _teams_active_repository_change_strategy() -> dict:
+    """Return the already-resolved repository strategy for the active Teams turn."""
+    active = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
+    value_context = active.get("retrieved_value_context") or []
+    context = _get_backend_existing_infra_context(value_context)
+    if not isinstance(context, dict):
+        return {}
+    strategy = context.get("repository_change_strategy") or {}
+    return dict(strategy) if isinstance(strategy, dict) else {}
+
+
+def _teams_validation_change_mode(path: str, workflow: str | None) -> str:
+    """Choose validation mode without resource-, repo-, path-, or flag-name maps.
+
+    Semantic resource/flag selection remains Foundry-owned. The backend uses
+    only the validated Boolean evidence and the already-resolved operation.
+    """
+    if _selected_feature_flag_match_from_active_context(path):
+        return "boolean"
+
+    active = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
+    if not active.get("active"):
+        return "legacy"
+
+    strategy = _teams_active_repository_change_strategy()
+    operation = str(strategy.get("operation") or "").strip().lower()
+    if operation in {"create", "creation", "add", "provision", "deploy"}:
+        return "create"
+    if operation in {"modify", "modification", "update", "delete", "deletion", "remove"}:
+        return "modify"
+
+    effective_prompt = str(active.get("effective_prompt") or "").strip()
+    if effective_prompt and _teams_is_existing_invocation_creation(effective_prompt):
+        return "create"
+
+    if str(workflow or "").strip() in INFRA_MODIFICATION_WORKFLOWS:
+        return "modify"
+    return "legacy"
+
+
+def _validate_foundry_append_only_existing_file(
+    existing_content: str,
+    generated_content: str,
+    path: str,
+) -> None:
+    """Creation in an existing file must be exact-prefix + non-empty append."""
+    existing = str(existing_content or "")
+    generated = str(generated_content or "")
+    if not existing:
+        return
+    if not generated.startswith(existing):
+        raise UnsafeGeneratedChangeError(
+            f"Creation output for {path} changed existing repository content. "
+            "For an existing target file, Foundry must copy the live file byte-for-byte "
+            "and append only the newly requested Terraform after the original EOF."
+        )
+    appended = generated[len(existing):]
+    if not appended.strip():
+        raise UnsafeGeneratedChangeError(
+            f"Creation output for {path} did not append any new Terraform after the live file."
+        )
+
+
+def _validate_foundry_targeted_existing_file_delta(
+    existing_content: str,
+    generated_content: str,
+    path: str,
+) -> None:
+    """Reject broad rewrites while allowing a bounded, localized Foundry delta.
+
+    This is deliberately semantic-neutral. It does not decide which resource
+    should change. It only ensures that a modification leaves the overwhelming
+    majority of the live file byte-for-byte unchanged and does not introduce
+    formatting-only churn across unrelated lines.
+    """
+    import difflib
+    import math
+
+    existing = str(existing_content or "")
+    generated = str(generated_content or "")
+    if not existing:
+        return
+    if existing == generated:
+        return
+
+    old_lines = existing.splitlines(keepends=True)
+    new_lines = generated.splitlines(keepends=True)
+    matcher = difflib.SequenceMatcher(a=old_lines, b=new_lines, autojunk=False)
+    changed_existing = 0
+    changed_generated = 0
+    hunks = 0
+
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        hunks += 1
+        changed_existing += i2 - i1
+        changed_generated += j2 - j1
+
+        if tag == "replace":
+            old_segment = old_lines[i1:i2]
+            new_segment = new_lines[j1:j2]
+            if len(old_segment) == len(new_segment) and all(
+                re.sub(r"\s+", " ", old.rstrip("\r\n").strip())
+                == re.sub(r"\s+", " ", new.rstrip("\r\n").strip())
+                for old, new in zip(old_segment, new_segment)
+            ):
+                raise UnsafeGeneratedChangeError(
+                    f"Modification output for {path} contains formatting-only changes. "
+                    "Foundry must preserve unrelated spacing and formatting exactly."
+                )
+
+    existing_line_count = max(1, len(old_lines))
+    changed_total = changed_existing + changed_generated
+    # Dynamic safety budgets scale with file size; they are not tied to any
+    # repository, environment, resource family, or feature-flag name.
+    line_budget = max(20, int(math.ceil(existing_line_count * 0.20)))
+    hunk_budget = max(3, int(math.ceil(existing_line_count / 250.0)))
+
+    if changed_total > line_budget or hunks > hunk_budget:
+        raise UnsafeGeneratedChangeError(
+            f"Modification output for {path} is not a small targeted delta "
+            f"({changed_total} changed line entries across {hunks} diff regions). "
+            "Foundry must start from the exact live file and alter only the lines required "
+            "for the requested existing resource."
+        )
+
+
+def _validate_agent_full_file_preservation_for_write(
+    existing_content: str,
+    generated_content: str,
+    path: str,
+    workflow: str | None,
+) -> None:
+    """Final Teams write policy: Boolean-only, targeted modify, or append-only create."""
+    if existing_content is None:
+        # A genuinely new file has no pre-existing bytes to preserve. Existing
+        # path/routing/HCL validators still apply before transport.
+        return _THREE_MODE_PREVIOUS_FULL_FILE_VALIDATOR(
+            existing_content,
+            generated_content,
+            path,
+            workflow,
+        )
+
+    if _terrabot_placeholder_content_detected(generated_content):
+        raise UnsafeGeneratedChangeError(
+            f"Generated output for {path} contains a repository-content placeholder. "
+            "Foundry must return the complete final file."
+        )
+
+    mode = _teams_validation_change_mode(path, workflow)
+
+    if mode == "boolean":
+        _validate_selected_boolean_is_only_file_change(
+            existing_content,
+            generated_content,
+            path,
+        )
+        return
+
+    if mode == "create":
+        _validate_foundry_append_only_existing_file(
+            existing_content,
+            generated_content,
+            path,
+        )
+        return
+
+    if mode == "modify":
+        # Keep all existing structural/destructive checks, then add the stricter
+        # minimal-diff boundary. Neither validator modifies generated HCL.
+        _THREE_MODE_PREVIOUS_FULL_FILE_VALIDATOR(
+            existing_content,
+            generated_content,
+            path,
+            workflow,
+        )
+        _validate_foundry_targeted_existing_file_delta(
+            existing_content,
+            generated_content,
+            path,
+        )
+        return
+
+    return _THREE_MODE_PREVIOUS_FULL_FILE_VALIDATOR(
+        existing_content,
+        generated_content,
+        path,
+        workflow,
+    )
