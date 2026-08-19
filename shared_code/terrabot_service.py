@@ -28963,22 +28963,12 @@ def _teams_maybe_rescue_grounding_refusal(agent_input: str, reply: str) -> Optio
         return _teams_build_generic_clarification_reply(prompt, files), None
 
 
-def _teams_resolve_pending_rescue_selection(prompt: str, pending: dict) -> Optional[str]:
-    """Resolve a user's reply to a previously rescued numbered picker into a
-    fully-specified instruction, so the next generation attempt targets an
-    exact, already-confirmed identifier instead of ambiguous free text.
-
-    Matches by 1-based number first, then by case-insensitive exact or
-    substring match against an option's identifier. Returns None when the
-    reply does not match any pending option (the caller should then treat
-    the message as an ordinary new request instead of forcing a match).
-    """
+def _teams_selected_rescue_options(prompt: str, pending: dict) -> list[dict]:
+    """Return the live-repository picker options explicitly selected by a user."""
     options = pending.get("options") or []
-    if not options:
-        return None
     text = str(prompt or "").strip()
-    if not text:
-        return None
+    if not options or not text:
+        return []
 
     selected: list[dict] = []
     number_tokens = re.findall(r"\d+", text)
@@ -28986,17 +28976,194 @@ def _teams_resolve_pending_rescue_selection(prompt: str, pending: dict) -> Optio
         for token in number_tokens:
             index = int(token) - 1
             if 0 <= index < len(options):
-                selected.append(options[index])
+                selected.append(dict(options[index]))
     if not selected:
         normalized = text.lower()
         for option in options:
             identifier = str(option.get("identifier") or "").lower()
             if identifier and (identifier == normalized or identifier in normalized or normalized in identifier):
-                selected.append(option)
+                selected.append(dict(option))
 
+    deduped = []
+    seen = set()
+    for item in selected:
+        key = (str(item.get("file") or pending.get("file") or ""), str(item.get("identifier") or ""))
+        if key not in seen:
+            seen.add(key)
+            deduped.append(item)
+    return deduped
+
+
+def _repository_context_evidence_excerpt(content: str, identifier: str, radius: int = 2) -> str:
+    """Return a small exact excerpt around an identifier from live repository text."""
+    lines = str(content or "").splitlines()
+    needle = str(identifier or "").strip().lower()
+    if not needle:
+        return ""
+    for index, line in enumerate(lines):
+        if needle in line.lower():
+            start = max(0, index - radius)
+            end = min(len(lines), index + radius + 1)
+            return "\n".join(lines[start:end]).strip()
+    return ""
+
+
+def _store_repository_context_from_resource_selection(
+    user_reply: str,
+    pending: dict,
+    selected: list[dict],
+) -> dict:
+    """Persist user-phrase -> selected live-resource mappings immediately.
+
+    This runs when Terrabot showed repository-derived resource/flag/rule options
+    and the user chose one. No Git commit is required. Foundry extracts only a
+    durable ``resolved_clarification`` and the normal repository-context layer
+    still validates the cited excerpt against the exact repository commit before
+    storing it.
+    """
+    if not selected:
+        return {"ok": True, "stored": 0, "skipped": "no_selection"}
+
+    cloud = str(pending.get("cloud") or "").strip()
+    repo_target = str(pending.get("repo_target") or "").strip()
+    owner, repo = _repository_context_repo_identity(cloud, repo_target, "", "")
+    if not owner or not repo:
+        return {"ok": True, "stored": 0, "skipped": "repo_unresolved"}
+
+    try:
+        branch, commit_sha = _repository_context_branch_and_sha(owner, repo, "")
+    except Exception as exc:
+        return {"ok": False, "stored": 0, "error": str(exc)}
+    if not commit_sha:
+        return {"ok": True, "stored": 0, "skipped": "commit_unresolved"}
+
+    relevant_code = []
+    for item in selected:
+        path = str(item.get("file") or pending.get("file") or "").strip()
+        identifier = str(item.get("identifier") or "").strip()
+        if not path or not identifier:
+            continue
+        try:
+            content = github_get_file_content(
+                cloud, path, branch, repo_target=repo_target or None, workflow="",
+            )
+        except Exception:
+            content = None
+        excerpt = _repository_context_evidence_excerpt(content or "", identifier)
+        if excerpt:
+            relevant_code.append({
+                "path": path,
+                "identifier": identifier,
+                "kind": str(item.get("kind") or "resource"),
+                "content": excerpt,
+            })
+
+    if not relevant_code:
+        LOGGER.warning(
+            "[TerrabotDiag] event=repository_context_resource_selection_skipped repo=%s/%s reason=no_live_evidence",
+            owner, repo,
+        )
+        return {"ok": True, "stored": 0, "skipped": "no_live_evidence"}
+
+    original_prompt = str(pending.get("original_prompt") or "").strip()
+    selection_text = ", ".join(str(item.get("identifier") or "") for item in selected)
+    try:
+        existing = search_repository_context(
+            owner, repo, original_prompt or selection_text, current_commit_sha=commit_sha, top_k=6
+        ).get("results") or []
+    except Exception:
+        existing = []
+
+    extraction = {
+        "task": "EXTRACT DURABLE REPOSITORY CONTEXT FROM RESOLVED RESOURCE SELECTION",
+        "repository": f"{owner}/{repo}",
+        "branch": branch,
+        "evidence_commit_sha": commit_sha,
+        "original_user_request": original_prompt,
+        "user_selection_reply": str(user_reply or "").strip(),
+        "selected_repository_targets": selected,
+        "relevant_code": relevant_code,
+        "existing_repository_context": existing,
+        "required_output": {
+            "candidates": [{
+                "category": "resolved_clarification",
+                "subject": "stable user-facing repository term or resource alias",
+                "scope": "repository/module/component/environment/path",
+                "statement": "durable mapping from the user's phrase to the selected concrete repository target",
+                "confidence": 0.0,
+                "evidence": [{
+                    "path": "repo-relative path present in relevant_code",
+                    "excerpt": "exact excerpt copied from relevant_code.content",
+                    "reason": "why the selected repository target supports this semantic mapping",
+                }],
+                "validation_summary": "why this mapping will prevent future ambiguity",
+            }]
+        },
+        "rules": [
+            "Return JSON only with exactly one top-level key: candidates.",
+            "Emit only resolved_clarification candidates.",
+            "The user's selection resolves which live repository target their original wording meant.",
+            "Store the semantic mapping, not the one-off requested action. Example: store 'observe collector refers to the repository OTel collector', not 'disable it in us1'.",
+            "Every candidate must cite an exact excerpt from relevant_code; the user reply alone is never repository evidence.",
+            "Do not store environment-specific action state unless the terminology itself is environment-specific.",
+            "Do not store user preferences, conversation summaries, secrets, branch choices, or transient task state.",
+            "Prefer zero candidates if the original phrase is too generic to be useful across future tasks.",
+            "Use confidence >= 0.80 only when the selection and repository evidence jointly support the mapping.",
+        ],
+    }
+
+    LOGGER.warning(
+        "[TerrabotDiag] event=repository_context_resource_selection_extraction_started repo=%s/%s selected=%s",
+        owner, repo, selection_text,
+    )
+    try:
+        text = call_named_agent(json.dumps(extraction, ensure_ascii=False), AGENT_NAME)
+        candidates = shared_repository_context.parse_context_extraction_response(text)
+    except Exception as exc:
+        LOGGER.warning(
+            "[TerrabotDiag] event=repository_context_resource_selection_extraction_failed repo=%s/%s error=%s",
+            owner, repo, exc,
+        )
+        return {"ok": False, "stored": 0, "error": str(exc)}
+
+    task_hash = hashlib.sha256(json.dumps({
+        "repo": f"{owner}/{repo}",
+        "commit": commit_sha,
+        "request": original_prompt,
+        "reply": str(user_reply or "").strip(),
+        "selected": [str(item.get("identifier") or "") for item in selected],
+    }, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+    stored = 0
+    rejected = 0
+    for candidate in candidates[:4]:
+        candidate = dict(candidate or {})
+        candidate["category"] = "resolved_clarification"
+        try:
+            result = add_repository_context(
+                owner, repo, commit_sha, candidate, evidence_branch=branch, source_task_hash=task_hash
+            )
+        except Exception as exc:
+            result = {"stored": False, "errors": [str(exc)]}
+        if result.get("stored"):
+            stored += 1
+        else:
+            rejected += 1
+
+    LOGGER.warning(
+        "[TerrabotDiag] event=repository_context_resource_selection_extraction_completed repo=%s/%s candidates=%s stored=%s rejected=%s",
+        owner, repo, len(candidates), stored, rejected,
+    )
+    return {"ok": True, "candidate_count": len(candidates), "stored": stored, "rejected": rejected}
+
+
+def _teams_resolve_pending_rescue_selection(prompt: str, pending: dict) -> Optional[str]:
+    """Resolve a user's picker reply into an exact repository instruction."""
+    selected = _teams_selected_rescue_options(prompt, pending)
     if not selected:
         return None
 
+    text = str(prompt or "").strip()
     file_path = str(pending.get("file") or "").strip()
     original_prompt = str(pending.get("original_prompt") or "").strip()
     identifiers = ", ".join(f'"{item.get("identifier")}"' for item in selected)
@@ -33407,8 +33574,18 @@ def handle_teams_chat_request(data: dict):
             existing_state = {}
         pending_rescue = existing_state.get("pending_rescue_selection")
         if isinstance(pending_rescue, dict) and pending_rescue.get("options"):
+            selected_rescue_options = _teams_selected_rescue_options(prompt, pending_rescue)
             resolved_instruction = _teams_resolve_pending_rescue_selection(prompt, pending_rescue)
             if resolved_instruction:
+                try:
+                    _store_repository_context_from_resource_selection(
+                        prompt, pending_rescue, selected_rescue_options
+                    )
+                except Exception as exc:
+                    LOGGER.warning(
+                        "[TerrabotDiag] event=repository_context_resource_selection_capture_failed error=%s",
+                        exc,
+                    )
                 LOGGER.info(
                     "TEAMS-RESCUE-RESOLVE-TRIGGER: rewriting reply %r into a fully-specified "
                     "instruction using the pending rescue selection for conversation=%s.",
