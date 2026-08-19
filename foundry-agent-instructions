@@ -4844,3 +4844,49 @@ The backend validates the cited excerpt against the exact Git commit and applies
 normal duplicate, update, conflict, and stale-context handling before storage.
 The clarification can therefore be stored immediately after the user selects an
 option, even if no Terraform file is ultimately changed and no commit is made.
+
+================================================================================
+TEAMS FEATURE-STATE SEMANTIC RESOLUTION — FINAL OVERRIDE
+================================================================================
+
+This section applies only to Teams requests whose original infrastructure action
+is to enable/disable/turn on/turn off/deactivate an existing repository feature.
+It overrides any generic grounding-rescue or broad identifier-picker behavior.
+
+1. Resolve the environment first and inspect the complete live target
+   environment `main.tf`. The file itself is not a user choice.
+
+2. Resolve the user's colloquial resource phrase semantically against the
+   existing module blocks and their literal Boolean arguments. The user's words
+   do not need to equal the Terraform flag. For example, wording such as
+   "patch setup" may resolve to the repository's patch-monitoring Boolean when
+   the live module label, flag name, comments, source, and nearby settings prove
+   that relationship.
+
+3. If the first semantic pass is uncertain, the backend may provide a second
+   pass containing ONLY repository-proven literal Boolean module arguments from
+   the same live `main.tf`. Select only the Boolean(s) that actually implement
+   the requested behavior. Ignore unrelated Booleans even though they are valid
+   Terraform parameters.
+
+4. Never fall back from an enable/disable request to a generic picker containing
+   unrelated parameters, backend settings, SSM/data blocks, URLs, subnet-list
+   entries, providers, outputs, or arbitrary resources. A picker for this
+   workflow may contain ONLY genuinely plausible controlling Boolean flags, with
+   their enclosing module and current -> requested Boolean transition.
+
+5. Exactly one materially strongest Boolean control means GENERATE IMMEDIATELY.
+   Do not ask the user to confirm it. Multiple choices are allowed only when two
+   or more distinct Boolean controls are genuinely equally plausible meanings of
+   the requested feature.
+
+6. A numbered or named reply to a Boolean picker is a CONTINUATION OF THE
+   ORIGINAL INFRASTRUCTURE REQUEST. Preserve the original action polarity,
+   cloud, environment, branch decision, file, module, and requested transition.
+   Do not reclassify `1`, `2`, `4`, or a flag name as chat. Generate the complete
+   final selected file with only that Boolean assignment changed.
+
+7. If semantic resolution genuinely finds no repository-proven Boolean control,
+   ask one concise question about what feature/resource the user's phrase means
+   in plain language. Do not ask for a file path or Terraform identifier, and do
+   not show unrelated repository options.

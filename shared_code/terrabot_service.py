@@ -28937,6 +28937,34 @@ def _teams_maybe_rescue_grounding_refusal(agent_input: str, reply: str) -> Optio
         files = _teams_extract_any_file_contents(payload)
         extraction_mode = "any-file-fallback"
 
+    # Never turn an explicit enable/disable request into the old broad picker
+    # that enumerates every Boolean, data block, list entry, and resource found
+    # in whichever recovered Terraform file happens to come first. That was the
+    # regression that surfaced backend.tf encryption/SSM/subnet options for a
+    # patch-monitoring request. The dedicated Boolean resolver above owns this
+    # workflow. If it still cannot resolve the feature, return one concise
+    # semantic clarification instead of unrelated repository choices.
+    feature_intent = _teams_feature_flag_intent(prompt)
+    if feature_intent in {"enable", "disable"}:
+        question = (
+            f'I could not map "{prompt}" to a unique repository Boolean control in the resolved environment. '
+            "I will not show unrelated Terraform parameters as choices. Please clarify the feature/resource meaning in plain language."
+        )
+        payload_out = {
+            "summary": question,
+            "reply": question,
+            "analysis": "The resolved environment was inspected, but no repository-proven Boolean control was uniquely selected after semantic resolution.",
+            "questions": [question],
+            "files": [],
+            "user_fillable": [],
+        }
+        LOGGER.warning(
+            "[TerrabotDiag] event=feature_flag_grounding_rescue_suppressed_broad_picker request=%s files=%s",
+            prompt[:160],
+            [path for path, _content in files],
+        )
+        return json.dumps(payload_out, ensure_ascii=False), None
+
     LOGGER.info(
         "TEAMS-RESCUE-2: grounding refusal detected, attempting rescue prompt=%r "
         "extraction_mode=%s files_recovered=%s",
@@ -29170,9 +29198,13 @@ def _teams_resolve_pending_rescue_selection(prompt: str, pending: dict) -> Optio
     kinds = {str(item.get("kind") or "") for item in selected}
 
     if kinds == {"parameter"}:
+        feature_intent = _teams_feature_flag_intent(original_prompt)
+        target_value = "true" if feature_intent == "enable" else "false"
         instruction = (
-            f'For the request "{original_prompt}": set the parameter(s) {identifiers} to `false` '
-            f"in `{file_path}`. Do not change any other parameter in that file."
+            f'Continue the ORIGINAL infrastructure request "{original_prompt}". The user selected '
+            f'parameter(s) {identifiers} in `{file_path}`. Set only the selected parameter(s) to '
+            f'`{target_value}` and preserve every other line unchanged. This is a resolved target-selection '
+            "continuation, not a new chat request."
         )
     elif kinds == {"list_entry"}:
         list_vars = {str(item.get("list_variable") or "") for item in selected}
@@ -33592,9 +33624,15 @@ def handle_teams_chat_request(data: dict):
                     prompt[:80], teams_conversation_id,
                 )
                 request_data["prompt"] = resolved_instruction
-                request_data["original_prompt"] = resolved_instruction
+                # Keep the user's original infrastructure intent separately so
+                # downstream state/validation never mistakes the numeric picker
+                # reply for a brand-new request. The executable prompt is the
+                # resolved instruction above.
+                request_data["original_prompt"] = str(pending_rescue.get("original_prompt") or resolved_instruction)
                 request_data["fresh_infra_generation"] = True
                 request_data["mode"] = "infra"
+                request_data["pending_target_selection_resolved"] = True
+                request_data["pending_target_selection_reply"] = True
                 pending_cloud = str(pending_rescue.get("cloud") or "").strip()
                 if pending_cloud:
                     request_data["cloud"] = pending_cloud
@@ -34671,47 +34709,154 @@ def _literal_module_boolean_index(main_tf_evidence: list[dict]) -> dict[tuple[st
     return index
 
 
+def _foundry_boolean_control_retry(
+    prompt: str,
+    main_tf_evidence: list[dict],
+    literal_index: dict[tuple[str, str, str], dict],
+) -> dict:
+    """Retry semantic resolution against a Boolean-only repository inventory.
+
+    The first classifier sees the complete live main.tf so Foundry can understand
+    module semantics. If it returns no usable control, this retry removes the
+    unrelated Terraform surface area (data blocks, subnet lists, backend values,
+    URLs, etc.) and asks Foundry to compare the user's phrase only against literal
+    Boolean module arguments that really exist in the same live file. Python does
+    not decide which Boolean means the user's phrase; it only supplies a validated
+    structural inventory.
+    """
+    inventory = [
+        {
+            "path": item[0],
+            "module": item[1],
+            "flag": item[2],
+            "current_value": value.get("current_value"),
+        }
+        for item, value in literal_index.items()
+    ]
+    if not inventory:
+        return {"applicable": False, "candidates": [], "reason": "No literal module Boolean controls exist in target main.tf."}
+
+    request = {
+        "task": (
+            "SECOND-PASS SEMANTIC BOOLEAN RESOLUTION. The complete target main.tf was already inspected, "
+            "but no usable Boolean control was returned. Resolve the user's colloquial resource phrase only "
+            "against the repository-proven Boolean controls listed below. Do not generate Terraform."
+        ),
+        "user_request": str(prompt or "").strip(),
+        "literal_boolean_controls": inventory,
+        "target_environment_files": [
+            {"path": str(item.get("path") or ""), "content": str(item.get("content") or "")}
+            for item in main_tf_evidence or []
+            if isinstance(item, dict)
+        ],
+        "required_output": {
+            "applicable": "boolean",
+            "reason": "short repository-grounded semantic explanation",
+            "candidates": [{
+                "path": "exact path from literal_boolean_controls",
+                "module": "exact module from literal_boolean_controls",
+                "flag": "exact flag from literal_boolean_controls",
+                "current_value": "true|false",
+                "new_value": "true|false",
+                "confidence": 0.0,
+                "description": "what this Boolean controls in repository terms",
+            }],
+        },
+        "rules": [
+            "Return JSON only with keys applicable, reason, candidates.",
+            "Choose only from literal_boolean_controls; never invent a path/module/flag.",
+            "Resolve aliases and colloquial wording semantically from module labels, flag names, comments, nearby settings, and the full target main.tf.",
+            "A phrase does not need to literally contain the flag name. For example, repository wording such as patch setup may semantically refer to a patch-monitoring control when the surrounding module evidence supports that relationship.",
+            "Ignore unrelated Boolean controls even though they are structurally valid Booleans.",
+            "Return only controls that actually implement the requested behavior and whose value must change.",
+            "If exactly one control is materially strongest, return only that control.",
+            "Return multiple candidates only when two or more controls are genuinely distinct interpretations of the requested resource phrase, not merely because they share words.",
+            "Use confidence from 0 to 1. Prefer no candidate over a weak semantic match.",
+        ],
+    }
+    try:
+        raw = call_named_agent(json.dumps(request, ensure_ascii=False), AGENT_NAME)
+        parsed = extract_json_from_text(raw)
+        return parsed if isinstance(parsed, dict) else {"applicable": False, "candidates": []}
+    except Exception as exc:
+        LOGGER.warning("Foundry Boolean-control second pass failed: %s", exc)
+        return {"applicable": False, "candidates": [], "error": str(exc)}
+
+
 def _validated_foundry_boolean_candidates(
     prompt: str,
     main_tf_evidence: list[dict],
 ) -> tuple[bool, list[dict], str]:
+    literal_index = _literal_module_boolean_index(main_tf_evidence)
     classification = _foundry_boolean_control_candidates(prompt, main_tf_evidence)
-    applicable = bool(classification.get("applicable"))
-    if not applicable:
+
+    def _validate(classification_payload: dict) -> list[dict]:
+        if not bool(classification_payload.get("applicable")):
+            return []
+        validated_items: list[dict] = []
+        seen: set[tuple[str, str, str]] = set()
+        for candidate in classification_payload.get("candidates") or []:
+            if not isinstance(candidate, dict):
+                continue
+            path = str(candidate.get("path") or "").strip().strip("/")
+            module_name = str(candidate.get("module") or "").strip()
+            flag = str(candidate.get("flag") or "").strip()
+            current = str(candidate.get("current_value") or "").strip().lower()
+            new_value = str(candidate.get("new_value") or "").strip().lower()
+            key = (path, module_name, flag)
+            literal = literal_index.get(key)
+            if not literal:
+                continue
+            if current not in {"true", "false"} or new_value not in {"true", "false"}:
+                continue
+            if current == new_value or literal.get("current_value") != current:
+                continue
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                confidence = float(candidate.get("confidence") or 0.0)
+            except (TypeError, ValueError):
+                confidence = 0.0
+            validated_items.append({
+                **literal,
+                "new_value": new_value,
+                "confidence": max(0.0, min(confidence, 1.0)),
+                "context": str(candidate.get("description") or "").strip()
+                or f'Controls the requested behavior in module "{module_name}".',
+                "description": str(candidate.get("description") or "").strip()
+                or f'Controls the requested behavior in module "{module_name}".',
+                "classification_reason": str(classification_payload.get("reason") or "").strip(),
+            })
+        return validated_items
+
+    validated = _validate(classification)
+    if not validated:
+        retry = _foundry_boolean_control_retry(prompt, main_tf_evidence, literal_index)
+        retry_validated = _validate(retry)
+        if retry_validated:
+            LOGGER.warning(
+                "[TerrabotDiag] event=boolean_control_second_pass_resolved candidates=%s request=%s",
+                len(retry_validated),
+                str(prompt or "")[:160],
+            )
+            classification = retry
+            validated = retry_validated
+
+    if not validated:
         return False, [], str(classification.get("reason") or "")
 
-    literal_index = _literal_module_boolean_index(main_tf_evidence)
-    validated: list[dict] = []
-    seen: set[tuple[str, str, str]] = set()
-    for candidate in classification.get("candidates") or []:
-        if not isinstance(candidate, dict):
-            continue
-        path = str(candidate.get("path") or "").strip().strip("/")
-        module_name = str(candidate.get("module") or "").strip()
-        flag = str(candidate.get("flag") or "").strip()
-        current = str(candidate.get("current_value") or "").strip().lower()
-        new_value = str(candidate.get("new_value") or "").strip().lower()
-        key = (path, module_name, flag)
-        literal = literal_index.get(key)
-        if not literal:
-            continue
-        if current not in {"true", "false"} or new_value not in {"true", "false"}:
-            continue
-        if current == new_value or literal.get("current_value") != current:
-            continue
-        if key in seen:
-            continue
-        seen.add(key)
-        validated.append({
-            **literal,
-            "new_value": new_value,
-            "context": str(candidate.get("description") or "").strip()
-            or f'Controls the requested behavior in module "{module_name}".',
-            "description": str(candidate.get("description") or "").strip()
-            or f'Controls the requested behavior in module "{module_name}".',
-            "classification_reason": str(classification.get("reason") or "").strip(),
-        })
-    return bool(validated), validated, str(classification.get("reason") or "")
+    # Foundry owns semantic ranking. If it returned confidence values and one
+    # result is materially stronger, do not make the user choose among weaker
+    # alternatives. Equal/near-equal distinct controls remain a real picker.
+    ranked = sorted(validated, key=lambda item: float(item.get("confidence") or 0.0), reverse=True)
+    if len(ranked) > 1:
+        top = float(ranked[0].get("confidence") or 0.0)
+        second = float(ranked[1].get("confidence") or 0.0)
+        if top >= 0.80 and top - second >= 0.15:
+            ranked = [ranked[0]]
+
+    return True, ranked, str(classification.get("reason") or "")
 
 
 def build_backend_existing_infra_modification_context(
