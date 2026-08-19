@@ -33886,7 +33886,7 @@ def _repository_context_completed_task_payload(
         "required_output": {
             "candidates": [
                 {
-                    "category": "architecture_decision | implementation_decision | coding_convention | repository_constraint | component_relationship | workflow_procedure | api_integration_behavior | resolved_clarification | repository_fact",
+                    "category": "repository_fact",
                     "subject": "stable repository concept",
                     "scope": "repository/module/component/environment/path",
                     "statement": "one durable repository-specific conclusion",
@@ -33904,6 +33904,7 @@ def _repository_context_completed_task_payload(
         },
         "rules": [
             "Return JSON only with exactly one top-level key: candidates.",
+            "For category, return exactly ONE of: architecture_decision, implementation_decision, coding_convention, repository_constraint, component_relationship, workflow_procedure, api_integration_behavior, resolved_clarification, repository_fact. Never copy the full allowed-category list into category.",
             "Do not store or summarize the conversation, user identity, request history, branch workflow state, PR metadata, or temporary task status.",
             "Persist only repository-specific knowledge useful for future tasks: architecture/implementation decisions, coding conventions, repository constraints, component relationships, workflows/procedures, API/integration behavior, resolved repository clarifications, or important repository facts.",
             "Every candidate must be supported by at least one exact repository excerpt from relevant_code at evidence_commit_sha. Do not use clarification text, model output, or existing context as sole evidence.",
@@ -33916,6 +33917,267 @@ def _repository_context_completed_task_payload(
     }
     return payload, owner, repo, branch, task_hash
 
+
+
+
+def _repository_context_allowed_category(candidate: dict) -> dict:
+    """Normalize one malformed extraction category without losing the record.
+
+    Some model responses copied the human-readable ``A | B | C`` schema text
+    verbatim into ``category``.  That is not a valid repository-context
+    category and caused otherwise useful evidence-backed records to be rejected.
+    ``repository_fact`` is the conservative fallback for that schema-copy error;
+    valid explicit categories are preserved unchanged.
+    """
+    item = dict(candidate or {})
+    allowed = {
+        "architecture_decision",
+        "implementation_decision",
+        "coding_convention",
+        "repository_constraint",
+        "component_relationship",
+        "workflow_procedure",
+        "api_integration_behavior",
+        "resolved_clarification",
+        "repository_fact",
+    }
+    category = str(item.get("category") or "").strip()
+    if category in allowed:
+        return item
+    if "|" in category:
+        item["category"] = "repository_fact"
+        LOGGER.warning(
+            "[TerrabotDiag] event=repository_context_category_schema_copy_normalized original=%s normalized=repository_fact",
+            category,
+        )
+    return item
+
+
+def _repository_context_vague_resource_phrase(prompt: str) -> str:
+    """Extract the reusable resource phrase from a plain-language change request."""
+    text = re.sub(r"\s+", " ", str(prompt or "").strip().lower())
+    if not text:
+        return ""
+    text = re.sub(r"^(?:please\s+)?(?:can|could|would)\s+you\s+", "", text)
+    text = re.sub(
+        r"^(?:please\s+)?(?:enable|disable|create|add|remove|delete|turn\s+on|turn\s+off|stop|start|set|update|modify|change)\s+",
+        "",
+        text,
+    )
+    # Remove a trailing environment qualifier while preserving the resource phrase.
+    env_names = sorted(
+        set(TEAMS_AWS_ENVIRONMENT_HINTS) | set(TEAMS_AZURE_ENVIRONMENT_HINTS),
+        key=len,
+        reverse=True,
+    )
+    for env in env_names:
+        env_re = re.escape(str(env).lower()).replace(r"\_", r"[_ -]")
+        text = re.sub(rf"\s+(?:in|on|for)\s+{env_re}\s*$", "", text)
+    text = re.sub(r"\s+(?:in|on|for)\s+terraform/[a-z0-9_./-]+\s*$", "", text)
+    return text.strip(" .,:;!?`'\"")
+
+
+def _repository_context_term_tokens(value: str) -> set[str]:
+    stop = {"setup", "service", "resource", "feature", "module", "the", "a", "an"}
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", str(value or "").lower().replace("_", " ").replace("-", " "))
+        if len(token) >= 3 and token not in stop
+    }
+
+
+def _repository_context_boolean_changes(compare: dict, changed_paths: set[str]) -> list[dict]:
+    """Return literal Boolean assignment changes from the current changed files."""
+    results: list[dict] = []
+    for file_info in compare.get("files") or []:
+        if not isinstance(file_info, dict):
+            continue
+        path = str(file_info.get("filename") or "").strip()
+        if changed_paths and path not in changed_paths:
+            continue
+        patch = str(file_info.get("patch") or "")
+        removed: dict[str, list[str]] = {}
+        added: dict[str, list[str]] = {}
+        for line in patch.splitlines():
+            if line.startswith("---") or line.startswith("+++"):
+                continue
+            match = re.match(r"^[+-]\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(true|false)\b", line, re.IGNORECASE)
+            if not match:
+                continue
+            name, value = match.group(1), match.group(2).lower()
+            target = removed if line.startswith("-") else added
+            target.setdefault(name, []).append(value)
+        for name in sorted(set(removed) & set(added)):
+            before_values = removed[name]
+            after_values = added[name]
+            changed_count = sum(1 for before, after in zip(before_values, after_values) if before != after)
+            if changed_count <= 0:
+                continue
+            results.append({
+                "path": path,
+                "flag": name,
+                "before": before_values[0],
+                "after": after_values[0],
+                "changed_occurrences": changed_count,
+            })
+    return results
+
+
+def _repository_context_flag_modules(content: str, flag_name: str) -> list[dict]:
+    """Resolve the module block(s) that contain one literal Boolean flag."""
+    matches: list[dict] = []
+    assignment_re = re.compile(
+        rf"(?m)^\s*{re.escape(flag_name)}\s*=\s*(true|false)\b",
+        re.IGNORECASE,
+    )
+    for block in _extract_top_level_tf_blocks(content or ""):
+        header = str(block.get("header") or "").strip()
+        module_match = re.fullmatch(r'module\s+"([^"]+)"', header)
+        if not module_match:
+            continue
+        block_text = str(block.get("block") or "")
+        assignment = assignment_re.search(block_text)
+        if not assignment:
+            continue
+        # Full module text is exact repository evidence and proves containment.
+        excerpt = block_text.strip()
+        if len(excerpt) > 12000:
+            # Preserve exact substrings when a very large module block is encountered.
+            header_line = block_text.splitlines()[0].strip() if block_text.splitlines() else header
+            flag_line = assignment.group(0).strip()
+            evidence = [header_line, flag_line]
+        else:
+            evidence = [excerpt]
+        matches.append({
+            "module": module_match.group(1),
+            "value": assignment.group(1).lower(),
+            "evidence": evidence,
+        })
+    return matches
+
+
+def _store_vague_request_control_relationships(
+    payload: dict,
+    owner: str,
+    repo: str,
+    branch: str,
+    task_hash: str,
+) -> dict:
+    """Store vague user phrase -> concrete flag/module/file relationships.
+
+    This is deterministic post-change extraction.  It uses the actual Git diff
+    and committed Terraform, so a request such as ``disable patch setup on us1``
+    can become durable context stating that ``patch setup`` is controlled by
+    ``enable_patch_monitoring`` in the concrete patch-management module(s).
+    """
+    prompt = str(payload.get("user_request") or "").strip()
+    phrase = _repository_context_vague_resource_phrase(prompt)
+    commit_sha = str(payload.get("evidence_commit_sha") or "").strip()
+    compare = ((payload.get("tool_results") or {}).get("git_compare") or {})
+    changed_paths = {
+        str(path or "").strip()
+        for path in ((payload.get("tool_results") or {}).get("committed_files") or [])
+        if str(path or "").strip()
+    }
+    if not phrase or not commit_sha:
+        return {"ok": True, "stored": 0, "skipped": "missing_phrase_or_commit"}
+
+    phrase_tokens = _repository_context_term_tokens(phrase)
+    grouped: dict[tuple[str, str], list[dict]] = {}
+    for change in _repository_context_boolean_changes(compare, changed_paths):
+        path = change["path"]
+        flag = change["flag"]
+        try:
+            content = github_get_file_content_by_repo(owner, repo, path, ref=commit_sha)
+        except Exception:
+            content = None
+        if not content:
+            continue
+        modules = _repository_context_flag_modules(content, flag)
+        if not modules:
+            continue
+        changed_occurrences = int(change.get("changed_occurrences") or 1)
+        if len(modules) > changed_occurrences:
+            # The compare proves fewer occurrences changed than currently exist.
+            # Without hunk-to-module certainty, do not overstate which sibling
+            # modules the user's vague phrase controls. Generic extraction can
+            # still store narrower facts if Foundry can prove them from evidence.
+            continue
+        relation_tokens = _repository_context_term_tokens(flag)
+        for module in modules:
+            relation_tokens |= _repository_context_term_tokens(module.get("module") or "")
+        # A vague relationship must still have a semantic bridge to the changed
+        # repository control; this avoids storing unrelated Boolean changes from
+        # an older cumulative branch diff.
+        if phrase_tokens and not (phrase_tokens & relation_tokens):
+            continue
+        grouped.setdefault((path, flag), []).extend(modules)
+
+    stored = 0
+    rejected = 0
+    for (path, flag), modules in grouped.items():
+        module_names = list(dict.fromkeys(str(item.get("module") or "") for item in modules if item.get("module")))
+        # If the user already named both the exact flag and module, this is not a
+        # useful alias/clarification to store.
+        prompt_lower = prompt.lower()
+        if flag.lower() in prompt_lower and module_names and all(name.lower() in prompt_lower for name in module_names):
+            continue
+        evidence: list[dict] = []
+        seen_excerpt: set[str] = set()
+        for item in modules:
+            for excerpt in item.get("evidence") or []:
+                exact = str(excerpt or "").strip()
+                if not exact or exact in seen_excerpt:
+                    continue
+                seen_excerpt.add(exact)
+                evidence.append({
+                    "path": path,
+                    "excerpt": exact,
+                    "reason": f'Live Terraform shows {flag} inside module "{item.get("module")}".',
+                })
+        if not evidence:
+            continue
+        module_text = ", ".join(f'`{name}`' for name in module_names)
+        candidate = {
+            "category": "resolved_clarification",
+            "subject": phrase,
+            "scope": path,
+            "statement": (
+                f'In `{path}`, the user-facing repository phrase "{phrase}" is controlled by '
+                f'`{flag}` in module(s) {module_text}.'
+            ),
+            "confidence": 0.98,
+            "evidence": evidence,
+            "validation_summary": (
+                "The completed code change changed this Boolean control in the enclosing live Terraform "
+                "module block(s), making the vague request-to-control relationship reusable for future tasks."
+            ),
+        }
+        try:
+            result = add_repository_context(
+                owner,
+                repo,
+                commit_sha,
+                candidate,
+                evidence_branch=branch,
+                source_task_hash=f"{task_hash}:control:{hashlib.sha1((path + flag + phrase).encode('utf-8')).hexdigest()}",
+            )
+        except Exception as exc:
+            result = {"stored": False, "errors": [str(exc)]}
+        if result.get("stored"):
+            stored += 1
+        else:
+            rejected += 1
+            LOGGER.warning(
+                "[TerrabotDiag] event=repository_context_control_relationship_rejected repo=%s/%s phrase=%s flag=%s modules=%s errors=%s",
+                owner, repo, phrase, flag, module_names, result.get("errors") or [],
+            )
+
+    LOGGER.warning(
+        "[TerrabotDiag] event=repository_context_control_relationship_completed repo=%s/%s phrase=%s stored=%s rejected=%s",
+        owner, repo, phrase, stored, rejected,
+    )
+    return {"ok": True, "stored": stored, "rejected": rejected}
 
 def _extract_and_store_repository_context_after_commit(
     agent_result: dict,
@@ -33945,6 +34207,13 @@ def _extract_and_store_repository_context_after_commit(
         branch,
         task_hash[:12],
     )
+
+    # First persist any deterministic vague-request -> Boolean/module/file
+    # relationship proved by the actual committed diff. Generic extraction below
+    # can still add broader architecture/convention knowledge.
+    relationship_result = _store_vague_request_control_relationships(
+        payload, owner, repo, branch, task_hash
+    )
     try:
         extraction_text = call_named_agent(
             json.dumps(payload, ensure_ascii=False),
@@ -33960,11 +34229,12 @@ def _extract_and_store_repository_context_after_commit(
         )
         return {"ok": False, "stored": 0, "error": str(exc)}
 
-    stored = 0
-    rejected = 0
+    stored = int(relationship_result.get("stored") or 0)
+    rejected = int(relationship_result.get("rejected") or 0)
     actions: list[dict] = []
     commit_sha = str(payload.get("evidence_commit_sha") or "")
     for candidate in candidates[:12]:
+        candidate = _repository_context_allowed_category(candidate)
         try:
             result = add_repository_context(
                 owner,

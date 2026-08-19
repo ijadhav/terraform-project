@@ -4713,7 +4713,7 @@ For this extraction call return JSON only:
 {
   "candidates": [
     {
-      "category": "architecture_decision | implementation_decision | coding_convention | repository_constraint | component_relationship | workflow_procedure | api_integration_behavior | resolved_clarification | repository_fact",
+      "category": "repository_fact",
       "subject": "stable repository concept",
       "scope": "repository/module/component/environment/path",
       "statement": "one durable repository-specific conclusion",
@@ -4731,6 +4731,10 @@ For this extraction call return JSON only:
 }
 
 Extraction rules are hard:
+
+- `category` must be exactly ONE allowed value: `architecture_decision`, `implementation_decision`, `coding_convention`, `repository_constraint`, `component_relationship`, `workflow_procedure`, `api_integration_behavior`, `resolved_clarification`, or `repository_fact`. Never return the entire allowed-category list as the value.
+- When a vague/colloquial user phrase led to a concrete repository change, preserve the durable semantic relationship when the committed diff proves it. Example shape: `"patch setup" -> enable_patch_monitoring -> module "patch_management" -> terraform/prod_aws/us1/main.tf`. Store the reusable phrase/control/module/file relationship, not the one-off action (`disable on us1`).
+- If the same controlling Boolean is changed in multiple relevant module blocks for the vague request, represent all repository-proven controlling modules in the relationship instead of emitting unrelated per-module facts.
 
 - Do NOT return Terraform files, ordinary chat, plans, or the normal generation
   envelope for this extraction task.
