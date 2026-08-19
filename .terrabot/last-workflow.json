@@ -1,0 +1,117 @@
+{
+  "evidence": [
+    {
+      "end_line": 18,
+      "kind": "documentation",
+      "path": "docs/repo_aware_cli.md",
+      "reason": "content mentions resource type storage_account",
+      "score": 5.6,
+      "snippet": "A developer opens an infra repository and asks:\n\n```text\n@terrabot add a private storage account for analytics in npr\n```\n\nTerrabot now has local building blocks to:\n\n1. scan the current workspace,\n2. detect Terraform, providers, cloud, tfvars layout, and pipelines,\n3. infer the infrastructure workflow from repo evidence,\n4. retrieve similar local examples,",
+      "start_line": 7
+    },
+    {
+      "end_line": 7,
+      "kind": "file",
+      "path": ".terrabot/policy.json",
+      "reason": "content mentions resource type storage_account; repo policy/convention file",
+      "score": 4.1,
+      "snippet": "{\n  \"rules\": [\n    \"Terrabot must use retrieved repository evidence as the source of truth for file placement and style.\",\n    \"Terrabot must ask for missing environment, subscription, subnet, secret, account, tenant, and object IDs instead of inventing them.\",\n    \"Generated infrastructure changes must preserve private networking defaults unless an approved exception is provided.\"\n  ]\n}",
+      "start_line": 1
+    },
+    {
+      "end_line": 46,
+      "kind": "documentation",
+      "path": ".venv-1/lib/python3.9/site-packages/openai/resources/responses/api.md",
+      "reason": "keyword match",
+      "score": 1.2,
+      "snippet": "    ResponseCodeInterpreterCallCodeDeltaEvent,\n    ResponseCodeInterpreterCallCodeDoneEvent,\n    ResponseCodeInterpreterCallCompletedEvent,\n    ResponseCodeInterpreterCallInProgressEvent,\n    ResponseCodeInterpreterCallInterpretingEvent,\n    ResponseCodeInterpreterToolCall,\n    ResponseCompactionItem,\n    ResponseCompactionItemParam,\n    ResponseCompletedEvent,\n    ResponseComputerToolCall,\n    ResponseComputerToolCallOutputItem,\n    ResponseComputerToolCallOutputScreenshot,",
+      "start_line": 35
+    },
+    {
+      "end_line": 44,
+      "kind": "documentation",
+      "path": ".venv-1/lib/python3.9/site-packages/openai/resources/realtime/api.md",
+      "reason": "keyword match",
+      "score": 1.2,
+      "snippet": "    LogProbProperties,\n    McpListToolsCompleted,\n    McpListToolsFailed,\n    McpListToolsInProgress,\n    NoiseReductionType,\n    OutputAudioBufferClearEvent,\n    RateLimitsUpdatedEvent,\n    RealtimeAudioConfig,\n    RealtimeAudioConfigInput,\n    RealtimeAudioConfigOutput,\n    RealtimeAudioFormats,\n    RealtimeAudioInputTurnDetection,",
+      "start_line": 33
+    }
+  ],
+  "policy": {
+    "allowed": true,
+    "blocking_issues": [],
+    "rules_applied": [
+      "Use repository context for style, placement, module sources, variable shape, and tfvars layout.",
+      "Use company policy for mandatory controls when repo examples are weaker than policy.",
+      "Do not invent secrets, tenant IDs, subscription IDs, account IDs, ARNs, object IDs, connection strings, subnet IDs, or private endpoint IDs.",
+      "Do not create public network exposure unless the user explicitly asks and policy allows it.",
+      "For storage resources, default to encryption, private access, public nested items disabled, and shared access keys disabled where the module supports it.",
+      "Preserve existing Terraform formatting and avoid unrelated file changes.",
+      "Generated files must cite source paths used from retrieved evidence.",
+      "Terrabot must use retrieved repository evidence as the source of truth for file placement and style.",
+      "Terrabot must ask for missing environment, subscription, subnet, secret, account, tenant, and object IDs instead of inventing them.",
+      "Generated infrastructure changes must preserve private networking defaults unless an approved exception is provided."
+    ],
+    "source_files": [
+      ".terrabot/policy.json"
+    ],
+    "warnings": [
+      "Storage account changes must preserve private access, encryption, non-public containers, and existing module conventions.",
+      "Azure PaaS resources should use private networking/private endpoints unless the request includes an approved exception.",
+      "Workflow inference has unresolved questions; Terrabot should ask those before generating a patch."
+    ]
+  },
+  "repo_profile": {
+    "clouds": [],
+    "data_sources": [],
+    "environments": [],
+    "file_count": 68,
+    "iac_tools": [],
+    "languages": [
+      "json",
+      "powershell",
+      "markdown",
+      "shell"
+    ],
+    "modules": [],
+    "pipeline_files": [],
+    "pipeline_systems": [],
+    "pipelines": [],
+    "policy_files": [
+      ".terrabot/policy.json",
+      ".terrabot/last-workflow.json"
+    ],
+    "providers": [],
+    "repo_conventions": {
+      "module_source_hosts": [],
+      "pipeline_var_files": [],
+      "resource_types_seen": [],
+      "terraform_versions": [],
+      "tfvars_patterns": []
+    },
+    "repo_name": "TerraVS",
+    "resources": [],
+    "root": "/Users/ijadhav/Downloads/TerraVS",
+    "terraform_roots": [],
+    "tfvars_files": [],
+    "validation_commands": [],
+    "variables": []
+  },
+  "workflow_profile": {
+    "apply_strategy": "review_patch_then_apply",
+    "clarification_reason": "no Terraform files were detected in the workspace",
+    "cloud": "azure",
+    "confidence": 0.15,
+    "evidence": [],
+    "needs_clarification": true,
+    "questions": [
+      "No Terraform files were detected. Which IaC tool should Terrabot use?"
+    ],
+    "resource_type": "storage_account",
+    "target_environment": "npr",
+    "target_files": [],
+    "validation_commands": [],
+    "value_files": [],
+    "workflow_type": "unknown_infra_workflow"
+  }
+}

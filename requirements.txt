@@ -1,0 +1,19 @@
+# Uncomment to enable Azure Monitor OpenTelemetry
+# Ref: aka.ms/functions-azure-monitor-python 
+# azure-monitor-opentelemetry 
+azure-monitor-opentelemetry 
+azure-functions
+python-dotenv
+azure-identity
+azure-ai-projects
+azure-ai-agents
+requests
+azure-keyvault-secrets
+botbuilder-core
+botbuilder-schema
+botbuilder-integration-aiohttp
+azure-data-tables>=12.5.0,<13.0.0
+PyJWT[crypto]>=2.8,<3
+httpx>=0.27.0,<1.0.0
+azure-search-documents>=11.6.0,<12.0.0
+openai>=1.0.0,<3.0.0

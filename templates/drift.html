@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Terrabot - Terraform Drift Detection</title>
+  <link rel="stylesheet" href="/static/css/terrabot.css?v=vena-drift-cleanup-v1" />
+</head>
+
+<script>
+  document.addEventListener("pointermove", function (event) {
+    document.body.style.setProperty("--cursor-x", event.clientX + "px");
+    document.body.style.setProperty("--cursor-y", event.clientY + "px");
+  });
+</script>
+
+<body data-page="drift">
+  <div class="page">
+    <header class="navbar">
+      <div class="brand">
+        <div class="logo">
+          <img src="static/images.svg" alt="Vena Solutions" />
+          
+        </div>
+        <div class="brand-text">Vena Solutions</div>
+      </div>
+
+      <nav class="mode-toggle" data-mode-toggle data-active-mode="drift" aria-label="Terrabot mode switch">
+        <span class="mode-toggle__thumb" aria-hidden="true"></span>
+        <a class="mode-toggle__option" href="/index" data-mode="infrastructure">Infrastructure</a>
+        <a class="mode-toggle__option active" href="/drift" data-mode="drift" aria-current="page">Drift Detection</a>
+      </nav>
+      <div class="auth-area">
+        <span id="authUser">Checking login...</span>
+
+        <button id="logoutButton" type="button">
+          Logout
+        </button>
+      </div>
+    </header>
+
+    <main class="hero">
+      <div class="drift-shell">
+        <section class="drift-header-card">
+          <div>
+            <div class="page-eyebrow">Terraform Drift</div>
+            <h1>Drift detection dashboard</h1>
+            <p>
+              View AWS and Azure commit drift with NPR, PRD, main, severity, Jira status, responsible user, and fix guidance.
+            </p>
+            <div class="drift-header-actions">
+              <button id="refreshDriftButton" class="primary-action-btn" type="button">Refresh Results</button>
+              <a class="secondary-action-btn" href="/index">Back to Infrastructure</a>
+            </div>
+            <p id="driftStatusLine" class="drift-footnote">Loading drift view...</p>
+          </div>
+
+          <div class="summary-grid" aria-label="Drift summary">
+            <div class="summary-card">
+              <div class="summary-card-label">Total checks</div>
+              <div id="summaryTotal" class="summary-card-value">0</div>
+              <div class="summary-card-note">AWS and Azure</div>
+            </div>
+            <div class="summary-card">
+              <div class="summary-card-label">Drift found</div>
+              <div id="summaryDrift" class="summary-card-value">0</div>
+              <div class="summary-card-note">Needs review</div>
+            </div>
+            <div class="summary-card">
+              <div class="summary-card-label">Clean</div>
+              <div id="summaryClean" class="summary-card-value">0</div>
+              <div class="summary-card-note">Aligned</div>
+            </div>
+            <div class="summary-card">
+              <div class="summary-card-label">Critical alerts</div>
+              <div id="summaryCritical" class="summary-card-value">0</div>
+              <div class="summary-card-note">Prod risk / errors</div>
+            </div>
+            
+          </div>
+        </section>
+
+        <section id="driftAlertPanel" class="drift-alert-panel" aria-live="polite" aria-label="Critical drift alerts">
+          <div class="alert-panel-header">
+            <div>
+              <h2>Drift alerts</h2>
+              <p>Critical backend GitHub commit mismatches and GitHub check errors will be highlighted here.</p>
+            </div>
+            <span id="driftAlertCount" class="pill">0 active</span>
+          </div>
+          <div id="driftAlertList" class="alert-list"></div>
+        </section>
+
+        <section class="drift-workspace-grid" aria-label="Drift workspace">
+          <div class="drift-main-column">
+            <section class="drift-provider-tabs" aria-labelledby="providerTabsTitle">
+              <div class="provider-tabs-header">
+                <div>
+                  <h2 id="providerTabsTitle">Cloud drift</h2>
+                  <p>Switch between AWS and Azure commit drift views.</p>
+                </div>
+                <div class="provider-tab-list" role="tablist" aria-label="Cloud provider drift tabs">
+                  <button id="awsDriftTab" class="provider-tab active" type="button" role="tab" aria-selected="true" aria-controls="awsDriftPanel" data-provider-tab="aws">AWS</button>
+                  <button id="azureDriftTab" class="provider-tab" type="button" role="tab" aria-selected="false" aria-controls="azureDriftPanel" data-provider-tab="azure">Azure</button>
+                </div>
+              </div>
+
+              <article id="awsDriftPanel" class="drift-provider-card provider-tab-panel active" role="tabpanel" aria-labelledby="awsDriftTab" data-provider-panel="aws">
+                <div class="provider-header">
+                  <div class="provider-title-row">
+                    <div class="provider-icon" aria-hidden="true">AWS</div>
+                    <div>
+                      <h3 id="awsDriftTitle">AWS drift</h3>
+                      <p>tf-devops NPR and PRD Terraform paths compared from GitHub on main.</p>
+                    </div>
+                  </div>
+                  <span id="awsProviderStatus" class="status-chip waiting">Waiting</span>
+                </div>
+                <div class="provider-body">
+                  <div class="provider-meta">
+                    <div class="meta-item">
+                      <span class="meta-label">Repo</span>
+                      <span class="meta-value">tf-devops</span>
+                    </div>
+                    <div class="meta-item">
+                      <span class="meta-label">Baseline</span>
+                      <span class="meta-value">main</span>
+                    </div>
+                    <div class="meta-item">
+                      <span class="meta-label">Scope</span>
+                      <span id="awsScopeCount" class="meta-value">0 envs</span>
+                    </div>
+                  </div>
+                  <div id="awsDriftList" class="env-list"></div>
+                </div>
+              </article>
+
+              <article id="azureDriftPanel" class="drift-provider-card provider-tab-panel" role="tabpanel" aria-labelledby="azureDriftTab" data-provider-panel="azure" hidden>
+                <div class="provider-header">
+                  <div class="provider-title-row">
+                    <div class="provider-icon" aria-hidden="true">AZ</div>
+                    <div>
+                      <h3 id="azureDriftTitle">Azure drift</h3>
+                      <p>tf-azure-hub NPR and PRD Terraform paths compared from GitHub on main.</p>
+                    </div>
+                  </div>
+                  <span id="azureProviderStatus" class="status-chip waiting">Waiting</span>
+                </div>
+                <div class="provider-body">
+                  <div class="provider-meta">
+                    <div class="meta-item">
+                      <span class="meta-label">Repo</span>
+                      <span class="meta-value">tf-azure-hub</span>
+                    </div>
+                    <div class="meta-item">
+                      <span class="meta-label">Baseline</span>
+                      <span class="meta-value">main</span>
+                    </div>
+                    <div class="meta-item">
+                      <span class="meta-label">Scope</span>
+                      <span id="azureScopeCount" class="meta-value">0 envs</span>
+                    </div>
+                  </div>
+                  <div id="azureDriftList" class="env-list"></div>
+                </div>
+              </article>
+            </section>
+
+            <section class="drift-activity-panel" aria-labelledby="activityTitle">
+              <div class="activity-header">
+                <div>
+                  <h2 id="activityTitle">Recent drift activity</h2>
+                  <p>Latest backend GitHub commit drift checks appear here after auto-refresh or manual refresh.</p>
+                </div>
+                <span id="activityUpdatedAt" class="pill">Not checked yet</span>
+              </div>
+              <div id="activityList" class="activity-list"></div>
+              <p class="drift-footnote">
+                This version does not use pipelines or Foundry. The backend reads GitHub commit history for configured NPR/PRD Terraform paths and returns drift, commit, PR, Jira status, and user attribution directly.
+              </p>
+            </section>
+          </div>
+
+
+        </section>
+      </div>
+    </main>
+  </div>
+
+  <script src="/static/js/mode-switch.js" defer></script>
+  <script src="/static/js/drift.js?v=jira-ticket-fix-v6" defer></script>
+</body>
+</html>

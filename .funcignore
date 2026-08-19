@@ -1,0 +1,14 @@
+.venv/
+.python_packages/
+__pycache__/
+*.pyc
+.git/
+.vscode/
+node_modules/
+vscode-terrabot/node_modules/
+vscode-terrabot/*.vsix
+__MACOSX/
+.DS_Store
+*.zip
+local.settings.json
+tests/

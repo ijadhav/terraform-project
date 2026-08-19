@@ -1,0 +1,12 @@
+PWD: /Users/ijadhav/Downloads/TerraVS/vscode-terrabot
+
+Checking compiled extension:
+total 32
+drwxr-xr-x@  4 ijadhav  staff   128 Jun 19 14:41 .
+drwxr-xr-x@ 10 ijadhav  staff   320 Jun 19 14:42 ..
+-rw-r--r--@  1 ijadhav  staff  6091 Jun 19 14:41 extension.js
+-rw-r--r--@  1 ijadhav  staff  4654 Jun 19 14:41 extension.js.map
+
+Checking package files:
+-rw-r--r--@ 1 ijadhav  staff  1849 Jun 19 14:41 package-lock.json
+-rw-r--r--@ 1 ijadhav  staff  2192 Jun 16 07:08 package.json

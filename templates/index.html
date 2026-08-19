@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <link rel="preload" href="/static/background.jpg" as="image" />
+  <title>Terrabot - AI-Powered Terraform chatbot</title>
+  <link rel="stylesheet" href="/static/css/terrabot.css" />
+</head>
+<body data-page="infrastructure">
+  <div class="page">
+   <header class="navbar">
+      <div class="brand">
+        <div class="logo">
+           <img src="/static/images.svg" alt="Vena Solutions Logo" />
+        </div>
+      <div class="brand-text">Vena Solutions</div>
+      </div>
+
+      <nav class="mode-toggle" data-mode-toggle data-active-mode="infrastructure" aria-label="Terrabot mode switch">
+        <span class="mode-toggle__thumb" aria-hidden="true"></span>
+        <a class="mode-toggle__option active" href="/index" data-mode="infrastructure" aria-current="page">Infrastructure</a>
+        <a class="mode-toggle__option" href="/drift" data-mode="drift">Drift Detection</a>
+      </nav>
+
+      <div class="auth-area">
+      <span id="authUser">Checking login...</span>
+
+      <button id="logoutButton" type="button">
+       Logout
+      </button>
+     </div>
+    </header>
+
+    <main class="hero">
+      <div class="app-shell">
+        <aside class="sidebar">
+          <div class="sidebar-title">Tickets</div>
+
+          <div class="sidebar-actions">
+            <input
+              id="ticketSearchInput"
+              type="text"
+              placeholder="Search tickets..."
+              autocomplete="off"
+            />
+            <button id="newTicketButton" class="new-ticket-btn" type="button">Create New Ticket</button>
+          </div>
+
+          <div id="ticketList" class="ticket-list"></div>
+        </aside>
+
+        <section class="chat-wrapper">
+          <div class="chat-header">
+            <h1>Terrabot - AI-Powered Terraform chatbot</h1>
+            <p>Your AI Assistant for infrastructure needs!</p>
+
+            <div class="thread-row">
+              <div id="threadBadge" class="thread-badge">Current thread: New</div>
+              <div id="threadLinkBadge" class="thread-link-badge" style="display:none;"></div>
+            </div>
+
+            <div id="prStatusPanel" class="pr-status-panel"></div>
+          </div>
+
+          <div class="ticket-link-banner" id="ticketLinkBanner">
+            <div class="ticket-link-banner-text">
+              Hey developer! Paste a ticket link to start a thread.
+            </div>
+
+            <div class="ticket-link-row">
+              <input
+                id="jiraTicketInput"
+                type="text"
+                placeholder="Enter ticket link (example: https://your-jira/browse/STO-1234)"
+                autocomplete="off"
+              />
+              <button id="saveJiraButton" class="ticket-link-btn" type="button">Save Ticket</button>
+            </div>
+
+            <div id="jiraStatusText" class="ticket-status"></div>
+          </div>
+
+          <div class="chat-box" id="chatBox">
+            <div class="message bot">Hello 👋! I'm Terrabot. How can I help you today?</div>
+          </div>
+
+          <div class="chat-input-area">
+            <div class="input-row">
+              <input id="promptInput" type="text" placeholder="Type your prompt here..." />
+              <button id="sendButton" type="button">Send</button>
+            </div>
+
+            <div id="commitConfirmBox" class="commit-box">
+              <div id="commitConfirmText" class="commit-text">
+                Terraform changes are ready. Do you want to commit these changes to the PR?
+              </div>
+              <div class="commit-actions">
+                <button id="commitYesButton" type="button" class="ticket-action-btn">Yes, Commit</button>
+                <button id="commitNoButton" type="button" class="ticket-action-btn">No, Do Not Commit</button>
+              </div>
+            </div>
+
+            <div class="status" id="statusText"></div>
+          </div>
+        </section>
+      </div>
+    </main>
+  </div>
+
+  <script src="/static/js/mode-switch.js" defer></script>
+  <script src="/static/js/infrastructure.js" defer></script>
+</body>
+</html>
