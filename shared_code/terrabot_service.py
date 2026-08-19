@@ -35448,6 +35448,54 @@ def _teams_merge_repository_evidence(primary: list[dict], extra: list[dict]) -> 
     return result
 
 
+def _teams_rehydrate_repository_evidence_full_contents(
+    evidence: list[dict],
+    cloud: str,
+    repo_target: str,
+    workflow: str,
+    branch: str,
+) -> list[dict]:
+    """Refresh Terraform evidence from live GitHub without snippet truncation.
+
+    Environment discovery intentionally bounds snippets for general Foundry
+    context. Boolean targeting cannot use those bounded snippets as its literal
+    inventory, because a valid flag can appear after the per-file character
+    cutoff (large hub/tier tfvars files are a common example). Re-read only the
+    already-discovered Terraform paths from the same resolved branch. This is
+    repository retrieval, not semantic selection or Terraform generation.
+    """
+    result: list[dict] = []
+    for item in evidence or []:
+        if not isinstance(item, dict):
+            continue
+        refreshed = dict(item)
+        path = _teams_context_file_identity(refreshed)
+        if not path or not path.endswith((".tf", ".tfvars")):
+            result.append(refreshed)
+            continue
+        try:
+            live_content = github_get_file_content(
+                cloud,
+                path,
+                branch,
+                repo_target=repo_target,
+                workflow=workflow,
+            )
+        except Exception as exc:
+            LOGGER.debug(
+                "Full Teams repository evidence refresh failed path=%s branch=%s: %s",
+                path,
+                branch,
+                exc,
+            )
+            live_content = None
+        if live_content is not None:
+            refreshed["content"] = live_content
+            refreshed["full_live_content"] = True
+        result.append(refreshed)
+    return result
+
+
 def build_backend_existing_infra_modification_context(
     prompt: str,
     thread_id: str,
@@ -36081,6 +36129,19 @@ def build_backend_existing_infra_modification_context(
     )
     if not evidence:
         return context
+
+    # Critical: environment discovery stores bounded snippets (20k chars per
+    # file). A Boolean near the end of a large hub.tfvars/tier.tfvars therefore
+    # did not enter literal_boolean_inventory and Foundry was incorrectly told
+    # there was no repository-proven control. Rehydrate the already-resolved
+    # Terraform evidence from the same live branch before Boolean inventory and
+    # semantic classification.
+    try:
+        evidence = _teams_rehydrate_repository_evidence_full_contents(
+            evidence, normalized_cloud, repo_target, workflow, branch
+        )
+    except Exception as exc:
+        LOGGER.debug("Full Teams repository evidence rehydration skipped: %s", exc)
 
     strategy, candidates = _validated_repository_boolean_strategy(prompt, evidence)
     context["repository_change_strategy"] = {
