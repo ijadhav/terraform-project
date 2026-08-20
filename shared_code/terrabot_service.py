@@ -37120,3 +37120,387 @@ def _validate_agent_full_file_preservation_for_write(
         path,
         workflow,
     )
+
+# =============================================================================
+# 2026-08-20 FINAL FOLLOW-UP + SEMANTIC FLAG RELEVANCE OVERRIDE
+# =============================================================================
+# Goals:
+#   1. Keep a Foundry blocking clarification attached to the same infrastructure
+#      request so a compact user answer ("2", a flag name, etc.) resumes generation.
+#   2. Before a Boolean picker is shown, make Foundry adjudicate the already
+#      repository-validated Boolean candidates and retain only genuinely relevant
+#      controls. No resource/flag vocabulary is encoded in Python.
+#   3. Leave the existing backend-validation self-correction / repair_edits loop
+#      untouched. These overrides only affect semantic candidate selection and
+#      multi-turn continuation state.
+
+_RELEVANCE_PREVIOUS_VALIDATED_REPOSITORY_BOOLEAN_STRATEGY = _validated_repository_boolean_strategy
+_RELEVANCE_PREVIOUS_PENDING_MAPPINGS = _teams_pending_state_mappings
+_RELEVANCE_PREVIOUS_HANDLE_TEAMS_CHAT_REQUEST = handle_teams_chat_request
+
+PENDING_AGENT_INFRA_CLARIFICATIONS: Dict[str, Dict[str, Any]] = {}
+
+
+def _teams_pending_state_mappings() -> dict[str, dict]:
+    """Include generic Foundry infrastructure clarification state in durable state."""
+    mappings = dict(_RELEVANCE_PREVIOUS_PENDING_MAPPINGS())
+    mappings["pending_agent_infra_clarifications"] = PENDING_AGENT_INFRA_CLARIFICATIONS
+    return mappings
+
+
+def _agent_infra_clarification_key(thread_id: str) -> str:
+    thread = str(thread_id or "").strip()
+    return hashlib.sha1(f"agent-infra-clarification::{thread}".encode("utf-8")).hexdigest()
+
+
+def _store_pending_agent_infra_clarification(
+    thread_id: str,
+    original_prompt: str,
+    cloud: str = "",
+    workflow: str = "",
+    repo_target: str = "",
+    question: str = "",
+) -> None:
+    thread = str(thread_id or "").strip()
+    if not thread:
+        return
+    PENDING_AGENT_INFRA_CLARIFICATIONS[_agent_infra_clarification_key(thread)] = {
+        "thread_id": thread,
+        "original_prompt": str(original_prompt or "").strip(),
+        "cloud": str(cloud or "").strip(),
+        "workflow": str(workflow or "").strip(),
+        "repo_target": str(repo_target or "").strip(),
+        "question": str(question or "").strip(),
+    }
+    try:
+        persist_teams_workflow_state(thread)
+    except Exception:
+        LOGGER.debug("Could not persist pending agent infrastructure clarification", exc_info=True)
+
+
+def _get_pending_agent_infra_clarification(thread_id: str) -> dict:
+    thread = str(thread_id or "").strip()
+    if not thread:
+        return {}
+    return dict(PENDING_AGENT_INFRA_CLARIFICATIONS.get(_agent_infra_clarification_key(thread)) or {})
+
+
+def _clear_pending_agent_infra_clarification(thread_id: str) -> None:
+    thread = str(thread_id or "").strip()
+    if not thread:
+        return
+    PENDING_AGENT_INFRA_CLARIFICATIONS.pop(_agent_infra_clarification_key(thread), None)
+    try:
+        persist_teams_workflow_state(thread)
+    except Exception:
+        LOGGER.debug("Could not persist cleared agent infrastructure clarification", exc_info=True)
+
+
+def _repository_candidate_context_window(
+    repository_evidence: list[dict],
+    candidate: dict,
+    radius: int = 6,
+) -> str:
+    """Return a bounded live-code window around one validated Boolean assignment."""
+    wanted_path = str(candidate.get("path") or "").strip().strip("/")
+    try:
+        line_number = int(candidate.get("line_number") or 0)
+    except (TypeError, ValueError):
+        line_number = 0
+    if not wanted_path or line_number <= 0:
+        return ""
+    for item in repository_evidence or []:
+        if not isinstance(item, dict):
+            continue
+        if _teams_context_file_identity(item) != wanted_path:
+            continue
+        lines = str(item.get("content") or "").replace("\r\n", "\n").splitlines()
+        if not lines:
+            return ""
+        start = max(0, line_number - 1 - radius)
+        end = min(len(lines), line_number + radius)
+        return "\n".join(
+            f"{index + 1}: {lines[index]}"
+            for index in range(start, end)
+        )
+    return ""
+
+
+def _foundry_adjudicate_repository_boolean_candidates(
+    prompt: str,
+    repository_evidence: list[dict],
+    candidates: list[dict],
+) -> list[dict]:
+    """Ask Foundry to prune validated Boolean candidates to prompt-relevant controls.
+
+    Python does not infer which flag implements the request. It only supplies the
+    exact repository-validated candidates and nearby live code, then validates
+    that Foundry's adjudicated selections are a subset of those candidates.
+    """
+    if len(candidates or []) <= 1:
+        return list(candidates or [])
+
+    candidate_payload = []
+    for candidate in candidates or []:
+        if not isinstance(candidate, dict):
+            continue
+        candidate_payload.append({
+            "path": str(candidate.get("path") or "").strip().strip("/"),
+            "line_number": int(candidate.get("line_number") or 0),
+            "flag": str(candidate.get("flag") or "").strip(),
+            "current_value": str(candidate.get("current_value") or "").strip().lower(),
+            "new_value": str(candidate.get("new_value") or "").strip().lower(),
+            "scope": str(candidate.get("scope") or "").strip(),
+            "prior_description": str(candidate.get("description") or candidate.get("context") or "").strip(),
+            "nearby_live_code": _repository_candidate_context_window(repository_evidence, candidate),
+        })
+
+    request = {
+        "task": (
+            "FINAL SEMANTIC BOOLEAN CANDIDATE ADJUDICATION. The backend has already "
+            "proved every candidate below is a real literal Boolean assignment in the live repository. "
+            "Select only the candidate(s) that actually implement the CURRENT user request. "
+            "Do not generate Terraform."
+        ),
+        "user_request": str(prompt or "").strip(),
+        "validated_candidates": candidate_payload,
+        "required_output": {
+            "reason": "short repository-grounded explanation",
+            "selected": [{
+                "path": "exact path from validated_candidates",
+                "line_number": 1,
+                "flag": "exact flag from validated_candidates",
+                "relevance": 0.0,
+                "description": "concise explanation of why this control matches the requested behavior",
+            }],
+        },
+        "rules": [
+            "Return JSON only with keys reason and selected.",
+            "Select only from validated_candidates; never invent or rename a flag/path/line.",
+            "Judge semantic relevance from the user request plus scope, nearby_live_code, and repository naming/context.",
+            "Do not select a Boolean merely because it is in the same file or because of weak generic lexical overlap with the request.",
+            "If exactly one control clearly implements the requested behavior, return exactly one selected item.",
+            "Return multiple selected items only when they are genuinely distinct plausible implementations of the same requested behavior and a user choice is truly required.",
+            "Omit weak, incidental, infrastructure-wide, and unrelated controls.",
+            "Use relevance from 0 to 1. A selected item must be strongly supported by repository semantics, not just lexical overlap.",
+            "If none is strongly supported, return selected=[].",
+        ],
+    }
+
+    try:
+        raw = call_named_agent(json.dumps(request, ensure_ascii=False), AGENT_NAME)
+        parsed = extract_json_from_text(raw)
+    except Exception as exc:
+        LOGGER.warning("Boolean candidate adjudication failed; using bounded validated fallback: %s", exc)
+        parsed = {}
+
+    original_index = {
+        (
+            str(item.get("path") or "").strip().strip("/"),
+            int(item.get("line_number") or 0),
+            str(item.get("flag") or "").strip(),
+        ): item
+        for item in candidates or []
+        if isinstance(item, dict)
+    }
+
+    adjudicated: list[dict] = []
+    if isinstance(parsed, dict):
+        for selected in parsed.get("selected") or []:
+            if not isinstance(selected, dict):
+                continue
+            key = (
+                str(selected.get("path") or "").strip().strip("/"),
+                int(selected.get("line_number") or 0),
+                str(selected.get("flag") or "").strip(),
+            )
+            original = original_index.get(key)
+            if not original:
+                continue
+            try:
+                relevance = max(0.0, min(float(selected.get("relevance") or 0.0), 1.0))
+            except (TypeError, ValueError):
+                relevance = 0.0
+            if relevance < 0.60:
+                continue
+            item = dict(original)
+            item["confidence"] = max(float(item.get("confidence") or 0.0), relevance)
+            item["context"] = str(selected.get("description") or item.get("context") or "").strip()
+            item["description"] = item["context"]
+            adjudicated.append(item)
+
+    if adjudicated:
+        adjudicated.sort(key=lambda item: float(item.get("confidence") or 0.0), reverse=True)
+        top = float(adjudicated[0].get("confidence") or 0.0)
+        # Keep only candidates that remain close to the strongest semantic match.
+        # This is resource-agnostic confidence pruning; no flag/resource names are encoded.
+        adjudicated = [
+            item for item in adjudicated
+            if float(item.get("confidence") or 0.0) >= max(0.60, top - 0.18)
+        ]
+        return adjudicated[:5]
+
+    # If adjudication is unavailable, never expose an unbounded inventory.
+    # Preserve the strongest repository-validated candidates only; ambiguity is
+    # safer than auto-selecting a weak control.
+    fallback = sorted(
+        [dict(item) for item in candidates or [] if isinstance(item, dict)],
+        key=lambda item: float(item.get("confidence") or 0.0),
+        reverse=True,
+    )
+    if not fallback:
+        return []
+    top = float(fallback[0].get("confidence") or 0.0)
+    if top > 0:
+        fallback = [
+            item for item in fallback
+            if float(item.get("confidence") or 0.0) >= max(0.50, top - 0.15)
+        ]
+    return fallback[:5]
+
+
+def _validated_repository_boolean_strategy(
+    prompt: str,
+    repository_evidence: list[dict],
+) -> tuple[dict, list[dict]]:
+    """Final Boolean strategy: validate first, then semantic-prune before UI/generation."""
+    strategy, candidates = _RELEVANCE_PREVIOUS_VALIDATED_REPOSITORY_BOOLEAN_STRATEGY(
+        prompt,
+        repository_evidence,
+    )
+    candidates = _foundry_adjudicate_repository_boolean_candidates(
+        prompt,
+        repository_evidence,
+        candidates,
+    )
+    strategy = dict(strategy or {})
+    strategy["adjudicated_candidate_count"] = len(candidates)
+    return strategy, candidates
+
+
+def _find_pending_agent_clarification_for_request(request_data: dict, state: dict) -> tuple[str, dict]:
+    """Resolve a pending generic Foundry clarification from durable workflow state."""
+    for thread_id in _teams_flow_guard_thread_candidates(request_data, state):
+        try:
+            restore_teams_workflow_state(thread_id)
+        except Exception:
+            pass
+        pending = _get_pending_agent_infra_clarification(thread_id)
+        if pending:
+            return thread_id, pending
+    return "", {}
+
+
+def handle_teams_chat_request(data: dict):
+    """Final wrapper that makes generic Foundry clarification answers resumable.
+
+    This specifically covers questions that are not one of Terrabot's dedicated
+    backend protocols (branch/Jira/module/target selection). The next compact user
+    answer is rebound to the same Foundry thread and the complete original request,
+    so generation continues instead of being reclassified as a new chat/request.
+    """
+    request_data = dict(data or {})
+    teams_conversation_id = str(
+        request_data.get("teams_conversation_id")
+        or request_data.get("conversation_id")
+        or ""
+    ).strip()
+    state = load_teams_conversation_state(teams_conversation_id) if teams_conversation_id else {}
+    user_reply = _teams_compact_followup_answer(
+        str(request_data.get("prompt") or request_data.get("message") or "").strip()
+    )
+
+    pending_thread, pending = _find_pending_agent_clarification_for_request(request_data, state)
+    continuation_active = bool(pending_thread and pending and user_reply)
+    if continuation_active:
+        original_prompt = str(pending.get("original_prompt") or "").strip()
+        request_data.update({
+            "thread_id": pending_thread,
+            "mode": "infra",
+            "cloud": pending.get("cloud") or request_data.get("cloud") or "",
+            "requested_cloud": pending.get("cloud") or request_data.get("requested_cloud") or "",
+            "workflow": pending.get("workflow") or request_data.get("workflow") or "",
+            "original_prompt": original_prompt,
+            "fresh_infra_generation": True,
+            "pending_agent_clarification_reply": True,
+            "prompt": (
+                f"{original_prompt}\n\n"
+                "The user is answering your immediately previous blocking clarification in this same infrastructure workflow.\n"
+                f"User answer: {user_reply}\n\n"
+                "Resolve this answer against only the choices/ambiguity from your immediately previous question, then continue the original infrastructure generation now. "
+                "Do not restart repository discovery, do not reinterpret the answer as a new standalone request, and do not ask the same question again."
+            ).strip(),
+        })
+        request_data["message"] = request_data["prompt"]
+        _teams_diag_log(
+            "agent_clarification_followup_resumed",
+            thread=pending_thread,
+            answer_preview=user_reply[:160],
+        )
+
+    result, status_code = _RELEVANCE_PREVIOUS_HANDLE_TEAMS_CHAT_REQUEST(request_data)
+    result = dict(result or {})
+    decision_state = str(result.get("decision_state") or "").strip().lower()
+    mode = str(result.get("mode") or "").strip().lower()
+
+    if decision_state == "agent_clarification" and mode == "clarification":
+        thread_id = str(result.get("thread_id") or request_data.get("thread_id") or "").strip()
+        if thread_id:
+            _store_pending_agent_infra_clarification(
+                thread_id=thread_id,
+                original_prompt=(
+                    str(pending.get("original_prompt") or "").strip()
+                    if continuation_active
+                    else str(request_data.get("original_prompt") or data.get("prompt") or data.get("message") or "").strip()
+                ),
+                cloud=str((result.get("router") or {}).get("cloud") or request_data.get("cloud") or ""),
+                workflow=str((result.get("router") or {}).get("workflow") or request_data.get("workflow") or ""),
+                repo_target=str(request_data.get("repo_target") or ""),
+                question=str(result.get("reply") or ""),
+            )
+            patch = dict(result.get("state_patch") or {})
+            patch["pending_agent_clarification_thread_id"] = thread_id
+            result["state_patch"] = patch
+            if teams_conversation_id:
+                _teams_save_ui_state(teams_conversation_id, patch)
+    elif continuation_active:
+        # The clarification has been consumed once generation advances to any
+        # other stage (branch choice, preview, success, or a dedicated protocol).
+        _clear_pending_agent_infra_clarification(pending_thread)
+        patch = dict(result.get("state_patch") or {})
+        patch["pending_agent_clarification_thread_id"] = None
+        result["state_patch"] = patch
+        if teams_conversation_id:
+            _teams_save_ui_state(teams_conversation_id, patch)
+
+    return result, status_code
+
+# Disable the older Teams lexical feature-flag auto-selector. The final generic
+# repository strategy above already asks Foundry to make the semantic decision
+# and literal-validates the result. Keeping both would reintroduce a Python
+# keyword/token heuristic after Foundry had already produced an adjudicated set.
+_RELEVANCE_PREVIOUS_AUTO_SELECT_FEATURE_FLAG_CONTEXT = _teams_auto_select_feature_flag_context
+
+
+def _teams_auto_select_feature_flag_context(existing_infra_context: dict, prompt: str) -> dict:
+    if (_ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}).get("active"):
+        return {}
+    return _RELEVANCE_PREVIOUS_AUTO_SELECT_FEATURE_FLAG_CONTEXT(existing_infra_context, prompt)
+
+
+_RELEVANCE_PREVIOUS_FLOW_GUARD_THREAD_CANDIDATES = _teams_flow_guard_thread_candidates
+
+
+def _teams_flow_guard_thread_candidates(request_data: dict, state: dict) -> list[str]:
+    values = list(_RELEVANCE_PREVIOUS_FLOW_GUARD_THREAD_CANDIDATES(request_data, state))
+    pending_thread = str((state or {}).get("pending_agent_clarification_thread_id") or "").strip()
+    if pending_thread and pending_thread not in values:
+        values.append(pending_thread)
+    return values
+
+
+def _teams_compact_followup_answer(value: str) -> str:
+    """Recover the actual answer when an upstream Teams layer wrapped it in context."""
+    text = str(value or "").strip()
+    match = re.search(r"(?is)\buser\s+follow[- ]?up\s*:\s*(.+?)\s*$", text)
+    return match.group(1).strip() if match else text

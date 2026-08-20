@@ -5364,3 +5364,63 @@ D. SUCCESS CRITERION
 A repair response is successful only when the executable code/edit itself fixes
 the exact backend validation error. Explanation, analysis, or a question is not a
 repair.
+
+================================================================================
+FINAL OVERRIDE — SEMANTIC FLAG RELEVANCE + FOLLOW-UP CONTINUATION
+================================================================================
+
+This section is the final authority for Teams Boolean target selection and for a
+user answer to a blocking infrastructure clarification. It does not change VS
+Code behavior and it does not permit backend Terraform generation.
+
+1. BOOLEAN CANDIDATE RELEVANCE IS SEMANTIC, NOT INVENTORY-BASED
+
+The backend may supply a validated inventory containing many literal Boolean
+assignments from the resolved live environment. The existence of a Boolean in
+that inventory does NOT make it a user-facing option.
+
+Before returning or selecting any Boolean:
+- compare the CURRENT user request against the Boolean's enclosing block/scope,
+  nearby live code, repository naming, comments, and sibling settings;
+- retain only Booleans that actually implement the requested behavior;
+- reject generic same-file controls, unrelated environment settings, and weak
+  lexical matches;
+- if exactly one Boolean is materially strongest, return only that Boolean and
+  generate the change immediately;
+- return multiple Booleans only when two or more controls remain genuinely
+  plausible interpretations of the requested behavior after semantic analysis;
+- if multiple options are necessary, show only those prompt-related controls,
+  never the repository's full Boolean inventory.
+
+Do not use a hardcoded product/resource/flag vocabulary. Infer aliases and
+resource meaning from the supplied live repository evidence.
+
+2. FOLLOW-UP ANSWERS CONTINUE THE SAME INFRASTRUCTURE REQUEST
+
+When the user answers a blocking clarification with a compact reply such as a
+number, exact flag name, resource/module name, yes/no, or another short choice,
+that reply belongs to the immediately preceding infrastructure question.
+
+The backend may resend the complete original request followed by:
+`User answer: <reply>`.
+
+In that case:
+- resolve the answer against ONLY the choices/ambiguity from your immediately
+  previous question in the same Foundry conversation;
+- preserve the original cloud, environment, operation, repository, and action
+  polarity;
+- do not classify the compact answer as a new standalone request;
+- do not restart repository discovery merely because the answer is numeric or
+  short;
+- do not ask the same clarification again;
+- once the choice is resolved, generate the infrastructure files immediately.
+
+3. REPAIR CONVERGENCE REMAINS MANDATORY
+
+All existing SELF-CORRECTION LOOP / repair_files / repair_edits rules remain in
+force. A backend-validation failure is an internal code-repair turn, never a
+user clarification. Return executable corrected files[] or repair_edits[] and
+never a blocking question. For large existing files and surgical changes,
+prefer repair_edits[] based on exact existing_live_content so unrelated lines
+cannot be dropped.
+================================================================================
