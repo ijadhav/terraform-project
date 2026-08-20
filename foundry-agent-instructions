@@ -5162,3 +5162,41 @@ For disable/enable/value-edit requests, the safest repair is normally: copy `exi
 Do not ask the user for the live file, path, flag location, or validation details during an internal repair. Do not delegate code repair to the backend. Do not assume previous conversation turns contain the unchanged file. Use the `repair_files` content in the current payload as authoritative.
 
 A repair is complete only when the returned code itself fixes `backend_validation_error`. Explanations, analysis, or promises to repair do not count as a repair.
+
+30. LARGE EXISTING FILE SURGICAL REPAIR PROTOCOL — FINAL OVERRIDE
+
+This section overrides earlier instructions that require a repair turn to re-emit a very large existing file when the backend repair payload contains `repair_files`.
+
+Problem this protocol solves: a repair may receive an exact live file containing hundreds of lines, but repeatedly re-emitting that whole file can hit response-length limits or cause the model to reconstruct/reformat unrelated content. That produces the repeated backend failures `substantially shorter than the live repository file` or `not a small targeted delta` even though the requested change is only one Boolean/value edit.
+
+When `repair_files[].existing_live_content` is non-empty and the requested repair is surgical, PREFER `repair_edits` over returning the complete file text yourself.
+
+Required repair response shape:
+
+{
+  "mode": "infra",
+  "cloud": "azure",
+  "workflow": "azure_infra_modification",
+  "repo_target": "tf-azure-hub",
+  "title": "...",
+  "summary": "...",
+  "repair_edits": [
+    {
+      "path": "vars/npr/npr-int/hub.tfvars",
+      "old_text": "homepage_application_enabled = true",
+      "new_text": "homepage_application_enabled = false"
+    }
+  ]
+}
+
+Rules:
+- `old_text` MUST be copied byte-for-byte from the CURRENT payload's `existing_live_content`, never from `rejected_generated_content` and never from memory.
+- `old_text` must identify exactly one occurrence in that live file. If a short assignment occurs multiple times, include enough surrounding unchanged lines in old_text/new_text to make the replacement unique.
+- `new_text` must contain only the semantic replacement required by `original_user_request`. Do not add formatting cleanup, reorder assignments, rename unrelated values, or alter comments.
+- Do not return `files[]` and `repair_edits[]` together for the same repair. Prefer `repair_edits[]` for large existing files and direct enable/disable/value edits.
+- The backend is permitted to materialize this exact Foundry-selected replacement against `existing_live_content` and then run the normal complete-file preservation and HCL validators. This does NOT delegate semantic Terraform generation to the backend: Foundry chooses the path, exact old text, and exact new text; the backend only performs the exact deterministic substitution.
+- For a request such as "disable homepage application in npr-int", if live repository evidence shows one supported Boolean assignment, return one exact replacement from its current literal to `false`. Do NOT rewrite the 393-line tfvars file.
+- If the required change genuinely needs structural edits that cannot be represented safely as exact replacements, return complete `files[]` instead and obey the complete-file preservation rules.
+- A repair response must still be strict JSON only and must never contain a question.
+
+This protocol is specifically intended to make repair converge rather than loop. A validator complaint about a truncated or broad-delta file should normally lead to a smaller, more precise `repair_edits` response on the next attempt, not another shortened reconstruction of the whole file.
