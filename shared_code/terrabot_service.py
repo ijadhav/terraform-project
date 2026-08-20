@@ -19986,28 +19986,82 @@ def handle_chat_request(data: dict):
                                 thread=conversation_id,
                                 attempt=f"{repair_attempt}/{MAX_TEAMS_SELF_CORRECTION_ATTEMPTS}",
                             )
-                            conversation_id, agent_reply = call_agent(
-                                conversation_id, json.dumps(repair_payload, indent=2)
-                            )
-                            agent_reply = _teams_apply_agent_identity(
-                                agent_reply, target_cloud, effective_workflow
-                            )
-                            agent_result = try_parse_agent_output(agent_reply)
-                            agent_result = finalize_agent_result_after_parse(
-                                agent_result,
-                                retrieved_module_context,
-                                retrieved_value_context,
-                            )
-                            agent_result["workflow"] = effective_workflow
-                            agent_result["repo_target"] = normalize_repo_target(
-                                agent_result["cloud"],
-                                repo_target=agent_result.get("repo_target"),
-                                workflow=effective_workflow,
-                            )
-                            agent_result["state_bucket"] = state_bucket_for_target(
-                                agent_result["cloud"],
-                                agent_result.get("repo_target"),
-                                effective_workflow,
+
+                            # A malformed/question-style Foundry repair response is itself
+                            # an INTERNAL repair failure. Never let its JSON/parser error
+                            # escape to the outer Teams response handler, because that would
+                            # surface messages such as "Expecting ',' delimiter" to the user
+                            # and prematurely stop the 5-attempt self-correction loop.
+                            #
+                            # Keep the last backend-invalid agent_result unchanged until a
+                            # replacement repair response has been fully parsed/finalized.
+                            # The next loop iteration will therefore re-run the same backend
+                            # validation and send the rejection back to Foundry again.
+                            try:
+                                repaired_conversation_id, repaired_reply = call_agent(
+                                    conversation_id,
+                                    json.dumps(repair_payload, indent=2),
+                                )
+                                repaired_reply = _teams_apply_agent_identity(
+                                    repaired_reply,
+                                    target_cloud,
+                                    effective_workflow,
+                                )
+
+                                repair_clarification = _teams_intercept_agent_questions(
+                                    repaired_reply
+                                )
+                                if repair_clarification is not None:
+                                    raise ValueError(
+                                        "Foundry returned a blocking question during an internal "
+                                        "backend-validation repair. Internal repair responses must "
+                                        "return corrected files[] and must not ask the user anything."
+                                    )
+
+                                repaired_result = try_parse_agent_output(repaired_reply)
+                                repaired_result = finalize_agent_result_after_parse(
+                                    repaired_result,
+                                    retrieved_module_context,
+                                    retrieved_value_context,
+                                )
+                                repaired_result["workflow"] = effective_workflow
+                                repaired_result["repo_target"] = normalize_repo_target(
+                                    repaired_result["cloud"],
+                                    repo_target=repaired_result.get("repo_target"),
+                                    workflow=effective_workflow,
+                                )
+                                repaired_result["state_bucket"] = state_bucket_for_target(
+                                    repaired_result["cloud"],
+                                    repaired_result.get("repo_target"),
+                                    effective_workflow,
+                                )
+                            except Exception as repair_response_error:
+                                _teams_diag_log(
+                                    "generation_validation_repair_response_invalid",
+                                    level="warning",
+                                    thread=conversation_id,
+                                    attempt=f"{repair_attempt}/{MAX_TEAMS_SELF_CORRECTION_ATTEMPTS}",
+                                    error=str(repair_response_error)[:300],
+                                )
+                                LOGGER.warning(
+                                    "Foundry generation-validation repair response failed on "
+                                    "attempt %s/%s (thread=%s): %s. Keeping the error private "
+                                    "and continuing the internal repair loop.",
+                                    repair_attempt,
+                                    MAX_TEAMS_SELF_CORRECTION_ATTEMPTS,
+                                    conversation_id,
+                                    repair_response_error,
+                                )
+                                continue
+
+                            conversation_id = repaired_conversation_id
+                            agent_reply = repaired_reply
+                            agent_result = repaired_result
+                            _teams_diag_log(
+                                "generation_validation_repair_response_accepted",
+                                thread=conversation_id,
+                                attempt=f"{repair_attempt}/{MAX_TEAMS_SELF_CORRECTION_ATTEMPTS}",
+                                files_returned=len(agent_result.get("files") or []),
                             )
 
                     if validation_error is not None:
