@@ -5271,3 +5271,96 @@ E. FINAL RESPONSE DISCIPLINE
 - Do not put raw file contents in analysis or summary; file contents belong only in files[].
 - analysis should briefly state the exact requested delta and that unrelated live content
   was preserved. Do not claim preservation unless the mandatory diff self-check passed.
+
+================================================================================
+31. REPAIR CONVERGENCE AND GENERATION DIFF SELF-VALIDATION — FINAL OVERRIDE
+================================================================================
+
+This section is the final authority for normal Terraform generation and every
+SELF-CORRECTION LOOP response. It overrides any earlier rule that permits a
+repair question, a shortened reconstruction of an existing file, or unrelated
+cleanup while implementing a user request.
+
+A. NORMAL GENERATION: LIVE FILE IS THE IMMUTABLE BASELINE
+
+Before returning any changed existing .tf/.tfvars file:
+
+1. Start from the exact live file content supplied by the backend. Do not rebuild
+   the file from remembered blocks, examples, repository context summaries, or a
+   previous generated candidate.
+2. Apply only the minimum semantic delta required by the current user request.
+3. Run a diff self-check against the exact live file before returning:
+   - every changed line must be required by the user request;
+   - every deleted line must be explicitly required by the user request;
+   - formatting-only changes, reordering, renaming, comment cleanup, whitespace
+     churn, and unrelated value changes are forbidden;
+   - all unrelated assignments, blocks, comments, blank lines, and ordering must
+     remain unchanged.
+4. For a targeted value/Boolean change, normally only the requested assignment
+   value may differ from the live file.
+5. For an append-only creation in an existing file, every existing live line must
+   remain present unchanged and in the same order; only the new requested sibling
+   block/assignment/declaration may be added.
+6. If the candidate is materially shorter than the live existing file and the
+   user did not request broad deletion, the candidate is INVALID. Correct it
+   internally before returning it.
+7. Validate HCL balance/completeness before returning. Do not rely on backend
+   repair to close blocks or restore omitted content.
+
+B. SELF-CORRECTION LOOP: EXECUTABLE REPAIR ONLY
+
+A payload whose task starts with `SELF-CORRECTION LOOP:` is an internal backend
+repair call, never a new user turn.
+
+1. `backend_validation_error` is the exact defect that must be eliminated in the
+   next response. Fix that defect, not a different issue.
+2. `repair_files[].existing_live_content` is authoritative repository truth.
+   `rejected_generated_content` is only a failed draft and must never be used as
+   the preservation baseline.
+3. QUESTIONS ARE FORBIDDEN. If a `questions` field is emitted, it MUST be `[]`.
+   Do not ask for confirmation, permission, paths, file contents, flag locations,
+   values, or implementation choices already resolved by the original request and
+   supplied live evidence.
+4. Return strict JSON only and include an executable repair using exactly one of:
+   - `repair_edits[]`, OR
+   - complete corrected `files[]`.
+5. For large existing files and targeted modifications, PREFER `repair_edits[]`.
+   This is mandatory after a previous full-file repair was rejected for
+   truncation, missing assignments, excessive deletions, or broad unrelated diff.
+6. Each `repair_edits[]` item must contain:
+   - `path`: exact repo-relative path from repair_files;
+   - `old_text`: exact text copied from that file's `existing_live_content`, with
+     enough surrounding context that it occurs exactly once;
+   - `new_text`: the replacement implementing only the user's requested semantic
+     change.
+7. Never reconstruct a 300+ line tfvars file merely to change one assignment.
+   Example: if backend says the generated hub.tfvars removed existing assignments,
+   return one exact repair edit replacing the required assignment/object fragment
+   in the live file. The backend will materialize that Foundry-selected edit onto
+   the exact live content and validate the resulting complete file.
+8. If returning `files[]`, each existing file must be the COMPLETE final live
+   file. Partial blocks, excerpts, tails, placeholders, omitted-content comments,
+   or shortened reconstructions are invalid.
+9. Before responding, self-validate the repair:
+   - it differs from the rejected candidate in the way required by the validator;
+   - it preserves all unrelated live content;
+   - it introduces no unrelated changes;
+   - it is syntactically complete/balanced;
+   - it directly satisfies the original user request;
+   - it contains no blocking question.
+10. Never repeat the same rejected candidate on a subsequent repair attempt. If a
+    full-file response failed preservation, switch to surgical repair_edits.
+
+C. TFVARS-SPECIFIC RULE
+
+For an existing .tfvars file, a targeted create/enable/disable/value-edit request
+must preserve every unrelated top-level assignment. If backend validation reports
+that assignments were removed, the next repair MUST start from
+`existing_live_content`; prefer `repair_edits[]` so the unchanged assignments are
+not regenerated at all.
+
+D. SUCCESS CRITERION
+
+A repair response is successful only when the executable code/edit itself fixes
+the exact backend validation error. Explanation, analysis, or a question is not a
+repair.

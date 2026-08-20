@@ -20108,19 +20108,24 @@ def handle_chat_request(data: dict):
                                     effective_workflow,
                                 )
 
+                                # Materialize valid Foundry-selected repair_edits BEFORE looking
+                                # for question fields. Some agent responses include an explanatory
+                                # questions[] field even when they also returned a complete surgical
+                                # repair. Rejecting the response before materialization threw away the
+                                # executable repair and caused the same backend failure to loop.
+                                repaired_reply = _teams_materialize_repair_edits_response(
+                                    repaired_reply, repair_payload
+                                )
+
                                 repair_clarification = _teams_intercept_agent_questions(
                                     repaired_reply
                                 )
                                 if repair_clarification is not None:
                                     raise ValueError(
-                                        "Foundry returned a blocking question during an internal "
-                                        "backend-validation repair. Internal repair responses must "
-                                        "return corrected files[] and must not ask the user anything."
+                                        "Foundry returned a blocking question without an executable "
+                                        "internal backend-validation repair. Internal repair responses "
+                                        "must return corrected files[] or valid repair_edits[]."
                                     )
-
-                                repaired_reply = _teams_materialize_repair_edits_response(
-                                    repaired_reply, repair_payload
-                                )
                                 repaired_result = try_parse_agent_output(repaired_reply)
                                 repaired_result = finalize_agent_result_after_parse(
                                     repaired_result,
@@ -26367,7 +26372,18 @@ def _teams_build_backend_repair_payload(
             "TRUNCATION GUARD: if an existing live file is materially longer than your candidate, the candidate is invalid. Re-copy existing_live_content in full and apply only the surgical change, or return repair_edits[] instead of reconstructing the file.",
             "For Boolean enable/disable repairs, prefer one repair_edits[] replacement of the exact live Boolean assignment. For ordinary modifications, prefer the smallest exact old_text/new_text replacement that implements the request.",
             "Return strict infra JSON only. During repair, use either corrected files[] or repair_edits[]. Do not ask a question and do not delegate semantic repair to the backend.",
+            "QUESTIONS ARE INVALID IN REPAIR MODE: set questions=[] if that field exists. A repair turn is never allowed to request user confirmation, file paths, values, or permission for a change already resolved by original_user_request and live repository evidence.",
+            "VALIDATOR-DRIVEN REPAIR: the next response must specifically eliminate backend_validation_error. If the error says tfvars assignments were removed, do not reconstruct tfvars; use repair_edits[] against existing_live_content so all assignments are retained automatically.",
+            "REPAIR CONVERGENCE RULE: after one rejected full-file attempt for an existing file, switch to repair_edits[] on the next repair attempt unless the requested change genuinely rewrites most of the file.",
         ],
+        "required_response_contract": {
+            "json_only": True,
+            "questions_must_be_empty": True,
+            "must_include_one_of": ["repair_edits", "files"],
+            "preferred_for_existing_large_files": "repair_edits",
+            "semantic_owner": "foundry",
+            "backend_role": "exact_edit_materialization_and_validation_only",
+        },
         "repair_edit_output_shape": {
             "mode": "infra",
             "cloud": current_result.get("cloud"),
@@ -26517,14 +26533,34 @@ def _teams_materialize_repair_edits_response(agent_reply: str, repair_payload: d
     return json.dumps(normalized, ensure_ascii=False)
 
 
-def _teams_call_agent_for_backend_repair(repair_payload: dict) -> tuple[str, str]:
-    """Use a fresh Foundry conversation for repair and bypass context compaction.
+def _teams_repair_reply_has_executable_change(agent_reply: str) -> bool:
+    """Return True when a repair reply contains code/edit material to validate.
 
-    A repair payload is already fully self-contained. Continuing the old agent
-    conversation can bias the model toward the prior failed answer, while the
-    normal Teams context enricher can add enough unrelated history to dilute or
-    clip the live file. This isolated call sends exactly the validator error,
-    rejected code, and live code supplied by the backend.
+    A repair response may carry incidental prose/question metadata, but it is
+    useful if it also contains non-empty repair_edits[] or files[]. This check
+    lets the backend immediately re-prompt Foundry only for truly non-executable
+    repair replies instead of burning the outer validation retry on a question.
+    """
+    try:
+        payload = extract_json_from_text(str(agent_reply or ""))
+    except Exception:
+        return False
+    edits = payload.get("repair_edits")
+    files = payload.get("files")
+    return bool(
+        (isinstance(edits, list) and any(isinstance(item, dict) for item in edits))
+        or (isinstance(files, list) and any(isinstance(item, dict) for item in files))
+    )
+
+
+def _teams_call_agent_for_backend_repair(repair_payload: dict) -> tuple[str, str]:
+    """Use isolated Foundry calls and force non-executable repairs to converge.
+
+    The repair payload is fully self-contained. If Foundry answers the first
+    isolated call with a question, prose, or malformed/non-executable JSON, make
+    one immediate fresh repair-enforcement call using the same live evidence.
+    Terraform semantics remain Foundry-owned; the backend only requires an
+    executable files[]/repair_edits[] response before returning to validation.
     """
     raw = json.dumps(repair_payload, ensure_ascii=False, separators=(",", ":"))
     _teams_diag_log(
@@ -26532,7 +26568,34 @@ def _teams_call_agent_for_backend_repair(repair_payload: dict) -> tuple[str, str
         input_chars=len(raw),
         repair_files=len(repair_payload.get("repair_files") or []),
     )
-    return _TEAMS_MULTICLOUD_PREVIOUS_CALL_AGENT(None, raw)
+    conversation_id, reply = _TEAMS_MULTICLOUD_PREVIOUS_CALL_AGENT(None, raw)
+    if _teams_repair_reply_has_executable_change(reply):
+        return conversation_id, reply
+
+    enforcement_payload = dict(repair_payload)
+    enforcement_payload["repair_response_violation"] = (
+        "The immediately preceding internal repair response contained no executable "
+        "files[] or repair_edits[]. Do not ask a question. Produce the repair now."
+    )
+    enforcement_payload["mandatory_next_output"] = {
+        "json_only": True,
+        "questions": [],
+        "must_include_exactly_one_of": ["repair_edits", "files"],
+        "preferred": "repair_edits for targeted edits to existing files",
+        "instruction": (
+            "Use repair_files[].existing_live_content as the immutable baseline and "
+            "fix backend_validation_error with the smallest Foundry-selected change."
+        ),
+    }
+    enforcement_raw = json.dumps(
+        enforcement_payload, ensure_ascii=False, separators=(",", ":")
+    )
+    _teams_diag_log(
+        "backend_repair_nonexecutable_retry",
+        input_chars=len(enforcement_raw),
+        repair_files=len(repair_payload.get("repair_files") or []),
+    )
+    return _TEAMS_MULTICLOUD_PREVIOUS_CALL_AGENT(None, enforcement_raw)
 
 
 def commit_terraform_files_to_branch_for_teams_with_self_correction(
