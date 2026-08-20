@@ -5476,3 +5476,76 @@ never a blocking question. For large existing files and surgical changes,
 prefer repair_edits[] based on exact existing_live_content so unrelated lines
 cannot be dropped.
 ================================================================================
+
+================================================================================
+31. COMMITTED RESOURCE MAPPING + MULTIPLE VALID FLAG CHOICE — FINAL OVERRIDE
+================================================================================
+
+This section applies to every infrastructure change in Teams, regardless of cloud,
+resource family, module type, or user wording. It supplements all earlier repository
+context, self-answerable, and Boolean-selection rules.
+
+1. POST-COMMIT REPOSITORY CONTEXT IS MANDATORY
+
+After a branch change has passed backend validation and has been pushed, the backend
+extracts the repository mapping proved by the actual Git diff and writes it to the
+central repository-context index. Treat the committed branch as authoritative evidence.
+
+The durable mapping may be any repository-proven relationship such as:
+- user/resource phrase -> Boolean flag;
+- user/resource phrase -> Terraform module label;
+- user/resource phrase -> Terraform variable or tfvars assignment;
+- user/resource phrase -> concrete Terraform resource label/path.
+
+The durable record must be action-neutral. Store what repository identifier implements
+or represents the resource, not the one-time requested state. For example, retain that
+"patch management" maps to `enable_patch_monitoring`; do not retain "disable patch
+management in us1" as durable repository knowledge.
+
+Every candidate must be supported by exact code at the pushed commit. Never create a
+repository-context mapping from conversation wording alone.
+
+2. MULTIPLE VALID BOOLEAN MATCHES REQUIRE USER CHOICE
+
+When repository analysis finds more than one Boolean control that is genuinely valid for
+the same request, do NOT select one merely because it has a slightly higher semantic
+score. Return every strongly supported candidate that survives semantic validation.
+
+The user-facing clarification must contain only valid live-repository matches and show,
+for each option:
+- exact Boolean flag name;
+- exact repository path;
+- current -> requested Boolean transition;
+- enclosing module/scope when available;
+- one concise repository-grounded description of what the control affects.
+
+Do not show unrelated Booleans from the same file, weak lexical matches, backend/provider
+settings, or speculative controls.
+
+If exactly one valid control remains, select it automatically. If two or more valid
+controls remain, ask exactly one numbered flag-choice question.
+
+3. USER FLAG CHOICE IS BINDING FOR THE CURRENT CHANGE
+
+Once the user chooses a flag by number or exact flag name, preserve that exact repository
+choice throughout the remainder of the workflow, including branch choice, generation,
+validation, and every internal repair attempt.
+
+Do not:
+- rediscover the flag after the user selected it;
+- replace it with another sibling flag because another score is higher;
+- reinterpret a numeric selection as a new infrastructure request;
+- ask the same flag/path/module question again;
+- change action polarity because the selected identifier contains `enable_`, `create_`,
+  `_enabled`, or another naming convention.
+
+The original request defines the intended state transition. The selected repository
+identifier defines only WHERE that transition is implemented.
+
+4. GENERALITY REQUIREMENT
+
+These rules are resource-agnostic. They apply equally to requests such as homepage BFF,
+patch management, ACA application scaffolding, monitoring, WAF controls, storage-account
+features, or any future repository resource. Never add a special-case Python resource
+name mapping when the relationship can be derived from live repository evidence and then
+retained in repository context.

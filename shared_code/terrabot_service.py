@@ -37743,3 +37743,392 @@ def _teams_compact_followup_answer(value: str) -> str:
     text = str(value or "").strip()
     match = re.search(r"(?is)\buser\s+follow[- ]?up\s*:\s*(.+?)\s*$", text)
     return match.group(1).strip() if match else text
+
+# =============================================================================
+# 2026-08-20 DURABLE RESOURCE MAPPING + AMBIGUOUS FLAG SELECTION — FINAL OVERRIDE
+# =============================================================================
+# Every successful Teams infrastructure branch write now persists the repository
+# mapping proved by the committed diff (resource phrase -> flag/module/variable)
+# in the centralized repository-context index. Boolean ambiguity remains a user
+# choice: if semantic adjudication leaves more than one valid repository control,
+# all valid controls are presented and the selected control is retained verbatim
+# through generation and backend self-correction.
+
+_REPO_MAPPING_PREVIOUS_CONTEXT_EXTRACT_AFTER_COMMIT = _extract_and_store_repository_context_after_commit
+_REPO_MAPPING_PREVIOUS_BUILD_SELECTED_CONTEXT = build_selected_infra_modification_context
+_REPO_MAPPING_PREVIOUS_BOOL_ADJUDICATOR = _foundry_adjudicate_repository_boolean_candidates
+
+
+def _repository_context_changed_identifier_evidence(compare: dict, changed_paths: set[str]) -> list[dict]:
+    """Return repository identifiers materially touched by the current branch diff.
+
+    This is deliberately structural and resource-agnostic. It recognizes literal
+    HCL assignments, variable references, module/resource labels, and Boolean
+    controls only when they occur on changed diff lines. Semantic meaning remains
+    tied to the original user request and exact committed repository evidence.
+    """
+    results: list[dict] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    def add(path: str, kind: str, identifier: str, changed_line: str) -> None:
+        identifier = str(identifier or "").strip()
+        if not path or not identifier:
+            return
+        key = (path, kind, identifier)
+        if key in seen:
+            return
+        seen.add(key)
+        results.append({
+            "path": path,
+            "kind": kind,
+            "identifier": identifier,
+            "changed_line": str(changed_line or "").strip(),
+        })
+
+    for file_info in compare.get("files") or []:
+        if not isinstance(file_info, dict):
+            continue
+        path = str(file_info.get("filename") or "").strip()
+        if changed_paths and path not in changed_paths:
+            continue
+        patch = str(file_info.get("patch") or "")
+        for raw_line in patch.splitlines():
+            if not raw_line.startswith("+") or raw_line.startswith("+++"):
+                continue
+            line = raw_line[1:]
+            assignment = re.match(r'^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+?)\s*$', line)
+            if assignment:
+                name = assignment.group(1)
+                value = assignment.group(2)
+                add(path, "flag" if value.lower() in {"true", "false"} else "assignment", name, line)
+                for var_name in re.findall(r'\bvar\.([A-Za-z_][A-Za-z0-9_]*)\b', value):
+                    add(path, "variable", var_name, line)
+
+            module_match = re.match(r'^\s*module\s+"([^"]+)"\s*\{', line)
+            if module_match:
+                add(path, "module", module_match.group(1), line)
+            resource_match = re.match(r'^\s*resource\s+"([^"]+)"\s+"([^"]+)"\s*\{', line)
+            if resource_match:
+                add(path, "resource", f"{resource_match.group(1)}.{resource_match.group(2)}", line)
+            variable_match = re.match(r'^\s*variable\s+"([^"]+)"\s*\{', line)
+            if variable_match:
+                add(path, "variable", variable_match.group(1), line)
+
+            for var_name in re.findall(r'\bvar\.([A-Za-z_][A-Za-z0-9_]*)\b', line):
+                add(path, "variable", var_name, line)
+
+    return results
+
+
+def _repository_context_identifier_exact_excerpt(content: str, identifier: str, changed_line: str = "") -> str:
+    """Return an exact committed-code excerpt that proves one mapped identifier."""
+    text = str(content or "")
+    identifier = str(identifier or "").strip()
+    if not text or not identifier:
+        return ""
+    if changed_line:
+        exact_line = str(changed_line).strip()
+        for line in text.splitlines():
+            if line.strip() == exact_line:
+                return line
+    return _repository_context_evidence_excerpt(text, identifier, radius=3)
+
+
+def _store_repository_context_from_committed_resource_mapping(
+    payload: dict,
+    owner: str,
+    repo: str,
+    branch: str,
+    task_hash: str,
+) -> dict:
+    """Persist request-resource -> repository-control mappings after every commit.
+
+    Unlike the older Boolean-only vague-phrase extractor, this records any
+    repository-proven mapping materialized by the successful diff: Boolean flag,
+    HCL assignment, variable, module, or resource label. The stored statement is
+    action-neutral so enable/disable/create/update polarity never becomes durable
+    repository knowledge.
+    """
+    prompt = str(payload.get("user_request") or "").strip()
+    phrase = _repository_context_vague_resource_phrase(prompt)
+    commit_sha = str(payload.get("evidence_commit_sha") or "").strip()
+    compare = ((payload.get("tool_results") or {}).get("git_compare") or {})
+    changed_paths = {
+        str(path or "").strip()
+        for path in ((payload.get("tool_results") or {}).get("committed_files") or [])
+        if str(path or "").strip()
+    }
+    if not phrase or not commit_sha:
+        return {"ok": True, "stored": 0, "rejected": 0, "skipped": "missing_phrase_or_commit"}
+
+    mappings = _repository_context_changed_identifier_evidence(compare, changed_paths)
+    stored = 0
+    rejected = 0
+    actions: list[dict] = []
+    for mapping in mappings[:12]:
+        path = str(mapping.get("path") or "").strip()
+        identifier = str(mapping.get("identifier") or "").strip()
+        kind = str(mapping.get("kind") or "repository identifier").strip()
+        if not path or not identifier:
+            continue
+        try:
+            content = github_get_file_content_by_repo(owner, repo, path, ref=commit_sha)
+        except Exception:
+            content = None
+        if not content:
+            continue
+        excerpt = _repository_context_identifier_exact_excerpt(
+            content,
+            identifier,
+            mapping.get("changed_line") or "",
+        )
+        if not excerpt:
+            continue
+
+        candidate = {
+            "category": "resolved_clarification",
+            "subject": phrase,
+            "scope": path,
+            "statement": (
+                f'In `{path}`, repository requests referring to "{phrase}" map to the '
+                f'{kind} `{identifier}`.'
+            ),
+            "confidence": 0.99,
+            "evidence": [{
+                "path": path,
+                "excerpt": excerpt,
+                "reason": (
+                    f"The successful branch diff changed or introduced the repository {kind} "
+                    f"`{identifier}` for the current request."
+                ),
+            }],
+            "validation_summary": (
+                "This mapping is derived from the successfully validated and pushed Terraform diff, "
+                "not from conversation memory or model-only reasoning."
+            ),
+        }
+        source_hash = hashlib.sha256(
+            f"{task_hash}|mapping|{path}|{kind}|{identifier}|{phrase}".encode("utf-8")
+        ).hexdigest()
+        try:
+            result = add_repository_context(
+                owner,
+                repo,
+                commit_sha,
+                candidate,
+                evidence_branch=branch,
+                source_task_hash=source_hash,
+            )
+        except Exception as exc:
+            result = {"stored": False, "errors": [str(exc)]}
+        if result.get("stored"):
+            stored += 1
+        else:
+            rejected += 1
+        actions.append({
+            "kind": kind,
+            "identifier": identifier,
+            "path": path,
+            "stored": bool(result.get("stored")),
+            "action": result.get("action") or "rejected",
+            "errors": result.get("errors") or [],
+        })
+
+    LOGGER.warning(
+        "[TerrabotDiag] event=repository_context_committed_resource_mapping_completed "
+        "repo=%s/%s phrase=%s mappings=%s stored=%s rejected=%s",
+        owner,
+        repo,
+        phrase,
+        len(mappings),
+        stored,
+        rejected,
+    )
+    return {
+        "ok": True,
+        "mapping_count": len(mappings),
+        "stored": stored,
+        "rejected": rejected,
+        "actions": actions,
+    }
+
+
+def _extract_and_store_repository_context_after_commit(
+    agent_result: dict,
+    prompt: str,
+    branch_result: dict,
+    thread_id: str,
+) -> dict:
+    """Post-commit index update with deterministic mapping capture in every case."""
+    try:
+        payload, owner, repo, branch, task_hash = _repository_context_completed_task_payload(
+            agent_result,
+            prompt,
+            branch_result,
+            thread_id,
+        )
+    except Exception as exc:
+        LOGGER.warning(
+            "[TerrabotDiag] event=repository_context_post_commit_mapping_packet_failed error=%s",
+            exc,
+        )
+        # Preserve the pre-existing generic extractor behavior if packet assembly
+        # unexpectedly fails; successful GitHub transport is never rolled back.
+        return _REPO_MAPPING_PREVIOUS_CONTEXT_EXTRACT_AFTER_COMMIT(
+            agent_result, prompt, branch_result, thread_id
+        )
+
+    mapping_result = _store_repository_context_from_committed_resource_mapping(
+        payload, owner, repo, branch, task_hash
+    )
+    generic_result = _REPO_MAPPING_PREVIOUS_CONTEXT_EXTRACT_AFTER_COMMIT(
+        agent_result, prompt, branch_result, thread_id
+    )
+    combined = dict(generic_result or {})
+    combined["mapping_stored"] = int(mapping_result.get("stored") or 0)
+    combined["mapping_rejected"] = int(mapping_result.get("rejected") or 0)
+    combined["mapping_count"] = int(mapping_result.get("mapping_count") or 0)
+    combined["stored"] = int(generic_result.get("stored") or 0) + int(mapping_result.get("stored") or 0)
+    combined["rejected"] = int(generic_result.get("rejected") or 0) + int(mapping_result.get("rejected") or 0)
+    return combined
+
+
+def _foundry_adjudicate_repository_boolean_candidates(
+    prompt: str,
+    repository_evidence: list[dict],
+    candidates: list[dict],
+) -> list[dict]:
+    """Keep every semantically valid Boolean match; never auto-collapse ambiguity.
+
+    Foundry still removes invalid/weak matches. If two or more validated matches
+    survive that semantic adjudication, they remain separate candidates and the
+    existing Teams flag picker asks the user to choose. This prevents a high-score
+    heuristic from silently choosing one of several genuinely valid controls.
+    """
+    adjudicated = _REPO_MAPPING_PREVIOUS_BOOL_ADJUDICATOR(
+        prompt,
+        repository_evidence,
+        candidates,
+    )
+    unique: list[dict] = []
+    seen: set[tuple[str, int, str]] = set()
+    for item in adjudicated or []:
+        if not isinstance(item, dict):
+            continue
+        key = (
+            str(item.get("path") or "").strip().strip("/"),
+            int(item.get("line_number") or 0),
+            str(item.get("flag") or "").strip(),
+        )
+        if not key[0] or not key[2] or key in seen:
+            continue
+        seen.add(key)
+        unique.append(dict(item))
+    return unique[:8]
+
+
+def build_selected_infra_modification_context(pending_selection: dict, selected_index: int) -> dict:
+    """Retain the exact user-selected repository target/flag through generation."""
+    context = _REPO_MAPPING_PREVIOUS_BUILD_SELECTED_CONTEXT(pending_selection, selected_index)
+    context = dict(context or {})
+    selected_files = list(context.get("matched_files") or [])
+    if len(selected_files) == 1 and isinstance(selected_files[0], dict):
+        selected_item = selected_files[0]
+        match = dict(selected_item.get("feature_flag_match") or {})
+        if match:
+            context["resolved_feature_flag_selection"] = {
+                "path": str(selected_item.get("path") or "").strip(),
+                "flag": str(match.get("flag") or "").strip(),
+                "line_number": int(match.get("line_number") or match.get("line") or 0),
+                "current_value": str(match.get("current_value") or "").strip().lower(),
+                "new_value": str(match.get("new_value") or "").strip().lower(),
+                "selected_by_user": True,
+            }
+            context["selection_state"] = "selected"
+            context["feature_flag_selection"] = True
+            context["instructions"] = list(context.get("instructions") or []) + [
+                "The user already selected this exact Boolean control from the repository-backed candidate list. This selection is final for the current infrastructure request.",
+                "Do not re-run target/flag discovery, do not substitute a higher-scoring sibling flag, and do not ask the user to confirm the same selection again.",
+                "Every repair attempt must preserve the selected path, flag, line, and requested true/false transition exactly.",
+            ]
+    return context
+
+
+
+def _validated_repository_boolean_strategy(
+    prompt: str,
+    repository_evidence: list[dict],
+) -> tuple[dict, list[dict]]:
+    """Validate all Foundry Boolean candidates, then preserve real ambiguity.
+
+    The earlier strategy collapsed a multi-candidate result when the top model
+    confidence exceeded the second candidate by a threshold. That is unsafe for
+    an infrastructure toggle when both controls are repository-valid: confidence
+    ranking is not user intent. This override validates every returned candidate
+    against the literal live inventory, then lets semantic adjudication remove
+    invalid/weak controls. More than one surviving valid control always reaches
+    the existing Teams picker.
+    """
+    strategy = _foundry_repository_change_strategy(prompt, repository_evidence)
+    if not strategy.get("boolean_applicable"):
+        return strategy, []
+
+    inventory = strategy.get("inventory") or []
+    literal_index = {
+        (
+            str(item.get("path") or "").strip().strip("/"),
+            int(item.get("line_number") or 0),
+            str(item.get("flag") or "").strip(),
+        ): item
+        for item in inventory
+        if isinstance(item, dict)
+    }
+
+    validated: list[dict] = []
+    seen: set[tuple[str, int, str]] = set()
+    for candidate in strategy.get("candidates") or []:
+        if not isinstance(candidate, dict):
+            continue
+        path = str(candidate.get("path") or "").strip().strip("/")
+        flag = str(candidate.get("flag") or "").strip()
+        try:
+            line_number = int(candidate.get("line_number") or 0)
+        except (TypeError, ValueError):
+            line_number = 0
+        key = (path, line_number, flag)
+        literal = literal_index.get(key)
+        if not literal or key in seen:
+            continue
+
+        current = str(candidate.get("current_value") or "").strip().lower()
+        target = str(candidate.get("new_value") or "").strip().lower()
+        if current not in {"true", "false"} or target not in {"true", "false"}:
+            continue
+        if current == target or current != str(literal.get("current_value") or "").lower():
+            continue
+        try:
+            confidence = max(0.0, min(float(candidate.get("confidence") or 0.0), 1.0))
+        except (TypeError, ValueError):
+            confidence = 0.0
+
+        seen.add(key)
+        validated.append({
+            **literal,
+            "new_value": target,
+            "confidence": confidence,
+            "context": str(candidate.get("description") or "").strip(),
+            "description": str(candidate.get("description") or "").strip(),
+            "classification_reason": str(strategy.get("reason") or "").strip(),
+            "operation": str(strategy.get("operation") or "unknown").strip().lower(),
+        })
+
+    adjudicated = _foundry_adjudicate_repository_boolean_candidates(
+        prompt,
+        repository_evidence,
+        validated,
+    )
+    strategy = dict(strategy or {})
+    strategy["validated_candidate_count"] = len(validated)
+    strategy["adjudicated_candidate_count"] = len(adjudicated)
+    strategy["requires_user_choice"] = len(adjudicated) > 1
+    return strategy, adjudicated
