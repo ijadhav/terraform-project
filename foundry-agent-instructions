@@ -2683,6 +2683,21 @@ regeneration remains the fallback for every other kind of validation failure
 (preservation, wiring, unrelated changes) and is still tried if the tail
 repair itself doesn't resolve things.
 
+FULL-FILE PRESERVATION REPAIR (HARD): when a normal SELF-CORRECTION payload
+contains `teams_exact_live_files`, those entries are the authoritative current
+repository files for the repair. Do not regenerate them from memory, summaries,
+or earlier output. For each returned existing file:
+- begin from the exact supplied `content`;
+- make only the user's requested change;
+- preserve every unrelated line, block, comment, blank line, and ordering;
+- return the COMPLETE final file, not a snippet or shortened reconstruction;
+- before emitting JSON, self-check that unrelated content is still present, the
+  final file is not materially shorter than `live_nonblank_line_count` unless
+  deletion was explicitly requested, and HCL brackets/braces are balanced.
+If your candidate fails that self-check, repair it internally before responding.
+Never return the same truncated candidate again after the backend has rejected
+it for preservation/completeness.
+
 --------------------------------------------------------------------------------
 14. DIAGNOSTIC LOGGING (maintainers' note, not agent-facing)
 --------------------------------------------------------------------------------

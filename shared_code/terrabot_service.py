@@ -19959,25 +19959,111 @@ def handle_chat_request(data: dict):
                                 retrieved_value_context
                             )
                             if isinstance(selected_repair_context, dict):
+                                # Give the repair turn the COMPLETE live content for every
+                                # file it is trying to modify, not only selected_path. The
+                                # repeated tfvars truncation failure happened because
+                                # hub.tfvars was a companion/environment file while the
+                                # repair payload prominently grounded only the selected
+                                # definition file. Foundry then kept regenerating a short
+                                # fragment instead of preserving the 393-line live file.
+                                live_files_by_path = {}
+                                for evidence_item in list(selected_repair_context.get("matched_files") or []) + list(selected_repair_context.get("environment_files") or []):
+                                    if not isinstance(evidence_item, dict):
+                                        continue
+                                    evidence_path = str(
+                                        evidence_item.get("path") or evidence_item.get("filename") or ""
+                                    ).strip().strip("/")
+                                    evidence_content = str(evidence_item.get("content") or "")
+                                    if evidence_path and evidence_content:
+                                        live_files_by_path[evidence_path] = evidence_content
+
+                                # Resolve all files returned by the rejected generation. If a
+                                # companion file was not retained in the bounded evidence,
+                                # read it directly from the same live GitHub ref before asking
+                                # Foundry to repair it. This remains evidence-only; the backend
+                                # does not synthesize or merge Terraform.
+                                rejected_paths = []
+                                for generated_item in agent_result.get("files") or []:
+                                    if not isinstance(generated_item, dict):
+                                        continue
+                                    generated_path = str(
+                                        generated_item.get("filename") or generated_item.get("path") or ""
+                                    ).strip().strip("/")
+                                    if generated_path and generated_path not in rejected_paths:
+                                        rejected_paths.append(generated_path)
+
+                                repair_live_files = []
+                                for repair_path in rejected_paths:
+                                    live_content = live_files_by_path.get(repair_path) or ""
+                                    if not live_content:
+                                        try:
+                                            repair_cloud = normalize_cloud(target_cloud)
+                                            repair_repo_target = normalize_repo_target(
+                                                repair_cloud,
+                                                repo_target=agent_result.get("repo_target"),
+                                                workflow=effective_workflow,
+                                            )
+                                            repair_ref = str(
+                                                selected_repair_context.get("context_ref")
+                                                or _teams_remote_context_branch(
+                                                    repair_cloud,
+                                                    repair_repo_target,
+                                                    effective_workflow,
+                                                )
+                                            ).strip()
+                                            live_content = github_get_file_content(
+                                                repair_cloud,
+                                                repair_path,
+                                                repair_ref,
+                                                repo_target=repair_repo_target,
+                                                workflow=effective_workflow,
+                                            ) or ""
+                                        except Exception as live_read_error:
+                                            _teams_diag_log(
+                                                "generation_validation_repair_live_file_read_failed",
+                                                level="warning",
+                                                thread=conversation_id,
+                                                path=repair_path,
+                                                error=str(live_read_error)[:200],
+                                            )
+                                    if live_content:
+                                        repair_live_files.append({
+                                            "path": repair_path,
+                                            "content": live_content,
+                                            "must_preserve_verbatim_except_requested_change": True,
+                                            "live_nonblank_line_count": len([
+                                                line for line in live_content.splitlines() if line.strip()
+                                            ]),
+                                        })
+
+                                if repair_live_files:
+                                    repair_payload["teams_exact_live_files"] = repair_live_files
+                                    repair_payload["agent_self_validation_required"] = {
+                                        "preservation": (
+                                            "Before returning JSON, compare each repaired existing file against teams_exact_live_files. "
+                                            "Every unrelated live line/block/comment must still be present; only the requested change may differ."
+                                        ),
+                                        "completeness": (
+                                            "Return the COMPLETE final file, never a snippet. A repaired file must not be materially shorter "
+                                            "than its live_nonblank_line_count unless the user explicitly requested deletion."
+                                        ),
+                                        "hcl": (
+                                            "Verify brackets/braces are balanced and the output contains no placeholders or omitted-content markers."
+                                        ),
+                                    }
+                                    repair_payload["correction_instructions"].extend([
+                                        "teams_exact_live_files is authoritative repository truth for this repair turn.",
+                                        "For every existing file you return, start from its exact teams_exact_live_files content and make only the requested edit; do not reconstruct a shortened version from memory.",
+                                        "Run the agent_self_validation_required checks yourself before emitting the JSON response. If preservation fails, correct it internally and only then return files[].",
+                                    ])
+
                                 selected_path = str(
                                     selected_repair_context.get("selected_path") or ""
                                 ).strip()
-                                selected_content = ""
-                                for matched in selected_repair_context.get("matched_files") or []:
-                                    if not isinstance(matched, dict):
-                                        continue
-                                    matched_path = str(
-                                        matched.get("path") or matched.get("filename") or ""
-                                    ).strip()
-                                    if not selected_path or matched_path == selected_path:
-                                        selected_content = str(matched.get("content") or "")
-                                        if selected_content:
-                                            selected_path = selected_path or matched_path
-                                            break
-                                if selected_path and selected_content:
+                                if selected_path and selected_path in live_files_by_path:
                                     repair_payload["teams_exact_target_file"] = {
                                         "path": selected_path,
-                                        "content": selected_content,
+                                        "content": live_files_by_path[selected_path],
                                         "must_preserve_verbatim": True,
                                     }
 
@@ -29682,6 +29768,51 @@ def _handle_teams_chat_request_multicloud(data: dict):
     )
     active_cloud = safe_normalize_cloud(str(state.get("cloud") or "")) or ""
     target_cloud_state = _teams_best_cloud_state(state, requested_cloud) if requested_cloud else {}
+
+    # Branch choice must be resolved BEFORE any Foundry generation. Durable UI
+    # state can be empty after a worker restart even though the deterministic
+    # Terrabot branch still exists remotely. Recover the current cloud's live
+    # branch state from GitHub before deciding whether this is a first request
+    # or a follow-up. Without this recovery, the request falls through to
+    # Foundry immediately and the user never gets the reuse/new-branch choice.
+    if explicit_infra and requested_cloud and not target_cloud_state.get("branch"):
+        recovery_thread_id = str(
+            request_data.get("thread_id")
+            or state.get("workflow_thread_id")
+            or (_teams_cloud_session(state, requested_cloud) or {}).get("thread_id")
+            or ""
+        ).strip()
+        if recovery_thread_id:
+            try:
+                restore_teams_workflow_state(recovery_thread_id)
+            except Exception:
+                pass
+            try:
+                recovered_thread_state = recover_thread_pr_state(recovery_thread_id) or {}
+                recovered_bucket = (
+                    "aws" if requested_cloud == "aws"
+                    else "azure_consumer"
+                )
+                recovered_cloud_state = recovered_thread_state.get(recovered_bucket) or {}
+                if recovered_cloud_state.get("branch"):
+                    target_cloud_state = dict(recovered_cloud_state)
+                    target_cloud_state.setdefault("thread_id", recovery_thread_id)
+                    request_data["thread_id"] = recovery_thread_id
+                    _teams_diag_log(
+                        "branch_state_recovered_before_foundry",
+                        thread=recovery_thread_id,
+                        cloud=requested_cloud,
+                        branch=target_cloud_state.get("branch"),
+                    )
+            except Exception as branch_recovery_error:
+                _teams_diag_log(
+                    "branch_state_recovery_before_foundry_failed",
+                    level="warning",
+                    thread=recovery_thread_id,
+                    cloud=requested_cloud,
+                    error=str(branch_recovery_error)[:240],
+                )
+
     reuse_branch = _teams_truthy(request_data.get("reuse_branch"))
     force_new_branch = _teams_truthy(request_data.get("force_new_branch"))
     branch_choice_already_resolved = _teams_truthy(
