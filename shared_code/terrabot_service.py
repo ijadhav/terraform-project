@@ -35955,6 +35955,9 @@ def _teams_is_path_request_question(text: str) -> bool:
         "should i proceed", "reply yes to proceed", "before i proceed",
         "confirm the exact target", "confirm the target", "confirm the file",
         "confirm the file path", "do you want me to disable",
+        "exact terraform variable", "terraform variable name",
+        "point me to the exact", "paste the snippet that defines",
+        "flag name and location", "where the flag resides",
         "would you like me to disable", "should i disable",
         "do you want me to enable", "would you like me to enable",
         "should i enable", "turning off the repository flag",
@@ -36757,6 +36760,167 @@ def _validated_repository_boolean_strategy_stage1(
 _validated_repository_boolean_strategy = _validated_repository_boolean_strategy_stage1
 
 
+def _teams_azure_boolean_resolution_phases(
+    prompt: str,
+    repository_evidence: list[dict],
+    scope_root: str = "",
+) -> list[list[dict]]:
+    """Return ordered evidence phases for Azure enable/disable resolution.
+
+    A normal hub request must never let a sibling ``dr.tfvars`` compete with
+    ``hub.tfvars``.  Foundry still owns the semantic mapping from user wording
+    to a repository Boolean, but it receives the value files in repository
+    precedence order: hub -> tier -> common.  For an explicit DR/failover
+    request, dr.tfvars is the leaf value file instead.
+
+    Non-tfvars Terraform evidence is included in every phase so Foundry can
+    infer what a Boolean controls from module/resource wiring without asking
+    the user for a flag or file name.
+    """
+    intent = _teams_feature_flag_intent(prompt)
+    if intent not in {"enable", "disable"}:
+        return [list(repository_evidence or [])]
+
+    evidence = [item for item in (repository_evidence or []) if isinstance(item, dict)]
+    non_values = [
+        item for item in evidence
+        if not _teams_context_file_identity(item).lower().endswith((".tfvars", ".tfvars.json"))
+    ]
+    value_items = [
+        item for item in evidence
+        if _teams_context_file_identity(item).lower().endswith((".tfvars", ".tfvars.json"))
+    ]
+    if not value_items:
+        return [evidence]
+
+    text = normalize_yes_no_reply(prompt)
+    dr_requested = bool(re.search(
+        r"(?<![a-z0-9])(dr|disaster recovery|failover|secondary)(?![a-z0-9])",
+        text,
+    ))
+    preferred_basenames = (
+        ("dr.tfvars", "tier.tfvars", "common.tfvars")
+        if dr_requested
+        else _TEAMS_FLAG_VALUES_BASENAME_PRIORITY
+    )
+
+    normalized_scope = str(scope_root or "").strip().strip("/")
+    phases: list[list[dict]] = []
+    used_paths: set[str] = set()
+
+    for basename in preferred_basenames:
+        matches: list[dict] = []
+        for item in value_items:
+            path = _teams_context_file_identity(item).strip().strip("/")
+            if not path or path in used_paths:
+                continue
+            if path.rsplit("/", 1)[-1].lower() != basename:
+                continue
+            if normalized_scope:
+                # Leaf hub/dr files belong to the exact environment folder.
+                # tier/common may be inherited from a direct parent/root and
+                # are therefore allowed outside the leaf scope.
+                if basename in {"hub.tfvars", "dr.tfvars"} and not path.startswith(normalized_scope.rstrip("/") + "/"):
+                    continue
+            matches.append(item)
+        if not matches:
+            continue
+        for item in matches:
+            used_paths.add(_teams_context_file_identity(item).strip().strip("/"))
+        phases.append(_teams_merge_repository_evidence(non_values, matches))
+
+    # Never reintroduce dr.tfvars into a normal environment request. If none of
+    # the preferred files were present, keep non-DR value evidence only.
+    if not phases:
+        allowed_values = []
+        for item in value_items:
+            path = _teams_context_file_identity(item).lower()
+            if not dr_requested and path.endswith("/dr.tfvars"):
+                continue
+            allowed_values.append(item)
+        phases.append(_teams_merge_repository_evidence(non_values, allowed_values))
+
+    return [phase for phase in phases if phase] or [evidence]
+
+
+def _teams_resolve_repository_boolean_strategy(
+    prompt: str,
+    repository_evidence: list[dict],
+    scope_root: str = "",
+) -> tuple[dict, list[dict], list[dict]]:
+    """Run semantic Boolean resolution in repository precedence order.
+
+    Returns ``(strategy, candidates, evidence_used)``.  The first phase that
+    yields a backend-validated literal Boolean wins.  If no phase yields a
+    Boolean, the final strategy result is returned so ordinary non-Boolean
+    modification generation can continue unchanged.
+    """
+    phases = _teams_azure_boolean_resolution_phases(prompt, repository_evidence, scope_root)
+    last_strategy: dict = {}
+    last_phase: list[dict] = list(repository_evidence or [])
+    for phase in phases:
+        strategy, candidates = _validated_repository_boolean_strategy(prompt, phase)
+        last_strategy = strategy
+        last_phase = phase
+        if candidates:
+            return strategy, candidates, phase
+
+        # Foundry semantic classification is primary. If it declines a Boolean
+        # even though the preferred repository value file contains one unique,
+        # high-confidence prompt/identifier match, use the existing generic
+        # backend selector as a safety fallback. This selector is resource-
+        # agnostic, tie-safe, and operates only on literal live-repository
+        # assignments; it never invents a flag or path. The fallback prevents
+        # "tell me the exact variable/file" questions for self-answerable
+        # requests such as disabling a homepage application whose repo flag is
+        # named aca_app_homepage_bff_enabled.
+        fallback_context = {
+            "matched_files": list(phase),
+            "environment_files": list(phase),
+            "selection_state": "candidate_selection_required",
+        }
+        selected = _teams_auto_select_feature_flag_context_stage1(
+            fallback_context,
+            prompt,
+        )
+        selected_files = list((selected or {}).get("matched_files") or [])
+        if (selected or {}).get("feature_flag_selection") and len(selected_files) == 1:
+            selected_item = selected_files[0]
+            match = dict(selected_item.get("feature_flag_match") or {})
+            path = _teams_context_file_identity(selected_item)
+            flag = str(match.get("flag") or "").strip()
+            current = str(match.get("current_value") or "").strip().lower()
+            target = str(match.get("new_value") or "").strip().lower()
+            try:
+                line_number = int(match.get("line") or 0)
+            except (TypeError, ValueError):
+                line_number = 0
+            if path and flag and line_number > 0 and current in {"true", "false"} and target in {"true", "false"} and current != target:
+                candidate = {
+                    "path": path,
+                    "line_number": line_number,
+                    "flag": flag,
+                    "current_value": current,
+                    "new_value": target,
+                    "confidence": 1.0,
+                    "context": str(match.get("context") or "").strip(),
+                    "description": "Unique live-repository Boolean matched by prompt semantics after Foundry declined a Boolean strategy.",
+                    "classification_reason": "deterministic repository Boolean fallback after semantic classifier returned no candidate",
+                    "operation": _teams_feature_flag_intent(prompt),
+                }
+                fallback_strategy = {
+                    "operation": _teams_feature_flag_intent(prompt),
+                    "boolean_applicable": True,
+                    "reason": (
+                        "Foundry returned no Boolean candidate, but live repository evidence contained one unique "
+                        "high-confidence literal Boolean matching the requested feature in the preferred values file."
+                    ),
+                    "fallback": "unique_literal_boolean_semantic_match",
+                }
+                return fallback_strategy, [candidate], phase
+    return last_strategy, [], last_phase
+
+
 def build_backend_existing_infra_modification_context(
     prompt: str,
     thread_id: str,
@@ -36821,7 +36985,18 @@ def build_backend_existing_infra_modification_context(
     except Exception as exc:
         LOGGER.debug("Full Teams repository evidence rehydration skipped: %s", exc)
 
-    strategy, candidates = _validated_repository_boolean_strategy(prompt, evidence)
+    if normalized_cloud == "azure":
+        strategy, candidates, strategy_evidence = _teams_resolve_repository_boolean_strategy(
+            prompt,
+            evidence,
+            scope_root=str(context.get("scope_root") or ""),
+        )
+        # Keep the resolved evidence visible to downstream generation.  For a
+        # normal hub request this deliberately excludes dr.tfvars, preventing
+        # a later agent turn from switching away from the already-resolved hub.
+        evidence = strategy_evidence or evidence
+    else:
+        strategy, candidates = _validated_repository_boolean_strategy(prompt, evidence)
     context["repository_change_strategy"] = {
         "operation": str(strategy.get("operation") or "unknown"),
         "boolean_applicable": bool(candidates),
