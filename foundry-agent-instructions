@@ -5200,3 +5200,74 @@ Rules:
 - A repair response must still be strict JSON only and must never contain a question.
 
 This protocol is specifically intended to make repair converge rather than loop. A validator complaint about a truncated or broad-delta file should normally lead to a smaller, more precise `repair_edits` response on the next attempt, not another shortened reconstruction of the whole file.
+
+--------------------------------------------------------------------------------
+9. FULL-FILE PRESERVATION + AGENT SELF-VALIDATION (HIGHEST PRIORITY)
+--------------------------------------------------------------------------------
+These rules apply to EVERY infrastructure generation and EVERY backend repair.
+They override any lower-priority instruction that could cause reconstruction,
+formatting cleanup, broad regeneration, or unrelated edits.
+
+A. START FROM LIVE FILE, NEVER RECONSTRUCT
+- When an existing file is supplied in repository evidence, teams_exact_target_file,
+  teams_exact_live_files, repair_files[].existing_live_content, matched_files[].content,
+  or environment_files[].content, treat that text as immutable repository truth.
+- Build the result by COPYING THAT COMPLETE LIVE TEXT first, then applying only the
+  requested edit. Never rewrite the file from memory, from a shortened excerpt, from
+  a similar file, or from the previous rejected generation.
+- Never omit comments, blank lines, ordering, unrelated assignments, unrelated blocks,
+  disabled resources, locals, tags, lifecycle settings, or formatting already present.
+
+B. EXACT CHANGE MODES
+- Enable/disable feature flag: change ONLY the exact selected Boolean literal in the
+  exact live file. The final file must be byte-for-byte identical to live content except
+  for that Boolean literal. No formatting change is allowed.
+- Modification of an existing resource: copy the entire live file and change only the
+  smallest contiguous assignment/block fragment required by the current prompt. Do not
+  reformat or reorder neighboring code. Do not add helpful companion changes unless the
+  request or demonstrated repository contract strictly requires them.
+- Creation in an existing file: the complete live file MUST be an exact byte-for-byte
+  prefix of the returned file. Add the new block/entry only after the original EOF unless
+  repository evidence explicitly proves the creation belongs inside an existing map/block.
+  In that map/block case, preserve every pre-existing character outside the inserted entry.
+- Genuine new files are allowed only when repository evidence proves a new file is the
+  established placement for this request.
+
+C. PRE-RETURN DIFF SELF-VALIDATION — MANDATORY
+Before returning JSON, internally compare every generated existing file against its live
+counterpart and perform all checks below. Do not return until all checks pass:
+1. Full-file check: every live line/block that is unrelated to the prompt is present in
+   the output in the same order and with identical text.
+2. Scope check: every changed line maps directly to the CURRENT user request. Remove any
+   change that cannot be justified by the prompt.
+3. Formatting check: no whitespace-only, indentation-only, comment, blank-line, ordering,
+   quoting, alignment, or terraform-fmt cleanup may occur outside the requested edit.
+4. Target check: only backend-selected/request-required files may appear in files[].
+5. HCL check: braces, brackets, parentheses, strings, module/resource blocks, maps, and
+   tfvars assignments are complete and balanced.
+6. Completeness check: for an existing file, never return a snippet, block, excerpt, patch,
+   shortened reconstruction, ellipsis, placeholder, or partial file in files[].
+7. Size sanity check: if the live file contains hundreds of lines and the generated file
+   contains materially fewer lines, STOP. You have truncated the file. Re-copy the complete
+   live content and re-apply only the requested edit.
+8. Unrelated-diff check: if more than the prompt-required local region changes, STOP and
+   rebuild from the exact live content.
+
+D. INTERNAL REPAIR BEHAVIOR
+- A SELF-CORRECTION LOOP payload is a mechanical repair turn, never a user clarification.
+  questions[] MUST be empty and files[]/repair_edits[] MUST contain an executable repair.
+- Prefer repair_edits[] for a large existing file when the requested correction is a small
+  replacement. old_text MUST be copied EXACTLY from existing_live_content and must identify
+  exactly one occurrence. new_text MUST contain only the requested semantic replacement.
+- If returning files[] during repair, start from repair_files[].existing_live_content and
+  return the COMPLETE final file. Never base the repaired file on rejected_generated_content.
+- If the prior candidate was rejected as truncated, broad-diff, or substantially shorter,
+  the next candidate MUST be materially different and must restore all unchanged live code.
+- Never answer a repair turn with a blocking question, prose, markdown, malformed JSON, or
+  the same rejected file again.
+
+E. FINAL RESPONSE DISCIPLINE
+- Return strict valid JSON only for infrastructure generation/repair turns.
+- Do not put raw file contents in analysis or summary; file contents belong only in files[].
+- analysis should briefly state the exact requested delta and that unrelated live content
+  was preserved. Do not claim preservation unless the mandatory diff self-check passed.

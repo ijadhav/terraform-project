@@ -26363,6 +26363,9 @@ def _teams_build_backend_repair_payload(
             "Preserve every unrelated live line, comment, block, ordering choice, and blank-line structure.",
             "Before responding, self-check that existing_nonblank_line_count is preserved within the requested surgical edit and that HCL is complete/balanced.",
             "The repaired content must differ from rejected_generated_content when the backend rejected that content; do not echo the same failed candidate.",
+            "MANDATORY SELF-VALIDATION: before responding, diff the proposed result against existing_live_content. Every changed line must map directly to original_user_request or the named backend_validation_error. Remove formatting-only, reordered, renamed, or unrelated changes.",
+            "TRUNCATION GUARD: if an existing live file is materially longer than your candidate, the candidate is invalid. Re-copy existing_live_content in full and apply only the surgical change, or return repair_edits[] instead of reconstructing the file.",
+            "For Boolean enable/disable repairs, prefer one repair_edits[] replacement of the exact live Boolean assignment. For ordinary modifications, prefer the smallest exact old_text/new_text replacement that implements the request.",
             "Return strict infra JSON only. During repair, use either corrected files[] or repair_edits[]. Do not ask a question and do not delegate semantic repair to the backend.",
         ],
         "repair_edit_output_shape": {
@@ -26891,6 +26894,9 @@ def _build_agent_input_for_infra_safe(
         "The backend rebases modification output onto the latest live file and rejects broad replacements. Return a full, terraform-fmt-compatible proposal for the selected path, but preserve every unrelated assignment, block, comment, and blank line.",
         "A switch between AWS/tf-devops and Azure/tf-azure-hub is a repository switch: use a new branch from that repository's latest remote base and rebuild repository context rather than reusing the other repository's branch.",
         "If the prompt also requests a PR, complete code generation and branch creation first, retain the PR intent through any clarification, then create/refresh the PR after Jira collection.",
+        "TEAMS AGENT SELF-VALIDATION (HARD): before returning any existing file, compare the candidate against the exact live file supplied in backend context. Start from the live text, not a reconstruction. Every differing line must be directly required by the current user prompt; remove all formatting-only, comment, blank-line, ordering, naming, or unrelated changes.",
+        "TEAMS COMPLETE-FILE GUARANTEE (HARD): files[] must contain the complete final file for every existing path. Never return a shortened file, excerpt, changed block, ellipsis, placeholder, or reconstructed subset. If the live file is much longer than your candidate, treat that as self-validation failure and rebuild from the live file before responding.",
+        "TEAMS THREE-MODE PRESERVATION (HARD): Boolean enable/disable = only the selected Boolean literal may differ; existing-resource modification = only a small prompt-related local delta may differ; creation in an existing file = preserve the live file exactly and append/insert only the new requested repository-pattern entry with all unrelated bytes unchanged.",
     ])
     payload["instructions"] = instructions
     return json.dumps(payload, indent=2)
