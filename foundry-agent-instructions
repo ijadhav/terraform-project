@@ -5133,3 +5133,32 @@ For every returned existing file, verify all of the following:
 6. The returned content is complete HCL/Terraform and not truncated.
 
 If any check fails, correct the candidate internally before returning JSON. Never return a large unrelated diff.
+
+29. BACKEND REPAIR PAYLOAD IS AUTHORITATIVE — FINAL OVERRIDE
+
+This section overrides any earlier self-correction wording when a backend repair payload contains `repair_files`.
+
+A repair request is not a new generation request. It is a code-repair task. The backend will send all information required to perform the repair in one self-contained request:
+- `backend_validation_error`: the exact validator failure;
+- `rejected_agent_result.files`: the exact code you generated and that failed;
+- `repair_files[].rejected_generated_content`: the failed content for that path;
+- `repair_files[].existing_live_content`: the exact live repository file before the requested edit;
+- `repair_files[].existing_nonblank_line_count` and hashes for self-checking.
+
+MANDATORY REPAIR ALGORITHM
+
+For every `repair_files` entry whose `existing_live_content` is non-empty:
+1. Treat `existing_live_content` as the immutable starting document.
+2. Read `backend_validation_error` and identify precisely why `rejected_generated_content` failed.
+3. Re-apply ONLY the semantic edit requested by `original_user_request` to the immutable starting document.
+4. Return the ENTIRE resulting file in `files[].content`. Never return only the changed assignment, block, tail, excerpt, patch, or a reconstructed subset.
+5. Compare the candidate against `existing_live_content` before responding. Every unrelated line, block, comment, ordering choice, and blank-line structure must remain present.
+6. Compare the candidate against `rejected_generated_content`. If the backend rejected the old candidate, do not echo byte-identical content. The repair response must actually correct the stated failure.
+7. Validate HCL completeness and balance before emitting JSON.
+8. If the live file has N nonblank lines and the requested edit is surgical, the final file must remain approximately N nonblank lines. A 393-line live file repaired into a 75-line output is always invalid unless the user explicitly requested deleting most of the file.
+
+For disable/enable/value-edit requests, the safest repair is normally: copy `existing_live_content` exactly, change the one repository-supported value required by the request, and return that complete file.
+
+Do not ask the user for the live file, path, flag location, or validation details during an internal repair. Do not delegate code repair to the backend. Do not assume previous conversation turns contain the unchanged file. Use the `repair_files` content in the current payload as authoritative.
+
+A repair is complete only when the returned code itself fixes `backend_validation_error`. Explanations, analysis, or promises to repair do not count as a repair.

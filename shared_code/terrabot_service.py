@@ -19905,6 +19905,7 @@ def handle_chat_request(data: dict):
                     # Foundry bounded repair attempts before any pending change/branch is
                     # exposed to Teams. The backend validates only; it never repairs HCL.
                     validation_error = None
+                    repair_feedback = ""
                     for repair_attempt in range(1, MAX_TEAMS_SELF_CORRECTION_ATTEMPTS + 1):
                         try:
                             agent_result = enforce_modification_uses_backend_matched_files(
@@ -20067,6 +20068,20 @@ def handle_chat_request(data: dict):
                                         "must_preserve_verbatim": True,
                                     }
 
+                            # Rebuild the repair request as one self-contained package.
+                            # This guarantees the agent receives the exact validator error,
+                            # the exact rejected generated code, and the exact live GitHub
+                            # counterpart for every returned existing file on every attempt.
+                            repair_payload = _teams_build_backend_repair_payload(
+                                current_result=agent_result,
+                                original_user_request=effective_prompt,
+                                backend_error=enforce_error,
+                                flow_context=_ACTIVE_TEAMS_FLOW_CONTEXT.get() or {},
+                                retrieved_value_context=retrieved_value_context,
+                                retrieved_module_context=retrieved_module_context,
+                                prior_repair_feedback=repair_feedback,
+                            )
+
                             _teams_diag_log(
                                 "sending_generation_validation_repair_to_agent",
                                 thread=conversation_id,
@@ -20084,9 +20099,8 @@ def handle_chat_request(data: dict):
                             # The next loop iteration will therefore re-run the same backend
                             # validation and send the rejection back to Foundry again.
                             try:
-                                repaired_conversation_id, repaired_reply = call_agent(
-                                    conversation_id,
-                                    json.dumps(repair_payload, indent=2),
+                                repaired_conversation_id, repaired_reply = _teams_call_agent_for_backend_repair(
+                                    repair_payload
                                 )
                                 repaired_reply = _teams_apply_agent_identity(
                                     repaired_reply,
@@ -20121,6 +20135,14 @@ def handle_chat_request(data: dict):
                                     repaired_result.get("repo_target"),
                                     effective_workflow,
                                 )
+                                if _teams_repair_candidate_is_identical(agent_result, repaired_result):
+                                    raise ValueError(
+                                        "Foundry repair returned byte-identical file content to the backend-rejected candidate. "
+                                        "The repair must actually change the failed output using existing_live_content."
+                                    )
+                                _teams_validate_repair_candidate_against_payload(
+                                    repaired_result, repair_payload
+                                )
                             except Exception as repair_response_error:
                                 _teams_diag_log(
                                     "generation_validation_repair_response_invalid",
@@ -20129,6 +20151,7 @@ def handle_chat_request(data: dict):
                                     attempt=f"{repair_attempt}/{MAX_TEAMS_SELF_CORRECTION_ATTEMPTS}",
                                     error=str(repair_response_error)[:300],
                                 )
+                                repair_feedback = str(repair_response_error)
                                 LOGGER.warning(
                                     "Foundry generation-validation repair response failed on "
                                     "attempt %s/%s (thread=%s): %s. Keeping the error private "
@@ -26195,6 +26218,192 @@ def _teams_attempt_tail_completion_repair(
     return True
 
 
+
+def _teams_repair_file_map(files: list[dict] | None) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for item in files or []:
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("filename") or item.get("path") or "").strip().strip("/")
+        if path:
+            result[path] = str(item.get("content") or "")
+    return result
+
+
+def _teams_collect_live_repair_files(
+    current_result: dict,
+    flow_context: dict | None,
+    retrieved_value_context: list | None,
+) -> list[dict]:
+    """Read the exact live counterpart for every rejected generated file.
+
+    Repair turns must be self-contained. They receive the rejected generated
+    code and the exact live repository code side-by-side so Foundry never has
+    to infer unchanged content from conversation memory or compacted context.
+    """
+    flow_context = dict(flow_context or {})
+    value_context = list(retrieved_value_context or [])
+    selected = _get_backend_existing_infra_context(value_context)
+    evidence: dict[str, str] = {}
+
+    if isinstance(selected, dict):
+        for item in list(selected.get("matched_files") or []) + list(selected.get("environment_files") or []):
+            if not isinstance(item, dict):
+                continue
+            path = str(item.get("path") or item.get("filename") or "").strip().strip("/")
+            content = str(item.get("content") or "")
+            if path and content:
+                evidence[path] = content
+
+    cloud = safe_normalize_cloud(current_result.get("cloud") or flow_context.get("cloud"))
+    workflow = str(current_result.get("workflow") or flow_context.get("workflow") or "").strip()
+    repo_target = current_result.get("repo_target") or flow_context.get("repo_target")
+    if cloud:
+        repo_target = normalize_repo_target(cloud, repo_target=repo_target, workflow=workflow)
+
+    ref = ""
+    if isinstance(selected, dict):
+        ref = str(selected.get("context_ref") or "").strip()
+    if not ref:
+        ref = str(flow_context.get("context_branch") or flow_context.get("source_branch") or "").strip()
+    if cloud and not ref:
+        try:
+            ref = _teams_remote_context_branch(cloud, repo_target, workflow)
+        except Exception:
+            ref = ""
+
+    generated = _teams_repair_file_map(current_result.get("files") or [])
+    live_files: list[dict] = []
+    for path, rejected_content in generated.items():
+        live_content = evidence.get(path, "")
+        if not live_content and cloud and ref:
+            try:
+                live_content = github_get_file_content(
+                    cloud,
+                    path,
+                    ref,
+                    repo_target=repo_target,
+                    workflow=workflow,
+                ) or ""
+            except Exception as exc:
+                _teams_diag_log(
+                    "repair_live_file_read_failed",
+                    level="warning",
+                    path=path,
+                    ref=ref,
+                    error=str(exc)[:240],
+                )
+        live_files.append({
+            "path": path,
+            "repository_ref": ref,
+            "existing_live_content": live_content,
+            "rejected_generated_content": rejected_content,
+            "existing_nonblank_line_count": len([line for line in live_content.splitlines() if line.strip()]),
+            "rejected_nonblank_line_count": len([line for line in rejected_content.splitlines() if line.strip()]),
+            "existing_sha256": hashlib.sha256(live_content.encode("utf-8")).hexdigest(),
+            "rejected_sha256": hashlib.sha256(rejected_content.encode("utf-8")).hexdigest(),
+            "must_return_complete_final_file": bool(live_content),
+        })
+    return live_files
+
+
+def _teams_build_backend_repair_payload(
+    current_result: dict,
+    original_user_request: str,
+    backend_error: Exception | str,
+    flow_context: dict | None = None,
+    retrieved_value_context: list | None = None,
+    retrieved_module_context: list | None = None,
+    prior_repair_feedback: str = "",
+) -> dict:
+    """Build one self-contained Foundry repair request.
+
+    The payload deliberately repeats all three artifacts needed to repair code:
+    validator error, rejected generated code, and exact live file code.
+    """
+    live_files = _teams_collect_live_repair_files(
+        current_result,
+        flow_context,
+        retrieved_value_context,
+    )
+    return {
+        "task": "SELF-CORRECTION LOOP: repair the rejected Terraform using the exact live files supplied in this payload.",
+        "channel": "teams",
+        "original_user_request": str(original_user_request or ""),
+        "backend_validation_error": str(backend_error),
+        "prior_repair_feedback": str(prior_repair_feedback or ""),
+        "expected_cloud": current_result.get("cloud"),
+        "expected_workflow": current_result.get("workflow"),
+        "expected_repo_target": current_result.get("repo_target"),
+        "rejected_agent_result": {
+            "cloud": current_result.get("cloud"),
+            "workflow": current_result.get("workflow"),
+            "repo_target": current_result.get("repo_target"),
+            "title": current_result.get("title"),
+            "summary": current_result.get("summary"),
+            "files": [
+                {"filename": (f or {}).get("filename"), "content": (f or {}).get("content")}
+                for f in (current_result.get("files") or [])
+                if isinstance(f, dict)
+            ],
+        },
+        "repair_files": live_files,
+        "retrieved_value_context": list(retrieved_value_context or []),
+        "retrieved_module_context": list(retrieved_module_context or []),
+        "repair_protocol": [
+            "For each repair_files entry, compare rejected_generated_content with existing_live_content and backend_validation_error.",
+            "Start from existing_live_content, not from rejected_generated_content, whenever existing_live_content is non-empty.",
+            "Apply only the semantic edit required by original_user_request.",
+            "Return the COMPLETE final existing file. Never return only the changed block, assignment, excerpt, patch, or shortened reconstruction.",
+            "Preserve every unrelated live line, comment, block, ordering choice, and blank-line structure.",
+            "Before responding, self-check that existing_nonblank_line_count is preserved within the requested surgical edit and that HCL is complete/balanced.",
+            "The repaired content must differ from rejected_generated_content when the backend rejected that content; do not echo the same failed candidate.",
+            "Return strict infra JSON only with corrected files[]. Do not ask a question and do not delegate repair to the backend.",
+        ],
+    }
+
+
+def _teams_repair_candidate_is_identical(previous_result: dict, repaired_result: dict) -> bool:
+    previous = _teams_repair_file_map(previous_result.get("files") or [])
+    repaired = _teams_repair_file_map(repaired_result.get("files") or [])
+    return bool(previous) and previous == repaired
+
+
+def _teams_validate_repair_candidate_against_payload(repaired_result: dict, repair_payload: dict) -> None:
+    """Validate a repair before replacing the last rejected candidate."""
+    repaired = _teams_repair_file_map(repaired_result.get("files") or [])
+    workflow = repaired_result.get("workflow") or repair_payload.get("expected_workflow")
+    for item in repair_payload.get("repair_files") or []:
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("path") or "").strip().strip("/")
+        live = str(item.get("existing_live_content") or "")
+        if not path or not live or path not in repaired:
+            continue
+        candidate = repaired[path]
+        if path.endswith((".tf", ".tfvars")):
+            _validate_hcl_content_complete(path, candidate)
+            _validate_agent_full_file_preservation_for_write(live, candidate, path, workflow)
+
+
+def _teams_call_agent_for_backend_repair(repair_payload: dict) -> tuple[str, str]:
+    """Use a fresh Foundry conversation for repair and bypass context compaction.
+
+    A repair payload is already fully self-contained. Continuing the old agent
+    conversation can bias the model toward the prior failed answer, while the
+    normal Teams context enricher can add enough unrelated history to dilute or
+    clip the live file. This isolated call sends exactly the validator error,
+    rejected code, and live code supplied by the backend.
+    """
+    raw = json.dumps(repair_payload, ensure_ascii=False, separators=(",", ":"))
+    _teams_diag_log(
+        "backend_repair_isolated_call",
+        input_chars=len(raw),
+        repair_files=len(repair_payload.get("repair_files") or []),
+    )
+    return _TEAMS_MULTICLOUD_PREVIOUS_CALL_AGENT(None, raw)
+
+
 def commit_terraform_files_to_branch_for_teams_with_self_correction(
     agent_result: dict,
     prompt: str,
@@ -26221,6 +26430,7 @@ def commit_terraform_files_to_branch_for_teams_with_self_correction(
     """
     current_result = agent_result
     last_error: Optional[Exception] = None
+    repair_feedback = ""
     _teams_diag_log(
         "commit_pipeline_start",
         thread=thread_id,
@@ -26360,16 +26570,33 @@ def commit_terraform_files_to_branch_for_teams_with_self_correction(
                         "must_preserve_verbatim": True,
                         "requested_resource_name": _teams_safe_prompt_resource_name(prompt),
                     }
+            # Canonical repair package: validator error + rejected code + exact live code.
+            repair_payload = _teams_build_backend_repair_payload(
+                current_result=current_result,
+                original_user_request=prompt,
+                backend_error=backend_error,
+                flow_context=context,
+                retrieved_value_context=context.get("retrieved_value_context") or [],
+                retrieved_module_context=context.get("retrieved_module_context") or [],
+                prior_repair_feedback=repair_feedback,
+            )
             _teams_diag_log(
                 "sending_full_regeneration_repair_to_agent",
                 thread=thread_id,
                 attempt=f"{attempt}/{max_attempts}",
             )
             try:
-                _conversation_id, repaired_reply = call_agent(
-                    thread_id, json.dumps(repair_payload, indent=2)
+                _conversation_id, repaired_reply = _teams_call_agent_for_backend_repair(
+                    repair_payload
                 )
-                current_result = try_parse_agent_output(repaired_reply)
+                repaired_result = try_parse_agent_output(repaired_reply)
+                if _teams_repair_candidate_is_identical(current_result, repaired_result):
+                    raise ValueError(
+                        "Foundry repair returned byte-identical file content to the backend-rejected candidate. "
+                        "The repair must actually change the failed output using existing_live_content."
+                    )
+                _teams_validate_repair_candidate_against_payload(repaired_result, repair_payload)
+                current_result = repaired_result
                 _teams_diag_log(
                     "agent_repair_response_received",
                     thread=thread_id,
@@ -26377,6 +26604,7 @@ def commit_terraform_files_to_branch_for_teams_with_self_correction(
                     files_returned=len(current_result.get("files") or []),
                 )
             except Exception as repair_call_error:
+                repair_feedback = str(repair_call_error)
                 LOGGER.warning(
                     "Foundry self-correction call failed on attempt %s (thread=%s): %s",
                     attempt, thread_id, repair_call_error,
