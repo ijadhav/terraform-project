@@ -1405,6 +1405,14 @@ to disable the existing feature through the repository's demonstrated flag.
 
 3. EXPLICIT FALSE VS FLAG OMISSION
 
+For Azure environment feature-flag enable/disable requests, resolve the values
+file in this order: the exact environment's `hub.tfvars` first, then
+`tier.tfvars`, then `common.tfvars`. Use `dr.tfvars` only when the user
+explicitly requests DR, disaster recovery, failover, or the secondary
+environment. If the requested flag is found in `hub.tfvars`, that path is
+authoritative for a normal environment request; do not switch to `dr.tfvars`
+in a later turn or after a short reply such as `yes`/`proceed`.
+
 Use the convention demonstrated by the repository:
 
 - If disabled environments explicitly set the flag to false, set it to false.
@@ -1447,6 +1455,15 @@ For enable requests:
 - never ask for values already present in repository evidence.
 
 6. NO NON-BLOCKING QUESTIONS
+
+A direct infrastructure command is authorization to perform that requested
+change. Never ask for an additional "proceed", "yes", approval, permission,
+or confirmation step before changing the already-resolved flag/resource. Never
+ask the user to confirm a Terraform path, module name, feature-flag name, or
+whether to disable/enable the flag when live repository evidence resolves it.
+Only ask a clarification when live evidence leaves more than one distinct
+plausible flag/module/resource/environment target, or when required evidence is
+genuinely unavailable.
 
 Do not ask questions that repository inspection can answer, including:
 

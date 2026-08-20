@@ -21781,7 +21781,9 @@ def _teams_auto_select_feature_flag_context_stage1(existing_infra_context: dict,
 
     This is repository validation/targeting only: it never generates or mutates
     Terraform. The selected literal assignment is later enforced byte-for-byte
-    by _validate_selected_boolean_is_only_file_change.
+    by _validate_selected_boolean_is_only_file_change. For environment value
+    files, normal hub requests prefer hub.tfvars; dr.tfvars is eligible only
+    when the user explicitly requested DR/failover/secondary.
     """
     intent = _teams_feature_flag_intent(prompt)
     if intent not in {"enable", "disable"}:
@@ -21837,6 +21839,21 @@ def _teams_auto_select_feature_flag_context_stage1(existing_infra_context: dict,
             score = (len(specific_overlap) * 10) + len(overlap)
             if flag.lower().endswith("_enabled"):
                 score += 2
+
+            basename = path.rsplit("/", 1)[-1].lower()
+            dr_requested = bool(re.search(
+                r"(?<![a-z0-9])(?:dr|disaster recovery|failover|secondary)(?![a-z0-9])",
+                text,
+            ))
+            if basename == "hub.tfvars":
+                score += 8 if not dr_requested else -4
+            elif basename == "dr.tfvars":
+                score += 8 if dr_requested else -8
+            elif basename == "tier.tfvars":
+                score += 4
+            elif basename == "common.tfvars":
+                score += 2
+
             candidates.append({
                 "score": score,
                 "path": path,
@@ -31535,6 +31552,8 @@ def _teams_backend_rule2_reply(prompt: str, retrieved_value_context: list | None
     """RULE 2 answered by the BACKEND: when the evidence proves the requested
     resource's enable flag is already true, return the modify-or-new-name
     question directly — never relay an agent request for file paths."""
+    if not _teams_is_existing_invocation_creation(prompt):
+        return None
     ctx = _get_backend_existing_infra_context(retrieved_value_context or [])
     name = _teams_requested_resource_name(prompt)
     if not isinstance(ctx, dict) or not name:
@@ -35917,22 +35936,29 @@ def _teams_candidate_selection_reply_non_boolean(existing_infra_context: dict) -
 
 
 def _teams_is_path_request_question(text: str) -> bool:
-    """Treat any resolved-target permission/path question as internally answerable."""
+    """Treat repo-answerable permission/path/flag questions as internal.
+
+    Generic proceed/confirmation wording is included so a direct infrastructure
+    command cannot leak an unnecessary approval roundtrip. Genuine ambiguity
+    cards (multiple flags/modules/resources) do not match.
+    """
     value = re.sub(r"\s+", " ", str(text or "").strip().lower())
     if _FINAL_BOOL_PREVIOUS_PATH_QUESTION(value):
         return True
     forbidden = (
-        "path restriction",
-        "allow modifying",
-        "allow modification",
-        "alternative repo-approved path",
-        "alternative repository-approved path",
-        "provide an alternative",
-        "confirm how you want to proceed given the path",
-        "specify the exact file",
-        "which file should i modify",
-        "which path should i modify",
-        "permission to modify",
+        "path restriction", "allow modifying", "allow modification",
+        "alternative repo-approved path", "alternative repository-approved path",
+        "provide an alternative", "confirm how you want to proceed given the path",
+        "specify the exact file", "which file should i modify",
+        "which path should i modify", "permission to modify",
+        "do you want me to proceed", "would you like me to proceed",
+        "should i proceed", "reply yes to proceed", "before i proceed",
+        "confirm the exact target", "confirm the target", "confirm the file",
+        "confirm the file path", "do you want me to disable",
+        "would you like me to disable", "should i disable",
+        "do you want me to enable", "would you like me to enable",
+        "should i enable", "turning off the repository flag",
+        "turning on the repository flag",
     )
     return any(marker in value for marker in forbidden)
 
@@ -37514,16 +37540,15 @@ def handle_teams_chat_request(data: dict):
 
     return result, status_code
 
-# Disable the older Teams lexical feature-flag auto-selector. The final generic
-# repository strategy above already asks Foundry to make the semantic decision
-# and literal-validates the result. Keeping both would reintroduce a Python
-# keyword/token heuristic after Foundry had already produced an adjudicated set.
+# Preserve the repository-grounded feature-flag selector for Teams. It only
+# auto-selects when live evidence yields one unambiguous Boolean assignment; a
+# score tie intentionally falls through to the normal clarification card. This
+# prevents an already-resolved hub.tfvars flag from being delegated back to
+# Foundry and later drifting to dr.tfvars.
 _RELEVANCE_PREVIOUS_AUTO_SELECT_FEATURE_FLAG_CONTEXT = _teams_auto_select_feature_flag_context
 
 
 def _teams_auto_select_feature_flag_context(existing_infra_context: dict, prompt: str) -> dict:
-    if (_ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}).get("active"):
-        return {}
     return _RELEVANCE_PREVIOUS_AUTO_SELECT_FEATURE_FLAG_CONTEXT(existing_infra_context, prompt)
 
 
