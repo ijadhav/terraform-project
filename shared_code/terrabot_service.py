@@ -666,7 +666,7 @@ def _reset_teams_chat_session_base(
     }
 
 
-def _teams_pending_state_mappings() -> dict[str, dict]:
+def _teams_pending_state_mappings_stage1() -> dict[str, dict]:
     return {
         "pending_infra_changes": PENDING_INFRA_CHANGES,
         "pending_cloud_clarifications": PENDING_CLOUD_CLARIFICATIONS,
@@ -677,6 +677,7 @@ def _teams_pending_state_mappings() -> dict[str, dict]:
         "pending_module_variable_value_selections": PENDING_MODULE_VARIABLE_VALUE_SELECTIONS,
         "pending_infra_modification_selections": PENDING_INFRA_MODIFICATION_SELECTIONS,
     }
+_teams_pending_state_mappings = _teams_pending_state_mappings_stage1
 
 
 def _teams_mapping_entries_for_thread(mapping: dict, thread_id: str) -> dict:
@@ -3818,7 +3819,7 @@ def _validate_full_file_modification_preserves_existing(
                     "The backend only allows targeted variable value edits."
                 )
 
-def github_put_file_if_changed(
+def github_put_file_if_changed_stage1(
     cloud: str,
     path: str,
     content: str,
@@ -3863,6 +3864,7 @@ def github_put_file_if_changed(
         workflow=workflow,
     )
     return {"changed": True, "path": path, "result": result}
+github_put_file_if_changed = github_put_file_if_changed_stage1
 
 def github_create_pull_request(cloud: Any | None, branch_name: str, title: str, body: str, repo_target: Optional[str] = None, workflow: Optional[str] = None):
     repo = github_repo_for_cloud(cloud, repo_target=repo_target, workflow=workflow)
@@ -7502,7 +7504,7 @@ def _aws_unique_custom_module_path(prompt: str, discovery: dict | None = None) -
     )
 
 
-def _aws_selected_module_context_with_contents(
+def _aws_selected_module_context_with_contents_stage1(
     selected_match: dict,
     discovery: dict,
     environment_path: str,
@@ -7635,6 +7637,7 @@ def _aws_selected_module_context_with_contents(
         ),
     }
     return verified, target_context
+_aws_selected_module_context_with_contents = _aws_selected_module_context_with_contents_stage1
 
 
 def _aws_selected_module_value_context(selected_match: dict, discovery: dict, environment_path: str) -> dict:
@@ -8237,13 +8240,14 @@ def _remove_backend_existing_infra_contexts(retrieved_value_context: list | None
     ]
 
 
-def _backend_existing_infra_context_is_selected(context: dict | None) -> bool:
+def _backend_existing_infra_context_is_selected_stage1(context: dict | None) -> bool:
     return bool(
         isinstance(context, dict)
         and context.get("source") == "backend_existing_infra_code_match"
         and context.get("selection_state") == "selected"
         and len(context.get("matched_files") or []) == 1
     )
+_backend_existing_infra_context_is_selected = _backend_existing_infra_context_is_selected_stage1
 
 
 def _infra_modification_search_terms(prompt: str) -> list[str]:
@@ -8415,7 +8419,7 @@ def _summarize_matched_blocks_for_selection(matched_file: dict, max_blocks: int 
     return ", ".join(headers) if headers else "matched file"
 
 
-def build_infra_modification_selection_reply(existing_infra_context: dict) -> str:
+def build_infra_modification_selection_reply_stage1(existing_infra_context: dict) -> str:
     lines = [
         "I found existing Terraform code that may match your modification request.",
         "Select the exact file/resource you want to modify. I will only change the selected path.",
@@ -8431,9 +8435,10 @@ def build_infra_modification_selection_reply(existing_infra_context: dict) -> st
     lines.append("")
     lines.append("Reply with the option number or the exact path to modify.")
     return "\n".join(lines)
+build_infra_modification_selection_reply = build_infra_modification_selection_reply_stage1
 
 
-def select_infra_modification_candidate_from_reply(reply: str, pending_selection: dict) -> int | None:
+def select_infra_modification_candidate_from_reply_stage1(reply: str, pending_selection: dict) -> int | None:
     text = (reply or "").strip()
     candidates = ((pending_selection.get("existing_infra_context") or {}).get("matched_files") or [])
     if not text:
@@ -8449,6 +8454,7 @@ def select_infra_modification_candidate_from_reply(reply: str, pending_selection
         if path and (path.lower() == normalized or path.lower() in normalized):
             return index
     return None
+select_infra_modification_candidate_from_reply = select_infra_modification_candidate_from_reply_stage1
 
 _TEAMS_ENV_EVIDENCE_MAX_FILES = 40
 _TEAMS_ENV_EVIDENCE_PER_FILE_CHARS = 20_000
@@ -9224,7 +9230,7 @@ def _build_selected_infra_modification_context_base(pending_selection: dict, sel
     return context
 
 
-def enforce_modification_uses_backend_matched_files(agent_result: dict, retrieved_value_context: list | None) -> dict:
+def enforce_modification_uses_backend_matched_files_stage1(agent_result: dict, retrieved_value_context: list | None) -> dict:
     """Keep true modifications scoped to the backend-selected file set.
 
     Teams intentionally routes ordinary create/add requests through
@@ -9314,6 +9320,7 @@ def enforce_modification_uses_backend_matched_files(agent_result: dict, retrieve
             f"Invalid path(s): {', '.join(invalid)}. Allowed path(s): {', '.join(sorted(allowed))}."
         )
     return agent_result
+enforce_modification_uses_backend_matched_files = enforce_modification_uses_backend_matched_files_stage1
 
 
 def commit_terraform_files_to_repo(
@@ -11169,7 +11176,7 @@ def _replace_or_append_file_entry(files: list[dict], filename: str, content: str
     })
 
 
-def _repair_azure_consumer_variables_tf_files_in_agent_result(agent_result: dict) -> dict:
+def _repair_azure_consumer_variables_tf_files_in_agent_result_stage1(agent_result: dict) -> dict:
     """Normalize any generated Azure consumer variables.tf before preview/commit.
 
     This catches the case where variables.tf is already present in files[] and
@@ -11198,6 +11205,7 @@ def _repair_azure_consumer_variables_tf_files_in_agent_result(agent_result: dict
             path=filename,
         )
     return agent_result
+_repair_azure_consumer_variables_tf_files_in_agent_result = _repair_azure_consumer_variables_tf_files_in_agent_result_stage1
 
 def _new_tfvars_assignment_roots(
     existing_tfvars: str,
@@ -11226,7 +11234,7 @@ def _new_tfvars_assignment_roots(
     return roots
 
 
-def ensure_azure_consumer_variables_tf_file(
+def ensure_azure_consumer_variables_tf_file_stage1(
     agent_result: dict,
     retrieved_value_context: list | None = None,
 ) -> dict:
@@ -11387,6 +11395,7 @@ def ensure_azure_consumer_variables_tf_file(
     routing_summary["variables_added"] = summary_added
     agent_result["routing_summary"] = routing_summary
     return agent_result
+ensure_azure_consumer_variables_tf_file = ensure_azure_consumer_variables_tf_file_stage1
 
 def _is_sensitive_variable_name(name: str) -> bool:
     lowered = (name or "").lower()
@@ -11776,7 +11785,7 @@ def _is_new_azure_module_consumer_context(retrieved_module_context: list) -> boo
     return False
 
 
-def validate_azure_consumer_two_file_payload_for_commit(agent_result: dict) -> None:
+def validate_azure_consumer_two_file_payload_for_commit_stage1(agent_result: dict) -> None:
     if not isinstance(agent_result, dict):
         return
     if normalize_cloud(agent_result.get("cloud")) != "azure":
@@ -11823,6 +11832,7 @@ def validate_azure_consumer_two_file_payload_for_commit(agent_result: dict) -> N
             file_data.get("content") or "",
             filename,
         )
+validate_azure_consumer_two_file_payload_for_commit = validate_azure_consumer_two_file_payload_for_commit_stage1
 
 
 def _find_agent_file_by_name_or_suffix(files: list[dict], target_filename: str, suffix: str = "") -> dict:
@@ -14026,7 +14036,7 @@ def _tfvars_missing_suggested_assignments(
             missing.append(name)
     return missing
 
-def enforce_real_module_inputs(agent_result: dict, retrieved_module_context: list) -> dict:
+def enforce_real_module_inputs_stage1(agent_result: dict, retrieved_module_context: list) -> dict:
     if not isinstance(agent_result, dict):
         return agent_result
 
@@ -14304,6 +14314,7 @@ def enforce_real_module_inputs(agent_result: dict, retrieved_module_context: lis
         "Azure consumer generation requires backend-routed tf-azure-hub context with target_consumer_filename "
         "and target_tfvars_filename. No single-file/source-only consumer PR was created."
     )
+enforce_real_module_inputs = enforce_real_module_inputs_stage1
 
 def finalize_agent_result_after_parse(
     agent_result: dict,
@@ -21765,7 +21776,7 @@ def _teams_feature_flag_intent(prompt: str) -> str:
 
 
 
-def _teams_auto_select_feature_flag_context(existing_infra_context: dict, prompt: str) -> dict:
+def _teams_auto_select_feature_flag_context_stage1(existing_infra_context: dict, prompt: str) -> dict:
     """Select one unambiguous live Boolean feature flag for enable/disable.
 
     This is repository validation/targeting only: it never generates or mutates
@@ -21867,6 +21878,7 @@ def _teams_auto_select_feature_flag_context(existing_infra_context: dict, prompt
         "Return the COMPLETE final file and change only the literal Boolean value on that assignment. Do not add, remove, rename, reorder, or reformat any other line.",
     ]
     return context
+_teams_auto_select_feature_flag_context = _teams_auto_select_feature_flag_context_stage1
 
 def _teams_repo_target_for_expected(cloud: str, workflow: str) -> str:
     return normalize_repo_target(cloud, workflow=workflow)
@@ -22250,7 +22262,7 @@ def _build_agent_input_for_infra_teams_v1(
     return json.dumps(payload, indent=2)
 
 
-def _teams_coerce_agent_payload(agent_text: str, context: dict) -> tuple[dict, dict]:
+def _teams_coerce_agent_payload_stage1(agent_text: str, context: dict) -> tuple[dict, dict]:
     payload = extract_json_from_text(agent_text)
     if not isinstance(payload, dict):
         raise ValueError("Teams agent response was not a JSON object.")
@@ -22339,6 +22351,7 @@ def _teams_coerce_agent_payload(agent_text: str, context: dict) -> tuple[dict, d
             + (f"Agent questions: {detail}" if detail else "A repair generation is required.")
         )
     return payload, dict(payload)
+_teams_coerce_agent_payload = _teams_coerce_agent_payload_stage1
 
 
 def try_parse_agent_output(agent_text: str):
@@ -22390,7 +22403,7 @@ def _teams_placeholder_expression(name: str, type_expr: str) -> tuple[str, str]:
     return json.dumps(token), token
 
 
-def _teams_select_aws_environment_consumer_file(
+def _teams_select_aws_environment_consumer_file_stage1(
     environment_path: str,
     branch: str,
 ) -> tuple[str, str]:
@@ -22456,6 +22469,7 @@ def _teams_select_aws_environment_consumer_file(
     usable.sort(key=lambda item: (-item[0], item[1]))
     _score, path, content = usable[0]
     return path, content
+_teams_select_aws_environment_consumer_file = _teams_select_aws_environment_consumer_file_stage1
 
 
 def _teams_build_deterministic_aws_consumer_payload(context: dict) -> dict:
@@ -25608,7 +25622,7 @@ def _teams_synthesize_azure_object_backed_creation_draft(
     """Disabled: Terraform semantic generation belongs exclusively to Foundry."""
     raise RuntimeError("Backend Terraform synthesis/materialization is disabled; retry through Foundry with live repository evidence.")
 
-def _teams_materialize_azure_object_backed_creation(
+def _teams_materialize_azure_object_backed_creation_stage1(
     transformed: dict,
     safe_files: list[dict],
     patch_details: list[dict],
@@ -25620,6 +25634,7 @@ def _teams_materialize_azure_object_backed_creation(
 ) -> list[dict]:
     """Disabled: Terraform semantic generation belongs exclusively to Foundry."""
     raise RuntimeError("Backend Terraform synthesis/materialization is disabled; retry through Foundry with live repository evidence.")
+_teams_materialize_azure_object_backed_creation = _teams_materialize_azure_object_backed_creation_stage1
 
 
 def _validate_azure_object_backed_three_file_write_set(
@@ -25754,7 +25769,7 @@ def _validate_azure_object_backed_three_file_write_set(
                         f"nearest sibling {source_root} field shape."
                     )
 
-def commit_terraform_files_to_branch_for_teams(agent_result: dict, prompt: str, thread_id: str) -> dict:
+def commit_terraform_files_to_branch_for_teams_stage1(agent_result: dict, prompt: str, thread_id: str) -> dict:
     """Apply Teams modifications surgically, then use the existing branch writer."""
     context = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
     _teams_diag_log(
@@ -26039,6 +26054,7 @@ def commit_terraform_files_to_branch_for_teams(agent_result: dict, prompt: str, 
     result["safe_patch_details"] = patch_details
     result["context_branch"] = source_branch
     return result
+commit_terraform_files_to_branch_for_teams = commit_terraform_files_to_branch_for_teams_stage1
 
 
 MAX_TEAMS_SELF_CORRECTION_ATTEMPTS = 5
@@ -27281,7 +27297,7 @@ def discover_live_aws_module_candidates(
     return base
 
 
-def normalize_module_variables_tf_content(
+def normalize_module_variables_tf_content_stage1(
     content: str,
     filename: str,
     workflow: str,
@@ -27345,6 +27361,7 @@ def normalize_module_variables_tf_content(
             if "is a string without a backend-approved or user-provided default" not in str(issue)
         ]
     return (updated or "").rstrip() + "\n", issues
+normalize_module_variables_tf_content = normalize_module_variables_tf_content_stage1
 
 
 def _teams_aws_context_snippet(content: str, limit: int = 14_000) -> str:
@@ -28001,7 +28018,7 @@ def _teams_aws_extract_new_consumer_block(files: list[dict], module_path: str) -
     return "", ""
 
 
-def _teams_aws_materialize_repo_aligned_consumer(
+def _teams_aws_materialize_repo_aligned_consumer_stage1(
     agent_result: dict,
     proposed_module_path: str,
     environment_path: str,
@@ -28080,6 +28097,7 @@ def _teams_aws_materialize_repo_aligned_consumer(
     module_files.append({"filename": target_path, "content": materialized})
     updated["files"] = module_files
     return updated
+_teams_aws_materialize_repo_aligned_consumer = _teams_aws_materialize_repo_aligned_consumer_stage1
 
 
 def _teams_validate_aws_module_creation_payload(
@@ -31105,7 +31123,7 @@ _TEAMS_PATH_QUESTION_RE = re.compile(
 )
 
 
-def _teams_commit_side_flag_guarantee(
+def _teams_commit_side_flag_guarantee_stage1(
     safe_files: list,
     patch_details: list,
     prompt: str,
@@ -31224,6 +31242,7 @@ def _teams_commit_side_flag_guarantee(
         )
     except Exception:
         logging.exception("Teams commit flag guarantee: skipped on error")
+_teams_commit_side_flag_guarantee = _teams_commit_side_flag_guarantee_stage1
 
 def _teams_collect_backend_env_context(retrieved_value_context: list | None) -> dict:
     """Merge every backend_existing_infra_code_match item in
@@ -31330,7 +31349,7 @@ def _teams_infer_requested_enable_flag_from_values(prompt: str, live_values: str
     return ""
 
 
-def _teams_ensure_flag_enable_in_env_values(
+def _teams_ensure_flag_enable_in_env_values_stage1(
     agent_result: dict,
     prompt: str,
     retrieved_value_context: list | None,
@@ -31485,9 +31504,11 @@ def _teams_ensure_flag_enable_in_env_values(
     except Exception:
         logging.exception("Teams flag-enable completion skipped")
         return agent_result
+_teams_ensure_flag_enable_in_env_values = _teams_ensure_flag_enable_in_env_values_stage1
     
-def _teams_is_path_request_question(text: str) -> bool:
+def _teams_is_path_request_question_stage1(text: str) -> bool:
     return bool(_TEAMS_PATH_QUESTION_RE.search(str(text or "")))
+_teams_is_path_request_question = _teams_is_path_request_question_stage1
 
 
 _TEAMS_NAME_STOPWORDS = {"is", "a", "an", "the", "it", "as", "be", "of", "to"}
@@ -32129,7 +32150,7 @@ def _teams_selected_invocation_context(
     return context
 
 
-def build_backend_existing_infra_modification_context(
+def build_backend_existing_infra_modification_context_stage1(
     prompt: str,
     thread_id: str,
     cloud: str,
@@ -32162,6 +32183,7 @@ def build_backend_existing_infra_modification_context(
         cloud,
         workflow,
     )
+build_backend_existing_infra_modification_context = build_backend_existing_infra_modification_context_stage1
 
 
 def build_agent_input_for_infra(
@@ -32360,7 +32382,7 @@ def reset_teams_chat_session(
     }
 
 
-def _teams_flow_guard_thread_candidates(request_data: dict, state: dict) -> list[str]:
+def _teams_flow_guard_thread_candidates_stage1(request_data: dict, state: dict) -> list[str]:
     values: list[str] = []
 
     def add(value: Any) -> None:
@@ -32379,6 +32401,7 @@ def _teams_flow_guard_thread_candidates(request_data: dict, state: dict) -> list
             if isinstance(session, dict):
                 add(session.get("thread_id"))
     return values
+_teams_flow_guard_thread_candidates = _teams_flow_guard_thread_candidates_stage1
 
 
 def _teams_flow_guard_find_target_selection(
@@ -32523,7 +32546,7 @@ def _teams_flow_guard_prepare_branch_reply(
     return updated, True
 
 
-def handle_teams_chat_request(data: dict):
+def _handle_teams_chat_request_state_machine(data: dict):
     """Terminal Teams state machine: one pending reply, one transition, no loops."""
     request_data = dict(data or {})
     prompt = str(request_data.get("prompt") or request_data.get("message") or "").strip()
@@ -33065,6 +33088,7 @@ def handle_teams_chat_request(data: dict):
         _teams_save_ui_state(teams_conversation_id, patch)
 
     return result, status_code
+handle_teams_chat_request = _handle_teams_chat_request_state_machine
 
 # =============================================================================
 # Final prompt/output relevance + Terraform validation guard
@@ -33229,7 +33253,7 @@ def _prompt_guard_validate_terraform_shape(agent_result: dict) -> None:
             raise ValueError(f"Generated Terraform file {path} contains Git conflict markers.")
 
 
-def _prompt_guard_agent_self_validate(agent_result: dict, prompt: str) -> None:
+def _prompt_guard_agent_self_validate_stage1(agent_result: dict, prompt: str) -> None:
     """Ask Foundry for an independent semantic + Terraform sanity verdict.
 
     This is intentionally a fresh validation conversation: it cannot inherit a
@@ -33293,14 +33317,16 @@ def _prompt_guard_agent_self_validate(agent_result: dict, prompt: str) -> None:
     reason = str(verdict.get("reason") or "").strip()
     detail = "; ".join(str(item) for item in errors if str(item).strip()) or reason or "generated output did not match the current request"
     raise ValueError(f"AGENT_SELF_VALIDATION_FAILED: {detail}")
+_prompt_guard_agent_self_validate = _prompt_guard_agent_self_validate_stage1
 
 
-def commit_terraform_files_to_branch_for_teams(agent_result: dict, prompt: str, thread_id: str) -> dict:
+def commit_terraform_files_to_branch_for_teams_stage2(agent_result: dict, prompt: str, thread_id: str) -> dict:
     """Final Teams write gate: prompt relevance -> HCL -> agent verifier -> existing commit guards."""
     _prompt_guard_validate_semantic_relevance(agent_result, prompt)
     _prompt_guard_validate_terraform_shape(agent_result)
     _prompt_guard_agent_self_validate(agent_result, prompt)
     return _PROMPT_GUARD_PREVIOUS_COMMIT_TERRAFORM_FOR_TEAMS(agent_result, prompt, thread_id)
+commit_terraform_files_to_branch_for_teams = commit_terraform_files_to_branch_for_teams_stage2
 
 
 def _teams_select_aws_environment_consumer_file(
@@ -33364,7 +33390,7 @@ def _teams_select_aws_environment_consumer_file(
 _PROMPT_GUARD_PREVIOUS_AWS_MATERIALIZER = _teams_aws_materialize_repo_aligned_consumer
 
 
-def _teams_aws_materialize_repo_aligned_consumer(
+def _teams_aws_materialize_repo_aligned_consumer_stage2(
     agent_result: dict,
     proposed_module_path: str,
     environment_path: str,
@@ -33437,6 +33463,7 @@ def _teams_aws_materialize_repo_aligned_consumer(
     module_files.append({"filename": target_path, "content": materialized})
     updated["files"] = module_files
     return updated
+_teams_aws_materialize_repo_aligned_consumer = _teams_aws_materialize_repo_aligned_consumer_stage2
 
 # =============================================================================
 # Teams vague-resource semantic resolution + user-friendly disambiguation
@@ -33706,7 +33733,7 @@ def _teams_semantic_resolve_modification_context(
     return result
 
 
-def build_backend_existing_infra_modification_context(
+def build_backend_existing_infra_modification_context_stage2(
     prompt: str,
     thread_id: str,
     cloud: str,
@@ -33732,6 +33759,7 @@ def build_backend_existing_infra_modification_context(
     return _teams_semantic_resolve_modification_context(
         context, prompt, cloud, workflow
     )
+build_backend_existing_infra_modification_context = build_backend_existing_infra_modification_context_stage2
 
 
 def _teams_candidate_friendly_label(item: dict) -> str:
@@ -33746,7 +33774,7 @@ def _teams_candidate_friendly_label(item: dict) -> str:
     return identifiers[0] if identifiers else str(item.get("filename") or "Terraform target")
 
 
-def build_infra_modification_selection_reply(existing_infra_context: dict) -> str:
+def build_infra_modification_selection_reply_stage2(existing_infra_context: dict) -> str:
     """Clean Teams clarification that always includes the actual choices."""
     candidates = list(existing_infra_context.get("matched_files") or [])[:6]
     if not candidates:
@@ -33769,6 +33797,7 @@ def build_infra_modification_selection_reply(existing_infra_context: dict) -> st
         "Reply with the number, the module/resource name, or the path. After you choose, Terrabot will generate the change and run the existing Terraform validation/self-check flow.",
     ])
     return "\n".join(lines)
+build_infra_modification_selection_reply = build_infra_modification_selection_reply_stage2
 
 # =============================================================================
 # 2026-08-13 Teams AWS selected-module materialization hardening
@@ -34225,7 +34254,7 @@ def _teams_find_reusable_aws_branch_for_request(state: dict, request_data: dict)
     return ""
 
 
-def handle_teams_chat_request(data: dict):
+def _handle_teams_chat_request_with_aws_branch_preflight(data: dict):
     """Ask branch choice before AWS module discovery/selection when reusable state exists."""
     request_data = dict(data or {})
     prompt = str(request_data.get("prompt") or request_data.get("message") or "").strip()
@@ -34326,6 +34355,7 @@ def handle_teams_chat_request(data: dict):
                 _teams_save_ui_state(teams_conversation_id, patch)
 
     return result, status_code
+handle_teams_chat_request = _handle_teams_chat_request_with_aws_branch_preflight
 
 
 # =============================================================================
@@ -34389,7 +34419,7 @@ def _teams_attach_related_pull_requests(result: dict, prompt: str, cloud: str) -
         return result
 
 
-def handle_teams_chat_request(data: dict):
+def _handle_teams_chat_request_with_related_pr_awareness(data: dict):
     """Final Teams wrapper: attach duplicate/related pull request awareness.
 
     Runs after every prior routing/state-machine stage so it sees the fully
@@ -34510,6 +34540,7 @@ def handle_teams_chat_request(data: dict):
         )
 
     return result, status_code
+handle_teams_chat_request = _handle_teams_chat_request_with_related_pr_awareness
 
 
 # =============================================================================
@@ -34522,7 +34553,7 @@ def handle_teams_chat_request(data: dict):
 _AGENT_OWNED_PREVIOUS_BUILD_EXISTING_CONTEXT = build_backend_existing_infra_modification_context
 
 
-def build_backend_existing_infra_modification_context(
+def build_backend_existing_infra_modification_context_stage3(
     prompt: str,
     thread_id: str,
     cloud: str,
@@ -34554,6 +34585,7 @@ def build_backend_existing_infra_modification_context(
             "No backend flag aliases, resource vocabulary, Boolean selection, or Terraform synthesis is authoritative.",
         ]
     return context
+build_backend_existing_infra_modification_context = build_backend_existing_infra_modification_context_stage3
 
 
 
@@ -35220,7 +35252,7 @@ def _teams_target_environment_main_tf_evidence(
     return evidence
 
 
-def build_backend_existing_infra_modification_context(
+def build_backend_existing_infra_modification_context_stage4(
     prompt: str,
     thread_id: str,
     cloud: str,
@@ -35283,6 +35315,7 @@ def build_backend_existing_infra_modification_context(
             "The backend will reject destructive/truncated full-file responses; it will not merge or synthesize Terraform on Foundry's behalf.",
         ]
     return context
+build_backend_existing_infra_modification_context = build_backend_existing_infra_modification_context_stage4
 
 
 def _terrabot_placeholder_content_detected(content: str) -> bool:
@@ -35298,7 +35331,7 @@ def _terrabot_placeholder_content_detected(content: str) -> bool:
     return any(marker in text for marker in markers)
 
 
-def _validate_agent_full_file_preservation_for_write(
+def _validate_agent_full_file_preservation_for_write_stage1(
     existing_content: str,
     generated_content: str,
     path: str,
@@ -35364,9 +35397,10 @@ def _validate_agent_full_file_preservation_for_write(
             f"({len(generated_nonblank)} vs {len(existing_nonblank)} nonblank lines). "
             "Refusing a likely truncated overwrite; Foundry must return the complete final file."
         )
+_validate_agent_full_file_preservation_for_write = _validate_agent_full_file_preservation_for_write_stage1
 
 
-def github_put_file_if_changed(
+def github_put_file_if_changed_stage2(
     cloud: str,
     path: str,
     content: str,
@@ -35412,6 +35446,7 @@ def github_put_file_if_changed(
         workflow=workflow,
     )
     return {"changed": True, "path": path, "result": result}
+github_put_file_if_changed = github_put_file_if_changed_stage2
 
 # =============================================================================
 # 2026-08-18 FOUNDRY SEMANTIC BOOLEAN CONTROL + EXACT PRESERVATION — FINAL OVERRIDE
@@ -35684,7 +35719,7 @@ def _validated_foundry_boolean_candidates(
     return True, ranked, str(classification.get("reason") or "")
 
 
-def build_backend_existing_infra_modification_context(
+def build_backend_existing_infra_modification_context_stage5(
     prompt: str,
     thread_id: str,
     cloud: str,
@@ -35805,6 +35840,7 @@ def build_backend_existing_infra_modification_context(
         context["selection_state"] = "candidate_selection_required"
         context["selected_path"] = ""
     return context
+build_backend_existing_infra_modification_context = build_backend_existing_infra_modification_context_stage5
 
 
 def select_infra_modification_candidate_from_reply(reply: str, pending_selection: dict) -> int | None:
@@ -35926,7 +35962,7 @@ class UnsafeGeneratedChangeError(ValueError):
     """
 
 
-def _validate_selected_boolean_is_only_file_change(
+def _validate_selected_boolean_is_only_file_change_stage1(
     existing_content: str,
     generated_content: str,
     path: str,
@@ -35985,6 +36021,7 @@ def _validate_selected_boolean_is_only_file_change(
         raise UnsafeGeneratedChangeError(
             f"Generated Boolean modification for {path} must change exactly one `{flag}` assignment; observed {changed}."
         )
+_validate_selected_boolean_is_only_file_change = _validate_selected_boolean_is_only_file_change_stage1
 
 
 def github_put_file_if_changed(
@@ -36109,7 +36146,7 @@ def _teams_rehydrate_repository_evidence_full_contents(
     return result
 
 
-def build_backend_existing_infra_modification_context(
+def build_backend_existing_infra_modification_context_stage6(
     prompt: str,
     thread_id: str,
     cloud: str,
@@ -36198,6 +36235,7 @@ def build_backend_existing_infra_modification_context(
             "Generate complete final changed files yourself. The backend will validate but will not merge, append, toggle, repair, or synthesize Terraform.",
         ]
     return context
+build_backend_existing_infra_modification_context = build_backend_existing_infra_modification_context_stage6
 
 
 def _backend_existing_infra_context_is_selected(context: dict | None) -> bool:
@@ -36628,7 +36666,7 @@ def _foundry_repository_change_strategy(
     return parsed
 
 
-def _validated_repository_boolean_strategy(
+def _validated_repository_boolean_strategy_stage1(
     prompt: str,
     repository_evidence: list[dict],
 ) -> tuple[dict, list[dict]]:
@@ -36690,6 +36728,7 @@ def _validated_repository_boolean_strategy(
         if top >= 0.80 and top - second >= 0.15:
             ranked = [ranked[0]]
     return strategy, ranked
+_validated_repository_boolean_strategy = _validated_repository_boolean_strategy_stage1
 
 
 def build_backend_existing_infra_modification_context(
