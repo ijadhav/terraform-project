@@ -20118,6 +20118,9 @@ def handle_chat_request(data: dict):
                                         "return corrected files[] and must not ask the user anything."
                                     )
 
+                                repaired_reply = _teams_materialize_repair_edits_response(
+                                    repaired_reply, repair_payload
+                                )
                                 repaired_result = try_parse_agent_output(repaired_reply)
                                 repaired_result = finalize_agent_result_after_parse(
                                     repaired_result,
@@ -26354,12 +26357,29 @@ def _teams_build_backend_repair_payload(
             "For each repair_files entry, compare rejected_generated_content with existing_live_content and backend_validation_error.",
             "Start from existing_live_content, not from rejected_generated_content, whenever existing_live_content is non-empty.",
             "Apply only the semantic edit required by original_user_request.",
-            "Return the COMPLETE final existing file. Never return only the changed block, assignment, excerpt, patch, or shortened reconstruction.",
+            "PREFERRED FOR LARGE EXISTING FILES: return repair_edits[] instead of re-emitting hundreds of unchanged lines. Each edit must contain path, old_text copied EXACTLY from existing_live_content, and new_text containing the requested replacement. old_text must identify exactly one occurrence in the live file; include enough surrounding lines if a short assignment is repeated.",
+            "The backend may deterministically materialize repair_edits by applying the exact Foundry-selected old_text -> new_text replacement to existing_live_content. This is transport/materialization only: Foundry remains responsible for choosing the semantic edit and the backend must never invent replacement HCL.",
+            "If you return files[] instead of repair_edits[], return the COMPLETE final existing file. Never return only a changed block, assignment, excerpt, patch, or shortened reconstruction in files[].",
             "Preserve every unrelated live line, comment, block, ordering choice, and blank-line structure.",
             "Before responding, self-check that existing_nonblank_line_count is preserved within the requested surgical edit and that HCL is complete/balanced.",
             "The repaired content must differ from rejected_generated_content when the backend rejected that content; do not echo the same failed candidate.",
-            "Return strict infra JSON only with corrected files[]. Do not ask a question and do not delegate repair to the backend.",
+            "Return strict infra JSON only. During repair, use either corrected files[] or repair_edits[]. Do not ask a question and do not delegate semantic repair to the backend.",
         ],
+        "repair_edit_output_shape": {
+            "mode": "infra",
+            "cloud": current_result.get("cloud"),
+            "workflow": current_result.get("workflow"),
+            "repo_target": current_result.get("repo_target"),
+            "title": current_result.get("title") or "Terraform repair",
+            "summary": current_result.get("summary") or "Repair backend-rejected Terraform change",
+            "repair_edits": [
+                {
+                    "path": "repo/relative/file.tfvars",
+                    "old_text": "exact text copied from existing_live_content",
+                    "new_text": "replacement text implementing only the requested change",
+                }
+            ],
+        },
     }
 
 
@@ -26384,6 +26404,114 @@ def _teams_validate_repair_candidate_against_payload(repaired_result: dict, repa
         if path.endswith((".tf", ".tfvars")):
             _validate_hcl_content_complete(path, candidate)
             _validate_agent_full_file_preservation_for_write(live, candidate, path, workflow)
+
+
+def _teams_materialize_repair_edits_response(agent_reply: str, repair_payload: dict) -> str:
+    """Materialize Foundry-selected surgical edits against exact live files.
+
+    Large existing Terraform files can exceed the practical response budget when
+    Foundry is forced to echo hundreds of unchanged lines. In repair mode Foundry
+    may therefore return ``repair_edits`` containing exact old_text/new_text
+    replacements. The backend does not decide or synthesize Terraform here: it
+    only applies the exact replacement chosen by Foundry to the exact
+    ``existing_live_content`` shipped in the repair payload, then sends the
+    resulting complete file through the normal preservation/HCL validators.
+    """
+    text = str(agent_reply or "").strip()
+    if not text:
+        return text
+
+    try:
+        payload = extract_json_from_text(text)
+    except Exception:
+        return text
+
+    edits = payload.get("repair_edits")
+    if not isinstance(edits, list) or not edits:
+        return text
+
+    live_by_path: dict[str, dict] = {}
+    for item in repair_payload.get("repair_files") or []:
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("path") or "").strip().strip("/")
+        if path:
+            live_by_path[path] = item
+
+    if not live_by_path:
+        raise ValueError(
+            "Foundry returned repair_edits, but the backend repair payload contains no live files."
+        )
+
+    edits_by_path: dict[str, list[dict]] = {}
+    for index, edit in enumerate(edits, start=1):
+        if not isinstance(edit, dict):
+            raise ValueError(f"repair_edits[{index}] must be an object.")
+        path = str(edit.get("path") or edit.get("filename") or "").strip().strip("/")
+        old_text = edit.get("old_text")
+        new_text = edit.get("new_text")
+        if not path or path not in live_by_path:
+            raise ValueError(
+                f"repair_edits[{index}] path '{path}' is not one of the backend-supplied live repair files."
+            )
+        if not isinstance(old_text, str) or not old_text:
+            raise ValueError(f"repair_edits[{index}] old_text must be non-empty exact live-file text.")
+        if not isinstance(new_text, str):
+            raise ValueError(f"repair_edits[{index}] new_text must be a string.")
+        if old_text == new_text:
+            raise ValueError(f"repair_edits[{index}] does not change anything.")
+        edits_by_path.setdefault(path, []).append({"old_text": old_text, "new_text": new_text})
+
+    materialized_files: list[dict] = []
+    for path, path_edits in edits_by_path.items():
+        live_item = live_by_path[path]
+        live_content = str(live_item.get("existing_live_content") or "")
+        if not live_content:
+            raise ValueError(
+                f"Cannot materialize repair_edits for {path}: existing_live_content is empty."
+            )
+
+        expected_sha = str(live_item.get("existing_sha256") or "").strip()
+        actual_sha = hashlib.sha256(live_content.encode("utf-8")).hexdigest()
+        if expected_sha and expected_sha != actual_sha:
+            raise ValueError(
+                f"Cannot materialize repair_edits for {path}: live-file checksum mismatch."
+            )
+
+        candidate = live_content
+        for edit_index, edit in enumerate(path_edits, start=1):
+            old_text = edit["old_text"]
+            new_text = edit["new_text"]
+            occurrences = candidate.count(old_text)
+            if occurrences != 1:
+                raise ValueError(
+                    f"repair_edits for {path} edit {edit_index} expected old_text to occur exactly once "
+                    f"in existing_live_content, but found {occurrences}. Foundry must include more exact surrounding context."
+                )
+            candidate = candidate.replace(old_text, new_text, 1)
+
+        if candidate == live_content:
+            raise ValueError(f"Materialized repair for {path} is unchanged from the live file.")
+
+        materialized_files.append({"filename": path, "content": candidate})
+
+    normalized = {
+        "mode": "infra",
+        "cloud": payload.get("cloud") or repair_payload.get("expected_cloud"),
+        "workflow": payload.get("workflow") or repair_payload.get("expected_workflow"),
+        "repo_target": payload.get("repo_target") or repair_payload.get("expected_repo_target"),
+        "title": payload.get("title") or (repair_payload.get("rejected_agent_result") or {}).get("title") or "Terraform repair",
+        "summary": payload.get("summary") or (repair_payload.get("rejected_agent_result") or {}).get("summary") or "Repair backend-rejected Terraform change",
+        "files": materialized_files,
+    }
+
+    _teams_diag_log(
+        "backend_repair_edits_materialized",
+        edit_count=sum(len(items) for items in edits_by_path.values()),
+        files=len(materialized_files),
+        paths=",".join(sorted(edits_by_path.keys()))[:500],
+    )
+    return json.dumps(normalized, ensure_ascii=False)
 
 
 def _teams_call_agent_for_backend_repair(repair_payload: dict) -> tuple[str, str]:
@@ -26588,6 +26716,9 @@ def commit_terraform_files_to_branch_for_teams_with_self_correction(
             try:
                 _conversation_id, repaired_reply = _teams_call_agent_for_backend_repair(
                     repair_payload
+                )
+                repaired_reply = _teams_materialize_repair_edits_response(
+                    repaired_reply, repair_payload
                 )
                 repaired_result = try_parse_agent_output(repaired_reply)
                 if _teams_repair_candidate_is_identical(current_result, repaired_result):
