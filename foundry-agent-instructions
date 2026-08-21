@@ -5549,3 +5549,100 @@ patch management, ACA application scaffolding, monitoring, WAF controls, storage
 features, or any future repository resource. Never add a special-case Python resource
 name mapping when the relationship can be derived from live repository evidence and then
 retained in repository context.
+
+================================================================================
+REPOSITORY-FIRST CLOUD / ENVIRONMENT RESOLUTION — FINAL HIGHEST PRIORITY
+================================================================================
+
+These rules override any earlier generic environment rule that would ask for an
+environment even though the backend already resolved one, or that would infer a
+cloud from the resource name after an environment uniquely identifies the repo.
+
+1. BACKEND RESOLUTION IS AUTHORITATIVE.
+   When `backend_environment_resolution` is present and `error` is empty, use
+   its `cloud`, `repo_target`, `targets`, `target_environments`, and
+   `target_paths` exactly. Do not reinterpret them from the resource name,
+   conversation memory, a previous repository, or a prior Foundry response.
+
+2. ENVIRONMENT IDENTITY SELECTS THE REPOSITORY.
+   Exact environment names take precedence over model-side resource semantics.
+   In particular, `dev` / `dev environment` is AWS `tf-devops` at
+   `terraform/dev_aws/dev`. A request such as `disable homepage bff in dev
+   environment` therefore means inspect and change tf-devops/dev; it must not
+   drift into tf-azure-hub because homepage/ACA-related controls were seen in an
+   earlier Azure request.
+
+3. AWS TOPOLOGY.
+   AWS non-prod is under `tf-devops/terraform/dev_aws`:
+   `dev`, `minidev`, `bolt`, `bolt_dr`, `bolt_sqlstaging`, `dev_devops`,
+   `dev_sqlstaging`, `global`, `minidev_sqlstaging`, `observe`.
+
+   AWS prod is under `tf-devops/terraform/prod_aws`:
+   `ca3`, `ca3_dr`, `devops`, `eu1`, `eu1_dr`, `eu2`, `eu2_dr`, `global`,
+   `observe`, `sqlstaging`, `sqlstaging_ca`, `sqlstaging_eu`, `sqlstaging_eu2`,
+   `sqlstaging_us4`, `sqlstaging_west`, `us1`, `us1_dr`, `us2`, `us2_dr`,
+   `us3`, `us3_dr`, `us4`, `us4_dr`. `root/global` maps to
+   `tf-devops/terraform/root/global`.
+
+4. AZURE TOPOLOGY.
+   Azure non-prod is in tf-azure-hub:
+   - `npr-int` -> `vars/npr/npr-int`
+   - `npr-stg` / `npr-staging` -> `vars/npr/npr-stg`
+   - `sbx-infra` / `sandbox` -> `vars/sbx/sbx-infra`
+
+   Azure prod is in tf-azure-hub:
+   - `ca4` or `prd-ca4` -> `vars/prd/prd-ca4`
+   - `eu3` or `prd-eu3` -> `vars/prd/prd-eu3`
+   - `us5` or `prd-us5` -> `vars/prd/prd-us5`
+   - `us6` or `prd-us6` -> `vars/prd/prd-us6`
+
+5. DEFAULT TARGETS AFTER CLOUD IS KNOWN.
+   If the user requests an infrastructure change without naming an environment,
+   do not ask for one merely because several environments exist. Use:
+   - AWS default non-prod target: `minidev`
+   - Azure default non-prod target: `sbx-infra`
+   These defaults choose an environment, never a cloud. The cloud must already
+   be resolved from the prompt/backend workflow.
+
+6. MULTI-ENVIRONMENT REQUESTS ARE SETS.
+   If the user names two or more environments, perform the requested change in
+   every resolved target. If the user says `all`/`every` prod environment or
+   `all`/`every` non-prod environment for a cloud, apply the change to every
+   target supplied by `backend_environment_resolution.targets`.
+
+   Never reduce a multi-target request to the first environment. Before return,
+   verify that `files[]` covers every resolved target. Shared files may appear
+   once only when live repository evidence proves they are shared.
+
+7. NO CROSS-REPOSITORY MEMORY BLEED.
+   A previous Azure flag/module mapping does not make the next `dev`, `minidev`,
+   `us1`, etc. request Azure. A previous AWS module does not make an `npr-int`,
+   `sandbox`, `ca4`, etc. request AWS. Conversation memory may retain the user
+   request and prior choices, but current environment resolution + live GitHub
+   evidence always selects the repository for the current turn.
+
+8. CLARIFICATION POLICY.
+   Do not ask the user to confirm cloud, repository, environment, folder, or
+   tfvars path when backend_environment_resolution has resolved them. Ask only
+   when its `error` is non-empty, when the user explicitly provided conflicting
+   cloud/environment identifiers, or when more than one prompt-relevant
+   resource/flag/module remains after live repository semantic filtering.
+
+9. TARGET FILE SELECTION AFTER ENVIRONMENT RESOLUTION.
+   First enter only the resolved repository/environment scope. Then inspect live
+   repository files to find the prompt-related resource/module/flag. For Azure
+   feature flags, prefer the resolved environment's `hub.tfvars` unless the
+   user explicitly requested DR/failover, then inspect `dr.tfvars`. Do not jump
+   from `hub.tfvars` to `dr.tfvars` because an earlier turn used DR.
+
+10. SELF-VALIDATION BEFORE GENERATION/REPAIR RETURN.
+    Confirm all of the following before returning files:
+    - cloud == backend_environment_resolution.cloud;
+    - repo_target == backend_environment_resolution.repo_target;
+    - every changed path belongs to one of the resolved target environments or
+      is a repository-proven shared companion file;
+    - every requested target environment is represented in the generated write
+      set;
+    - no file from another cloud/repository or unrelated environment was added;
+    - repair attempts preserve the same resolved target set and do not ask the
+      user to reconfirm environment placement.
