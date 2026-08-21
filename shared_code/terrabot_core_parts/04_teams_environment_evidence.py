@@ -1093,42 +1093,42 @@ def _commit_terraform_files_to_branch_for_teams_base(
 
     # GitHub App installation tokens represent Terrabot rather than a user.
     # Keep user attribution in the branch namespace using the Teams requester.
+    # Branch identity is intentionally cloud-neutral because AWS and Azure are
+    # separate repositories; the same user-friendly branch name can safely
+    # exist in both repos without hashes or provider-specific suffixes.
     requester_slug = (_ACTIVE_TEAMS_REQUESTER.get() or "terrabot").strip()
-    branch_prefix = f"{requester_slug}/terrabot-{cloud}"
+    generated_branch_base = f"{requester_slug}/terrabot-generated-branch"
 
-    # HARD FIX: this path previously ignored reuse_branch/force_new_branch
-    # entirely and always reused (or recreated with the same name) the one
-    # deterministic per-thread branch. That meant replying "no" to "create a
-    # new branch?" was silently discarded and changes kept landing on the
-    # existing branch. Honor the explicit choice the same way the v1 commit
-    # path does.
+    # Honor the explicit branch-continuity choice. A saved branch is reusable
+    # only when it physically exists in the repository selected by the current
+    # cloud/workflow. This prevents stale cross-cloud state from being reused.
     flow_context = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
     reuse_branch = _teams_truthy(flow_context.get("reuse_branch"))
     force_new_branch = _teams_truthy(flow_context.get("force_new_branch"))
     requested_existing_branch = str(
         flow_context.get("existing_branch") or state.get("branch") or ""
     ).strip()
+    existing_branch_is_valid = bool(
+        requested_existing_branch
+        and github_branch_exists(
+            cloud,
+            requested_existing_branch,
+            repo_target=repo_target,
+            workflow=workflow,
+        )
+    )
 
     branch_name = ""
-    if (
-        reuse_branch
-        and not force_new_branch
-        and requested_existing_branch
-        and github_branch_exists(cloud, requested_existing_branch, repo_target=repo_target, workflow=workflow)
-    ):
-        # Explicit "yes, reuse the existing branch".
+    if reuse_branch and not force_new_branch and existing_branch_is_valid:
+        # Explicit "yes": reuse only the branch verified in this cloud repo.
         branch_name = requested_existing_branch
         state["branch"] = branch_name
     elif force_new_branch:
-        # Explicit "no" — always materialize a genuinely NEW branch from the
-        # latest base branch. Never fall back to the old branch name/content.
-        base_candidate = (
-            (state.get("branch") or "").strip()
-            or f"{branch_prefix}-{stable_thread_key(thread_id)}"
-        )
-        start_cycle = max(2, int(state.get("cycle") or 0) + 1)
+        # Explicit "no": always start from the stable Teams-user namespace.
+        # _teams_unique_branch_name adds -v2/-v3 only when that exact branch
+        # already exists in this repository. No thread hash is used.
         branch_name, cycle = _teams_unique_branch_name(
-            cloud, base_candidate, repo_target, workflow, start_cycle=start_cycle,
+            cloud, generated_branch_base, repo_target, workflow, start_cycle=1,
         )
         state["cycle"] = cycle
         state["branch"] = branch_name
@@ -1136,12 +1136,27 @@ def _commit_terraform_files_to_branch_for_teams_base(
         state.pop("pr_url", None)
         state["has_open_pr"] = False
     else:
-        # No explicit branch-continuity choice was supplied for this turn
-        # (e.g. the very first generation on this thread) — preserve the
-        # original deterministic single-branch-per-thread behavior.
-        branch_name = (state.get("branch") or "").strip()
-        if not branch_name or not branch_name.startswith(f"{branch_prefix}-"):
-            branch_name = f"{branch_prefix}-{stable_thread_key(thread_id)}"
+        # First request/no explicit choice: keep an already-valid generated
+        # branch for this user in this repository, otherwise create the base
+        # name (or the next -vN variant if it already exists remotely).
+        current_branch = (state.get("branch") or "").strip()
+        current_is_user_generated = bool(
+            current_branch
+            and (
+                current_branch == generated_branch_base
+                or current_branch.startswith(generated_branch_base + "-v")
+            )
+            and github_branch_exists(
+                cloud, current_branch, repo_target=repo_target, workflow=workflow
+            )
+        )
+        if current_is_user_generated:
+            branch_name = current_branch
+        else:
+            branch_name, cycle = _teams_unique_branch_name(
+                cloud, generated_branch_base, repo_target, workflow, start_cycle=1,
+            )
+            state["cycle"] = cycle
         state["branch"] = branch_name
 
     seed_branch = base_branch
