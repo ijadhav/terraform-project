@@ -1,4 +1,33 @@
 from __future__ import annotations
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from shared_code.terrabot_core_typing import (
+        AZURE_TFVARS_AUTOFILL_EXCLUDED_ROOTS,
+        PENDING_AZURE_CONSUMER_VALUE_SELECTIONS,
+        PENDING_AZURE_NEW_CONSUMER_FILE_CONFIRMATIONS,
+        _azure_consumer_module_name_from_repo,
+        _dedupe_preserving_order,
+        _extract_top_level_tf_blocks,
+        _repair_unclosed_variables_tf_content_for_write,
+        cloud_root_dir,
+        extract_first_balanced_json_object,
+        find_tf_azure_hub_module_invocation_file_by_source,
+        github_branch_exists,
+        github_branch_seed_for_cloud,
+        github_get_file_content,
+        github_list_tf_files_recursive,
+        hashlib,
+        json,
+        normalize_agent_relative_tf_path,
+        normalize_cloud,
+        normalize_repo_target,
+        normalize_yes_no_reply,
+        re,
+        recover_thread_pr_state,
+        safe_normalize_cloud,
+    )
+
 AZURE_DEFAULT_TFVARS_BY_ENV = {
     "npr": "vars/npr/tier.tfvars",
     "prd": "vars/prd/tier.tfvars",

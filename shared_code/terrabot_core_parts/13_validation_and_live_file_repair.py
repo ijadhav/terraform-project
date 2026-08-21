@@ -1,4 +1,68 @@
 from __future__ import annotations
+from typing import TYPE_CHECKING , Any, Optional
+
+if TYPE_CHECKING:
+    from shared_code.terrabot_core_typing import (
+        AGENT_NAME,
+        AWS_MODULES_ROOT,
+        INFRA_MODIFICATION_WORKFLOWS,
+        LOGGER,
+        _ACTIVE_TEAMS_FLOW_CONTEXT,
+        _TEAMS_FLAG_VALUES_BASENAME_PRIORITY,
+        _aws_consumer_files_from_agent_result,
+        _extract_aws_module_source_refs_from_text,
+        _extract_root_variable_names,
+        _extract_top_level_hcl_assignment_names,
+        _extract_top_level_tf_blocks,
+        _find_balanced_curly_end,
+        _get_azure_consumer_routing_context,
+        _get_backend_existing_infra_context,
+        _get_verified_azure_module_source_url,
+        _has_git_conflict_markers,
+        _iter_variable_blocks_with_names,
+        _repository_context_branch_and_sha,
+        _repository_context_completed_task_payload,
+        _repository_context_evidence_excerpt,
+        _repository_context_repo_identity,
+        _repository_context_vague_resource_phrase,
+        _sanitize_aws_module_rel_path,
+        _teams_auto_select_feature_flag_context_stage1,
+        _teams_candidate_friendly_label,
+        _teams_diag_log,
+        _teams_environment_folder_evidence,
+        _teams_feature_flag_intent,
+        _teams_is_existing_invocation_creation,
+        _teams_remote_context_branch,
+        _teams_repository_context_live_files,
+        _teams_save_ui_state,
+        _teams_target_environment_main_tf_evidence,
+        _top_level_tf_block_matches,
+        _top_level_tf_headers_for_modification,
+        _validate_full_file_modification_preserves_existing,
+        _validate_hcl_content_complete,
+        _variable_attr_present,
+        add_repository_context,
+        call_named_agent,
+        extract_json_from_text,
+        github_get_file_content,
+        github_get_file_content_by_repo,
+        github_put_file,
+        hashlib,
+        json,
+        load_teams_conversation_state,
+        normalize_agent_relative_tf_path,
+        normalize_cloud,
+        normalize_iac_relative_path,
+        normalize_repo_target,
+        normalize_tf_relative_path,
+        normalize_yes_no_reply,
+        persist_teams_workflow_state,
+        re,
+        restore_teams_workflow_state,
+        safe_normalize_cloud,
+        shared_repository_context,
+    )
+
 def _terrabot_placeholder_content_detected(content: str) -> bool:
     text = str(content or "").lower()
     markers = (
@@ -554,7 +618,7 @@ def build_infra_modification_selection_reply(existing_infra_context: dict) -> st
             flag_items.append((item, match))
     if flag_items:
         lines = [
-            "I found multiple repository-backed Boolean parameters that can control this request. Which parameter should I change?",
+            "I found multiple repository-backed controls that match this request. Which resource/control should I change?",
             "",
         ]
         for index, (item, match) in enumerate(flag_items, start=1):
@@ -563,12 +627,11 @@ def build_infra_modification_selection_reply(existing_infra_context: dict) -> st
             current = str(match.get("current_value") or "").strip().lower()
             target = str(match.get("new_value") or "").strip().lower()
             description = str(match.get("context") or match.get("description") or "").strip()
-            path = str(item.get("path") or "").strip()
-            lines.append(f"{index}. **`{flag}`** — {description or f'Boolean control in module {module_name}'}")
-            lines.append(f"   Module: `module \"{module_name}\"` · `{current}` → `{target}` · `{path}`")
+            label = description or (f'Boolean control in module {module_name}' if module_name else f'Repository control {flag}')
+            lines.append(f"{index}. **{label}** — current state `{current}` → requested state `{target}`")
         lines.extend([
             "",
-            "Reply with the number or exact Boolean parameter name. Terrabot will change only that parameter and preserve the rest of the file unchanged.",
+            "Reply with the number or the resource/control name shown above. Terrabot already knows the repository file and exact Terraform identifier.",
         ])
         return "\n".join(lines)
     # Preserve every earlier non-Boolean clarification behavior.
@@ -588,11 +651,10 @@ def _teams_candidate_selection_reply_non_boolean(existing_infra_context: dict) -
     ]
     for index, item in enumerate(candidates, start=1):
         label = _teams_candidate_friendly_label(item)
-        path = str(item.get("path") or "").strip()
-        lines.append(f"{index}. **{label}** — `{path}`")
+        lines.append(f"{index}. **{label}**")
     lines.extend([
         "",
-        "Reply with the number or resource/module name. Terrabot will use the already resolved repository path.",
+        "Reply with the number or resource/component name shown above. Terrabot will use the already resolved repository path internally.",
     ])
     return "\n".join(lines)
 
@@ -1287,6 +1349,52 @@ def _repository_literal_boolean_inventory(repository_evidence: list[dict]) -> li
     return inventory
 
 
+def _teams_shared_context_for_repository_decision(prompt: str) -> tuple[str, list[dict], dict]:
+    """Retrieve durable context plus CURRENT live evidence for target selection.
+
+    Semantic flag/module selection happens before the ordinary generation
+    ``call_agent`` path, so relying only on call_agent's context injection meant
+    stored resource mappings were invisible during the decision that chooses a
+    Boolean/module. This helper makes the same repository context available to
+    the semantic decision call and re-reads every referenced evidence path from
+    the current repository branch.
+    """
+    active = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
+    cloud = str(active.get("cloud") or "").strip()
+    repo_target = str(active.get("repo_target") or "").strip()
+    workflow = str(active.get("workflow") or "").strip()
+    owner, repo = _repository_context_repo_identity(cloud, repo_target, workflow, str(active.get("repo_name") or ""))
+    if not owner or not repo:
+        return "", [], {}
+    preferred_branch = str(active.get("context_branch") or active.get("existing_branch") or active.get("source_branch") or "").strip()
+    branch, current_sha = _repository_context_branch_and_sha(owner, repo, preferred_branch)
+    try:
+        search_result = shared_repository_context.search_repository_context(
+            repo_owner=owner,
+            repo_name=repo,
+            query=str(prompt or "").strip(),
+            current_commit_sha=current_sha,
+            top_k=8,
+        )
+        block = shared_repository_context.format_repository_context_for_agent(search_result)
+    except Exception as exc:
+        LOGGER.warning(
+            "[TerrabotDiag] event=repository_context_semantic_decision_search_failed repo=%s/%s error=%s",
+            owner, repo, exc,
+        )
+        return "", [], {}
+    live_files = _teams_repository_context_live_files(owner, repo, branch, search_result)
+    metadata = {
+        "repository": f"{owner}/{repo}",
+        "branch": branch,
+        "current_commit_sha": current_sha,
+        "result_count": len(search_result.get("results") or []),
+        "stale_count": int(search_result.get("stale_count") or 0),
+        "conflicted_count": int(search_result.get("conflicted_count") or 0),
+    }
+    return block, live_files, metadata
+
+
 def _foundry_repository_change_strategy(
     prompt: str,
     repository_evidence: list[dict],
@@ -1308,6 +1416,10 @@ def _foundry_repository_change_strategy(
     if not evidence:
         return {"operation": "unknown", "boolean_applicable": False, "candidates": [], "inventory": inventory}
 
+    shared_context_block, shared_context_live_files, shared_context_metadata = (
+        _teams_shared_context_for_repository_decision(prompt)
+    )
+
     request = {
         "task": (
             "Infer the repository implementation strategy for the CURRENT infrastructure request from live evidence. "
@@ -1317,6 +1429,9 @@ def _foundry_repository_change_strategy(
         "user_request": str(prompt or "").strip(),
         "repository_evidence": evidence,
         "literal_boolean_inventory": inventory,
+        "shared_repository_context": shared_context_block,
+        "shared_repository_context_live_files": shared_context_live_files,
+        "shared_repository_context_metadata": shared_context_metadata,
         "required_output": {
             "operation": "create|enable|disable|modify|delete|unknown",
             "boolean_applicable": "boolean",
@@ -1341,6 +1456,8 @@ def _foundry_repository_change_strategy(
             "For ordinary modifications, use a Boolean only when that Boolean directly implements the requested behavior; do not convert arbitrary setting changes into feature-flag changes.",
             "Include only candidates whose literal value must change. current_value and new_value must differ.",
             "Do not return unrelated Booleans merely because their names share words with the user request.",
+            "When shared_repository_context contains a prior resource/alias mapping, treat it only as a semantic hint and verify it against shared_repository_context_live_files plus repository_evidence. If the current live file still proves the mapping, use that concrete control without asking the user for a file/path/flag/module name.",
+            "If a stored mapping is stale, conflicted, missing from the current live file, or contradicted by repository_evidence, ignore it and resolve from current live repository evidence instead.",
             "When one candidate is materially strongest, return only that candidate. Return multiple candidates only for genuine semantic ambiguity.",
             "Prefer boolean_applicable=false over a weak or speculative Boolean match.",
         ],

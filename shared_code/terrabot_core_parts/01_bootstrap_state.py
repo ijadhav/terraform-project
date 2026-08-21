@@ -1,4 +1,17 @@
 from __future__ import annotations
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from shared_code.terrabot_core_typing import (
+        PENDING_AWS_MODULE_DISCOVERIES,
+        _github_request_error,
+        build_conversation_label,
+        call_agent,
+        is_valid_jira_ticket,
+        normalize_generated_module_variable_files,
+        parse_agent_output,
+        try_parse_agent_output,
+    )
 import os
 import re
 import json

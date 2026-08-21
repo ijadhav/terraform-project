@@ -1,4 +1,111 @@
 from __future__ import annotations
+from typing import TYPE_CHECKING , Any, List , Optional
+
+if TYPE_CHECKING:
+    from shared_code.terrabot_core_typing import (
+        AFFIRMATIVE_REPLIES,
+        AGENT_NAME,
+        AWS_MODULES_ROOT,
+        GITHUB_AWS_BASE_BRANCH,
+        GITHUB_AWS_DIR,
+        GITHUB_AWS_REPO,
+        GITHUB_AZURE_BASE_BRANCH,
+        GITHUB_AZURE_REPO,
+        GITHUB_OWNER,
+        GITHUB_TOKEN,
+        GITHUB_VENA_BASE_BRANCH,
+        GITHUB_VENA_REPO,
+        LOGGER,
+        ModuleVariableValuesRequired,
+        NEGATIVE_REPLIES,
+        THREAD_PR_STATE,
+        _ACTIVE_TEAMS_FLOW_CONTEXT,
+        _TEAMS_CONVERSATION_CONTEXT,
+        _TEAMS_SAFE_PREVIOUS_BUILD_AGENT_INPUT,
+        _TEAMS_SAFE_PREVIOUS_HANDLE_CHAT,
+        _TEAMS_SHORT_FOLLOW_UP,
+        _aws_consumer_files_from_agent_result,
+        _aws_created_module_paths_from_files,
+        _aws_module_catalog_branch,
+        _aws_module_catalog_phrases,
+        _aws_module_lookup_text,
+        _aws_module_lookup_tokens,
+        _build_agent_input_for_aws_module_creation_base,
+        _call_agent_base,
+        _discover_live_aws_module_candidates_base,
+        _explicit_prompt_default_for_variable,
+        _extract_aws_module_source_refs_from_text,
+        _extract_top_level_tf_blocks,
+        _get_backend_existing_infra_context,
+        _infer_variable_type_from_name_and_default,
+        _iter_variable_blocks_with_names,
+        _module_variable_field_description,
+        _normalize_module_variables_tf_content_base,
+        _replace_variable_block,
+        _sanitize_aws_module_rel_path,
+        _score_aws_module_candidate,
+        _teams_auto_accept_aws_module_creation_base,
+        _teams_auto_commit_preview,
+        _teams_branch_choice_from_reply,
+        _teams_diag_log,
+        _teams_ensure_variables_tf_evidence,
+        _teams_feature_flag_intent,
+        _teams_placeholder_expression,
+        _teams_prompt_requests_pr,
+        _teams_remote_context_branch,
+        _teams_safe_request_cloud,
+        _teams_save_ui_state,
+        _teams_suggested_branch_name,
+        _teams_truthy,
+        _teams_workflow_thread_id,
+        _variable_attr_present,
+        _variable_attr_value,
+        _variable_name_is_private_or_sensitive,
+        _variable_type_from_block,
+        agent_pr_context,
+        agent_reply_looks_like_infra_json,
+        build_aws_local_module_source,
+        build_enhanced_conversation_label,
+        build_thread_prs_payload,
+        build_verified_aws_module_context,
+        call_named_agent,
+        detect_aws_module_variable_file_convention,
+        extract_json_from_text,
+        extract_json_safely,
+        github_get_base_branch_sha_by_repo,
+        github_get_directory_listing,
+        github_get_file_content,
+        github_get_file_content_by_repo,
+        github_get_repo,
+        github_list_verified_aws_module_paths,
+        github_verified_aws_module_exists,
+        hashlib,
+        infer_aws_requested_resource_hint,
+        infer_cloud_from_prompt,
+        infer_new_aws_module_path,
+        is_valid_jira_ticket_link,
+        json,
+        load_teams_conversation_state,
+        looks_like_infra_payload,
+        normalize_aws_module_source_path,
+        normalize_generated_module_variable_files,
+        normalize_tf_relative_path,
+        normalize_yes_no_reply,
+        os,
+        parse_agent_output,
+        re,
+        recover_thread_pr_state,
+        repo_chat_context,
+        restore_teams_workflow_state,
+        safe_normalize_cloud,
+        shared_repository_context,
+        state_bucket_for_target,
+        store_pending_infra_change,
+        uuid,
+        validate_aws_module_variable_file_convention,
+    )
+
+
 def _build_agent_input_for_infra_safe(
     prompt: str,
     thread_id: str,
@@ -1991,6 +2098,26 @@ def _teams_compact_agent_input(agent_input: str, max_chars: int = 90000) -> str:
             or item.get("invocation_generation")
         )
 
+    # Repository-context evidence paths are re-read from the current live
+    # repository before Foundry uses a durable mapping. Preserve those complete
+    # files through compaction just like an already-selected write target.
+    shared_live_files = payload.get("shared_repository_context_live_files")
+    if isinstance(shared_live_files, list):
+        preserved_live_files = []
+        for item in shared_live_files[:8]:
+            if not isinstance(item, dict):
+                continue
+            copy = dict(item)
+            content = copy.get("content")
+            if isinstance(content, str) and len(content) > 160_000:
+                # Keep JSON valid and mark the exceptional oversize case. Normal
+                # Terraform target files remain complete. The semantic selector
+                # must not treat a clipped file as authoritative for an edit.
+                copy["content"] = content[:160_000]
+                copy["content_truncated_for_transport"] = True
+            preserved_live_files.append(copy)
+        payload["shared_repository_context_live_files"] = preserved_live_files
+
     for key in ("retrieved_value_context", "retrieved_module_context"):
         values = payload.get(key)
         if isinstance(values, list):
@@ -2136,6 +2263,72 @@ def _repository_context_branch_and_sha(
     return branch, str(sha or "").strip()
 
 
+def _teams_repository_context_live_files(
+    owner: str,
+    repo: str,
+    branch: str,
+    search_result: dict,
+    max_files: int = 8,
+) -> list[dict]:
+    """Re-read current files referenced by retrieved repository context.
+
+    Durable repository context is a semantic hint, never code truth. When a
+    stored mapping says a user phrase maps to a flag/module/path, Foundry must
+    also receive the CURRENT live file from the resolved repository/branch so
+    it can validate that mapping before choosing the implementation target.
+    """
+    results = [item for item in (search_result.get("results") or []) if isinstance(item, dict)]
+    path_context: dict[str, dict] = {}
+    for result in results:
+        # Conflicted records are never promoted into decision evidence. Stale
+        # records may still suggest a path, but the current file below is the
+        # only source of truth and the agent is told to revalidate semantics.
+        if str(result.get("status") or "").strip().lower() == "conflicted":
+            continue
+        context_id = str(result.get("id") or "").strip()
+        subject = str(result.get("subject") or "").strip()
+        statement = str(result.get("statement") or "").strip()
+        for path in result.get("evidence_paths") or []:
+            normalized = str(path or "").strip().strip("/")
+            if not normalized:
+                continue
+            entry = path_context.setdefault(normalized, {
+                "context_ids": [],
+                "subjects": [],
+                "statements": [],
+                "stale_context": False,
+            })
+            if context_id and context_id not in entry["context_ids"]:
+                entry["context_ids"].append(context_id)
+            if subject and subject not in entry["subjects"]:
+                entry["subjects"].append(subject)
+            if statement and statement not in entry["statements"]:
+                entry["statements"].append(statement)
+            entry["stale_context"] = bool(entry["stale_context"] or result.get("stale"))
+
+    live_files: list[dict] = []
+    for path, metadata in list(path_context.items())[:max_files]:
+        try:
+            content = github_get_file_content_by_repo(owner, repo, path, ref=branch or None)
+        except Exception as exc:
+            LOGGER.warning(
+                "[TerrabotDiag] event=repository_context_live_evidence_fetch_failed repo=%s/%s path=%s branch=%s error=%s",
+                owner, repo, path, branch, exc,
+            )
+            continue
+        if content is None:
+            continue
+        live_files.append({
+            "path": path,
+            "content": str(content),
+            "repository": f"{owner}/{repo}",
+            "branch": branch,
+            "source": "shared_repository_context_live_evidence",
+            **metadata,
+        })
+    return live_files
+
+
 def _teams_attach_repository_context(agent_input: str, active: dict) -> str:
     """Attach shared repository context before Foundry works on a task.
 
@@ -2205,6 +2398,18 @@ def _teams_attach_repository_context(agent_input: str, active: dict) -> str:
             "stale_count": int(search_result.get("stale_count") or 0),
             "conflicted_count": int(search_result.get("conflicted_count") or 0),
         }
+        live_context_files = _teams_repository_context_live_files(
+            owner, repo, branch, search_result
+        )
+        if live_context_files:
+            payload["shared_repository_context_live_files"] = live_context_files
+        instructions = list(payload.get("instructions") or [])
+        instructions.extend([
+            "SHARED CONTEXT DECISION RULE: shared_repository_context is a semantic hint from prior validated repository work. Validate every mapping against shared_repository_context_live_files and the other current live repository evidence before using it.",
+            "If a retrieved context item maps the current user phrase to a flag/module/resource and the CURRENT live file still proves that mapping, use that repository control directly; do not ask the user for its file path, variable name, module name, or permission.",
+            "If the current live file disproves or no longer contains the mapped control, ignore the stale mapping and continue live repository discovery.",
+        ])
+        payload["instructions"] = instructions
     payload["repository_context_tools"] = (
         shared_repository_context.FOUNDRY_REPOSITORY_CONTEXT_TOOL_SCHEMAS
     )
@@ -2709,6 +2914,77 @@ def _teams_extract_candidate_rule_identifiers(content: str, prompt: str = "", ma
     return ordered[:max_items]
 
 
+def _teams_filter_rescue_resource_options(prompt: str, options: list[dict]) -> list[dict]:
+    """Keep only live candidates semantically relevant to the current request.
+
+    Structural extraction can find many valid declarations in a Terraform file.
+    Valid-in-file is not the same as matched-to-request. Foundry performs this
+    semantic pruning; Python only verifies the returned identifiers are a subset
+    of the live extracted options. This prevents unrelated flags/resources from
+    being shown simply because they share a file with the requested resource.
+    """
+    candidates = [dict(item) for item in (options or []) if isinstance(item, dict)]
+    if not candidates:
+        return []
+    indexed = []
+    for index, item in enumerate(candidates, start=1):
+        indexed.append({
+            "index": index,
+            "identifier": str(item.get("identifier") or "").strip(),
+            "kind": str(item.get("kind") or "").strip(),
+            "description": str(item.get("description") or "").strip(),
+            "current_value": str(item.get("current_value") or "").strip(),
+            "list_variable": str(item.get("list_variable") or "").strip(),
+            "file": str(item.get("file") or "").strip(),
+        })
+    request = {
+        "task": "SEMANTICALLY FILTER LIVE REPOSITORY RESOURCE CHOICES. Do not generate Terraform.",
+        "user_request": str(prompt or "").strip(),
+        "live_repository_candidates": indexed,
+        "required_output": {
+            "selected": [{
+                "index": 1,
+                "relevance": 0.0,
+                "reason": "why this concrete live candidate implements or could plausibly implement the requested resource",
+            }]
+        },
+        "rules": [
+            "Return JSON only with key selected.",
+            "Select only from live_repository_candidates; never invent a resource, flag, module, file, or identifier.",
+            "Keep only candidates strongly related to the resource/component named by the current user request.",
+            "Do not select infrastructure-wide, sibling, incidental, or weak lexical matches simply because they occur in the same Terraform file.",
+            "Return one candidate when one live target is clearly strongest. Return multiple only for genuine resource ambiguity that requires the user to choose.",
+            "Return selected=[] when none of the supplied candidates is strongly supported.",
+        ],
+    }
+    try:
+        raw = call_named_agent(json.dumps(request, ensure_ascii=False), AGENT_NAME)
+        parsed = extract_json_from_text(raw)
+    except Exception as exc:
+        LOGGER.warning("Teams rescue semantic candidate filtering failed: %s", exc)
+        return []
+    selected: list[dict] = []
+    seen: set[int] = set()
+    if isinstance(parsed, dict):
+        for item in parsed.get("selected") or []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                index = int(item.get("index") or 0)
+                relevance = float(item.get("relevance") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if index < 1 or index > len(candidates) or index in seen or relevance < 0.60:
+                continue
+            chosen = dict(candidates[index - 1])
+            chosen["semantic_relevance"] = max(0.0, min(relevance, 1.0))
+            chosen["semantic_reason"] = str(item.get("reason") or "").strip()
+            selected.append(chosen)
+            seen.add(index)
+    selected.sort(key=lambda item: float(item.get("semantic_relevance") or 0.0), reverse=True)
+    return selected[:8]
+
+
 def _teams_build_options_question(
     options: list[dict],
     prompt: str,
@@ -2720,9 +2996,9 @@ def _teams_build_options_question(
     exact name from memory.
     """
     lines = [
-        f"I found the following option(s) in `{file_path}` for \"{prompt.strip()}\". "
-        "Which one(s) should be changed?" if prompt.strip() else
-        f"I found the following option(s) in `{file_path}`. Which one(s) should be changed?",
+        (f'I found multiple live repository resources that match "{prompt.strip()}". Which resource should I change?'
+         if prompt.strip() else
+         "I found multiple matching live repository resources. Which resource should I change?"),
         "",
     ]
     for index, item in enumerate(options, start=1):
@@ -2731,8 +3007,8 @@ def _teams_build_options_question(
         lines.append(f"{index}. `{item['identifier']}`{suffix}")
     remaining = total_available - len(options)
     if remaining > 0:
-        lines.append(f"...and {remaining} more option(s) not shown. Reply with the exact name if you don't see it above.")
-    lines.extend(["", "Reply with the number(s) or the exact name(s)."])
+        lines.append(f"...and {remaining} more matched option(s) not shown.")
+    lines.extend(["", "Reply with the number(s) or the resource/component name shown above."])
     return "\n".join(lines)
 
 
@@ -2764,14 +3040,17 @@ def _teams_build_grounding_rescue_reply(
     if not all_options:
         return None
 
-    visible_options = all_options[:max_options]
-    question = _teams_build_options_question(visible_options, prompt, primary_file, total_available=len(all_options))
+    matched_options = _teams_filter_rescue_resource_options(prompt, all_options)
+    if not matched_options:
+        return None
+    visible_options = matched_options[:max_options]
+    question = _teams_build_options_question(visible_options, prompt, primary_file, total_available=len(matched_options))
     payload = {
         "summary": question,
         "reply": question,
         "analysis": (
-            f"Inspected `{primary_file}` and extracted {len(all_options)} named "
-            "rule/parameter/list-entry candidate(s) instead of asking the user to recall an exact name."
+            f"Inspected live repository evidence and retained {len(matched_options)} prompt-relevant "
+            "resource/control candidate(s) after semantic filtering."
         ),
         "questions": [question],
         "files": [],
@@ -2798,10 +3077,10 @@ def _teams_build_generic_clarification_reply(prompt: str, files: Optional[list[t
     clean_prompt = str(prompt or "").strip()
     question = (
         (f'For "{clean_prompt}", ' if clean_prompt else "")
-        + "I could not confidently identify the exact rule, resource, or parameter to change."
+        + "I could not reduce the live repository evidence to one unique resource."
         + inspected
-        + " Please name the specific rule/parameter (or its current true/false value) that should be changed, "
-        "and I will apply it."
+        + " Please clarify only which infrastructure resource/component you mean in plain language. "
+        "You do not need to provide a Terraform file, path, variable/flag name, module name, or current value."
     )
     payload = {
         "summary": question,
@@ -3224,15 +3503,53 @@ def call_agent(conversation_id: Optional[str], agent_input: str):
         rescue_outcome = _teams_maybe_rescue_grounding_refusal(context_enriched_input, reply)
         if rescue_outcome:
             rescued_reply, resolution_context = rescue_outcome
-            LOGGER.info(
-                "TEAMS-AGENT-CALL-3[%s]: rescued a bare grounding refusal into an evidence-backed "
-                "clarification before returning it to the user (options=%s).",
-                call_id,
-                len((resolution_context or {}).get("options") or []),
-            )
-            reply = rescued_reply
+            options = list((resolution_context or {}).get("options") or [])
+            # One repository-proven semantic match is self-answerable. Do not
+            # ask the user to confirm a target the repository already resolved;
+            # feed the selected resource back to Foundry and continue generation.
+            if resolution_context and len(options) == 1:
+                resolved_instruction = _teams_resolve_pending_rescue_selection("1", resolution_context)
+                try:
+                    continuation_payload = json.loads(context_enriched_input)
+                except Exception:
+                    continuation_payload = {}
+                if isinstance(continuation_payload, dict) and resolved_instruction:
+                    continuation_payload["backend_resolved_resource_selection"] = options[0]
+                    continuation_payload["user_request"] = str(
+                        continuation_payload.get("user_request")
+                        or continuation_payload.get("prompt")
+                        or active.get("effective_prompt")
+                        or ""
+                    ).strip()
+                    continuation_payload["resolved_selection_instruction"] = resolved_instruction
+                    continuation_instructions = list(continuation_payload.get("instructions") or [])
+                    continuation_instructions.extend([
+                        "A repository-only semantic recovery found exactly one live resource/control matching the user's request. This is NOT user ambiguity.",
+                        "Use backend_resolved_resource_selection and continue generation now. Do not ask the user for a file, path, flag/variable name, module name, value, or confirmation.",
+                    ])
+                    continuation_payload["instructions"] = continuation_instructions
+                    retry_generation_input = _teams_compact_agent_input(
+                        json.dumps(continuation_payload, ensure_ascii=False), context_budget
+                    )
+                    LOGGER.info(
+                        "TEAMS-AGENT-CALL-3[%s]: one prompt-relevant live target resolved internally; retrying generation without user clarification.",
+                        call_id,
+                    )
+                    result_conversation_id, reply = _TEAMS_MULTICLOUD_PREVIOUS_CALL_AGENT(
+                        result_conversation_id, retry_generation_input
+                    )
+                    resolution_context = None
+                else:
+                    reply = rescued_reply
+            else:
+                LOGGER.info(
+                    "TEAMS-AGENT-CALL-3[%s]: rescued a bare grounding refusal into an evidence-backed "
+                    "clarification before returning it to the user (options=%s).",
+                    call_id, len(options),
+                )
+                reply = rescued_reply
             teams_conversation_id = str(active.get("teams_conversation_id") or "").strip()
-            if resolution_context and teams_conversation_id:
+            if resolution_context and len(options) > 1 and teams_conversation_id:
                 try:
                     _teams_save_ui_state(
                         teams_conversation_id,

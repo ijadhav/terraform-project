@@ -1,4 +1,38 @@
 from __future__ import annotations
+from typing import TYPE_CHECKING ,Optional
+
+if TYPE_CHECKING:
+    from shared_code.terrabot_core_typing import (
+        INFRA_MODIFICATION_WORKFLOWS,
+        LOGGER,
+        MAX_TEAMS_SELF_CORRECTION_ATTEMPTS,
+        SurgicalEdit,
+        _ACTIVE_TEAMS_FLOW_CONTEXT,
+        _TEAMS_MULTICLOUD_PREVIOUS_CALL_AGENT,
+        _get_backend_existing_infra_context,
+        _modular_repair_protocol,
+        _modular_repair_response_contract,
+        _teams_diag_log,
+        _teams_find_truncated_file_error,
+        _teams_remote_context_branch,
+        _teams_repair_file_map,
+        _teams_safe_prompt_resource_name,
+        _top_level_tf_headers_for_modification,
+        _validate_full_file_modification_preserves_existing,
+        _validate_hcl_content_complete,
+        apply_surgical_edits,
+        commit_terraform_files_to_branch_for_teams,
+        extract_json_from_text,
+        github_get_file_content,
+        github_resolve_base_branch_for_cloud,
+        hashlib,
+        json,
+        normalize_repo_target,
+        re,
+        safe_normalize_cloud,
+        try_parse_agent_output,
+    )
+
 # Compatibility definitions required by the repair pipeline. These existed in
 # the monolithic core but were separated into a later override section during
 # the refactor. Keeping them here prevents NameError when this part is used as
@@ -78,6 +112,148 @@ def _validate_agent_full_file_preservation_for_write(
             f"({len(generated_nonblank)} vs {len(existing_nonblank)} nonblank lines). "
             "Refusing a likely truncated overwrite; Foundry must return the complete final file."
         )
+
+
+
+def _teams_collect_live_repair_files(
+    current_result: dict,
+    flow_context: dict | None = None,
+    retrieved_value_context: list | None = None,
+) -> list[dict]:
+    """Build repair baselines from complete live GitHub files only.
+
+    Repository evidence in the generation payload may intentionally contain
+    bounded snippets.  A snippet is useful for semantic discovery but is never
+    safe as an existing-file repair baseline.  For every generated path this
+    function re-reads the file from GitHub and records the exact bytes/checksum
+    used for repair materialization.
+
+    If earlier repository evidence proves that a path already exists but the
+    backend cannot re-read that exact file from GitHub, fail closed instead of
+    silently repairing against a truncated excerpt.
+    """
+    flow_context = dict(flow_context or (_ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}))
+    selected = _get_backend_existing_infra_context(retrieved_value_context or [])
+    selected = dict(selected or {}) if isinstance(selected, dict) else {}
+
+    cloud = safe_normalize_cloud(
+        str(current_result.get("cloud") or flow_context.get("cloud") or "")
+    ) or ""
+    workflow = str(
+        current_result.get("workflow") or flow_context.get("workflow") or ""
+    ).strip()
+    repo_target = str(
+        current_result.get("repo_target")
+        or flow_context.get("repo_target")
+        or ""
+    ).strip()
+
+    # Evidence is used only to determine whether a path is expected to exist;
+    # its content is deliberately NOT used as the repair baseline.
+    evidence: dict[str, str] = {}
+    for container in (
+        selected.get("matched_files") or [],
+        flow_context.get("retrieved_value_context") or [],
+        retrieved_value_context or [],
+    ):
+        for item in container:
+            if not isinstance(item, dict):
+                continue
+            path = str(item.get("path") or item.get("filename") or "").strip().strip("/")
+            content = item.get("content")
+            if path and isinstance(content, str) and content:
+                evidence.setdefault(path, content)
+
+    refs: list[str] = []
+    for value in (
+        selected.get("context_ref"),
+        flow_context.get("context_branch"),
+        flow_context.get("existing_branch"),
+        flow_context.get("source_branch"),
+    ):
+        value = str(value or "").strip().replace("refs/heads/", "")
+        if value and value not in refs:
+            refs.append(value)
+    if cloud:
+        try:
+            value = str(_teams_remote_context_branch(cloud, repo_target, workflow) or "").strip()
+            if value and value not in refs:
+                refs.append(value)
+        except Exception:
+            pass
+        try:
+            value = str(
+                github_resolve_base_branch_for_cloud(
+                    cloud,
+                    repo_target=repo_target or None,
+                    workflow=workflow or None,
+                )
+                or ""
+            ).strip()
+            if value and value not in refs:
+                refs.append(value)
+        except Exception:
+            pass
+
+    generated = _teams_repair_file_map(current_result.get("files") or [])
+    live_files: list[dict] = []
+    for path, rejected_content in generated.items():
+        live_content = None
+        resolved_ref = ""
+        read_errors: list[str] = []
+        if cloud:
+            for ref in refs:
+                try:
+                    candidate = github_get_file_content(
+                        cloud,
+                        path,
+                        ref,
+                        repo_target=repo_target or None,
+                        workflow=workflow or None,
+                    )
+                except Exception as exc:
+                    read_errors.append(f"{ref}: {exc}")
+                    continue
+                if candidate is not None:
+                    live_content = str(candidate)
+                    resolved_ref = ref
+                    break
+
+        expected_existing = bool(evidence.get(path))
+        if expected_existing and live_content is None:
+            raise ValueError(
+                f"Cannot establish an exact live GitHub repair baseline for existing file {path}. "
+                "Terrabot will not repair from a repository excerpt or rejected generated content. "
+                + (f"GitHub reads failed: {' | '.join(read_errors[:3])}" if read_errors else "The file was not readable on the resolved repository refs.")
+            )
+
+        live_text = str(live_content or "")
+        if live_text and path.endswith((".tf", ".tfvars")):
+            # The authoritative baseline itself must be structurally complete.
+            # If this fails, do not let Foundry repair against bad evidence.
+            _validate_hcl_content_complete(path, live_text)
+
+        live_files.append({
+            "path": path,
+            "repository_ref": resolved_ref,
+            "existing_live_content": live_text,
+            "rejected_generated_content": str(rejected_content or ""),
+            "existing_nonblank_line_count": len([line for line in live_text.splitlines() if line.strip()]),
+            "rejected_nonblank_line_count": len([line for line in str(rejected_content or "").splitlines() if line.strip()]),
+            "existing_sha256": hashlib.sha256(live_text.encode("utf-8")).hexdigest(),
+            "rejected_sha256": hashlib.sha256(str(rejected_content or "").encode("utf-8")).hexdigest(),
+            "must_return_complete_final_file": bool(live_text),
+            "repair_baseline_source": "github_exact" if live_text else "new_file",
+        })
+
+    _teams_diag_log(
+        "repair_live_baseline_resolved",
+        files=len(live_files),
+        existing_files=sum(1 for item in live_files if item.get("existing_live_content")),
+        refs=",".join(sorted({str(item.get("repository_ref") or "") for item in live_files if item.get("repository_ref")}))[:500],
+        strategy="github_exact_only",
+    )
+    return live_files
 
 
 def _teams_build_backend_repair_payload(
@@ -336,6 +512,75 @@ def _teams_call_agent_for_backend_repair(repair_payload: dict) -> tuple[str, str
     return _TEAMS_MULTICLOUD_PREVIOUS_CALL_AGENT(None, enforcement_raw)
 
 
+
+def _teams_get_valid_backend_repair(
+    repair_payload: dict,
+    current_result: dict,
+    max_response_attempts: int = 3,
+) -> dict:
+    """Obtain one executable backend-valid repair before consuming an outer retry.
+
+    Invalid repair responses (wrong old_text, truncated new_text, malformed HCL,
+    full-file output in surgical mode, or an unchanged candidate) are fed back
+    to Foundry immediately with the same exact GitHub baseline.  This prevents
+    the outer self-correction loop from validating the same rejected draft five
+    times while the repair response itself never converges.
+    """
+    working_payload = dict(repair_payload or {})
+    last_error: Exception | None = None
+    for response_attempt in range(1, max(1, int(max_response_attempts or 1)) + 1):
+        try:
+            _conversation_id, repaired_reply = _teams_call_agent_for_backend_repair(
+                working_payload
+            )
+            repaired_reply = _teams_materialize_repair_edits_response(
+                repaired_reply, working_payload
+            )
+            repaired_result = try_parse_agent_output(repaired_reply)
+            if _teams_repair_candidate_is_identical(current_result, repaired_result):
+                raise ValueError(
+                    "Foundry repair returned byte-identical content to the backend-rejected candidate. "
+                    "Use the exact live GitHub baseline and return a different surgical repair_edits[] result."
+                )
+            _teams_validate_repair_candidate_against_payload(
+                repaired_result, working_payload
+            )
+            _teams_diag_log(
+                "backend_repair_response_validated",
+                response_attempt=f"{response_attempt}/{max_response_attempts}",
+                files=len(repaired_result.get("files") or []),
+            )
+            return repaired_result
+        except Exception as exc:
+            last_error = exc
+            _teams_diag_log(
+                "backend_repair_response_rejected_retrying_agent",
+                level="warning",
+                response_attempt=f"{response_attempt}/{max_response_attempts}",
+                error=str(exc)[:300],
+            )
+            if response_attempt >= max_response_attempts:
+                break
+            working_payload = dict(working_payload)
+            working_payload["prior_repair_feedback"] = str(exc)
+            working_payload["repair_response_violation"] = (
+                "Your immediately previous INTERNAL repair response was rejected by backend validation. "
+                f"Repair-response error: {exc}. Re-read repair_files[].existing_live_content and return a NEW repair_edits[] response. "
+                "For every existing file, old_text must be copied exactly from existing_live_content; do not repair from rejected_agent_result."
+            )
+            working_payload["mandatory_next_output"] = {
+                "json_only": True,
+                "questions": [],
+                "existing_file_output": "repair_edits_only",
+                "must_not_return_full_existing_files": True,
+                "must_copy_old_text_from": "repair_files[].existing_live_content",
+            }
+    raise ValueError(
+        "Foundry did not produce a backend-valid surgical repair response after "
+        f"{max_response_attempts} internal response attempts: {last_error}"
+    )
+
+
 def commit_terraform_files_to_branch_for_teams_with_self_correction(
     agent_result: dict,
     prompt: str,
@@ -414,39 +659,19 @@ def commit_terraform_files_to_branch_for_teams_with_self_correction(
                 attempt, max_attempts, thread_id, backend_error,
             )
 
-            # Truncation failures get a targeted, small tail-completion repair
-            # FIRST — repeating a full-file regeneration request tends to hit
-            # the exact same output-length ceiling every time, which is why
-            # the identical "N open brackets" error could recur on every
-            # attempt without ever actually getting fixed.
+            # Never repair a truncated existing file by completing the rejected
+            # candidate tail. The rejected candidate is not repository truth and may
+            # already have deleted/reconstructed unrelated blocks. Truncation now
+            # goes directly to the exact-live-file surgical repair path below.
             truncation_match = _teams_find_truncated_file_error(str(backend_error))
             if truncation_match:
                 trunc_path, open_count, open_brackets = truncation_match
                 _teams_diag_log(
-                    "truncation_detected_trying_tail_repair",
+                    "truncation_detected_forcing_live_file_surgical_repair",
                     thread=thread_id,
                     attempt=f"{attempt}/{max_attempts}",
                     path=trunc_path,
                     open_brackets=f"{open_count}({open_brackets})",
-                )
-                tail_fixed = _teams_attempt_tail_completion_repair(
-                    current_result.get("files") or [], trunc_path, thread_id, prompt,
-                    current_result=current_result,
-                )
-                if tail_fixed:
-                    _teams_diag_log(
-                        "tail_repair_applied_retrying_validation",
-                        thread=thread_id,
-                        attempt=f"{attempt}/{max_attempts}",
-                        path=trunc_path,
-                    )
-                    continue  # re-run backend_validation_start with the spliced content
-                _teams_diag_log(
-                    "tail_repair_did_not_resolve_falling_back_to_full_regeneration",
-                    level="warning",
-                    thread=thread_id,
-                    attempt=f"{attempt}/{max_attempts}",
-                    path=trunc_path,
                 )
 
             context = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
@@ -513,25 +738,16 @@ def commit_terraform_files_to_branch_for_teams_with_self_correction(
                 prior_repair_feedback=repair_feedback,
             )
             _teams_diag_log(
-                "sending_full_regeneration_repair_to_agent",
+                "sending_exact_live_surgical_repair_to_agent",
                 thread=thread_id,
                 attempt=f"{attempt}/{max_attempts}",
             )
             try:
-                _conversation_id, repaired_reply = _teams_call_agent_for_backend_repair(
-                    repair_payload
+                current_result = _teams_get_valid_backend_repair(
+                    repair_payload,
+                    current_result,
+                    max_response_attempts=3,
                 )
-                repaired_reply = _teams_materialize_repair_edits_response(
-                    repaired_reply, repair_payload
-                )
-                repaired_result = try_parse_agent_output(repaired_reply)
-                if _teams_repair_candidate_is_identical(current_result, repaired_result):
-                    raise ValueError(
-                        "Foundry repair returned byte-identical file content to the backend-rejected candidate. "
-                        "The repair must actually change the failed output using existing_live_content."
-                    )
-                _teams_validate_repair_candidate_against_payload(repaired_result, repair_payload)
-                current_result = repaired_result
                 _teams_diag_log(
                     "agent_repair_response_received",
                     thread=thread_id,

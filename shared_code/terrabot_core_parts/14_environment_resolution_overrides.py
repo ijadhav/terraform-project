@@ -1,4 +1,22 @@
 from __future__ import annotations
+from typing import TYPE_CHECKING , Optional
+
+if TYPE_CHECKING:
+    from shared_code.terrabot_core_typing import (
+        NormalizedRouterDecision,
+        TEAMS_AWS_ENVIRONMENT_HINTS,
+        TEAMS_AZURE_ENVIRONMENT_HINTS,
+        TERRABOT_AZURE_ENVIRONMENT_ALIASES,
+        TERRABOT_ENVIRONMENT_CATALOG,
+        _azure_tfvars_file_kind_from_prompt,
+        _explicit_tfvars_path_from_prompt,
+        _first_existing_tf_azure_hub_tfvars_path,
+        github_branch_seed_for_cloud,
+        json,
+        re,
+        safe_normalize_cloud,
+    )
+
 def _terrabot_env_text(prompt: str) -> str:
     return re.sub(r"\s+", " ", str(prompt or "").strip().lower().replace("_", "-"))
 

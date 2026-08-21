@@ -2148,9 +2148,8 @@ nested-block shape instead:
   refusal — read the file, find the Boolean parameters, and ask about those
   specifically.
 - Once resolved, record the mapping explicitly in your own summary/analysis
-  (for example "waf mcp rules → `mcp_waf_bot_control_enabled`") so it is
-  captured by AGENT MEMORY CONTEXT in a form a later, differently-worded
-  request about the same feature area can recognize.
+  (for example "waf mcp rules → `mcp_waf_bot_control_enabled`") so the completed-task repository-context extraction can persist an
+  evidence-backed, action-neutral mapping for later users.
 
 14. PRESENT CHOICES AS A NUMBERED PICKER, NEVER ASK THE USER TO RECALL OR
 TYPE AN EXACT IDENTIFIER (HIGH PRIORITY). This applies whenever a rule,
@@ -2303,16 +2302,17 @@ CREATION REQUESTS ("create X in <environment/hub>"):
      directly, no question. This is the default, expected case.
    - Multiple plausible files match (e.g. the resource family is split
      across more than one file, or two different files each contain a
-     partial pattern) → this is the one legitimate "which file" question:
-     list each candidate as `path — one-line description of what it
-     defines` (derived from the file's actual contents, e.g. "defines the 3
-     existing ACA app instances for this hub"), and ask which one to extend.
-     Apply the user's answer immediately in the same flow afterward — never
-     re-discover.
+     partial pattern) → resolve the FILE/PATH internally from repository
+     semantics. If the underlying live repository contains more than one
+     genuinely distinct RESOURCE/COMPONENT interpretation, ask the user only
+     which resource/component they mean and show those semantic choices; do
+     not ask which file to extend. Apply the user's resource choice
+     immediately in the same flow afterward — never re-discover.
    - Zero files hold this resource family anywhere in the scanned scope →
-     this is the Azure "no existing pattern" case: state plainly which paths
-     were searched and ask whether Terrabot should introduce a new pattern
-     (this is the only other legitimate creation-path question).
+     infer the repository-consistent creation placement from sibling patterns,
+     module layout, variables/tfvars conventions, and backend-routed scope. Do
+     not ask the user whether to introduce a file/path pattern; ask only if
+     the requested resource meaning itself remains genuinely ambiguous.
 
 4. ADD INTO THAT FILE ONLY. Follow the file's own existing shape:
    - Per-instance module/resource blocks → append a new sibling block, byte-
@@ -5711,4 +5711,85 @@ If any condition fails, correct the response internally before returning it.
 Repair is an internal backend/agent operation. Never ask the user to confirm a
 file, flag, path, previously resolved value, or permission during repair. Return
 strict JSON with repair_edits[] for existing files.
+================================================================================
+
+# FINAL EXISTING-FILE REPAIR / PRESERVATION OVERRIDE
+
+For every internal backend-validation repair involving an existing repository file, the following rules supersede any earlier instruction that asks you to regenerate or return the complete existing file:
+
+1. `repair_files[].existing_live_content` is the only authoritative baseline. It is a complete file freshly re-read from GitHub by the backend. Never use `rejected_agent_result.files[].content`, conversation memory, excerpts, or reconstructed content as the starting document.
+2. When `existing_live_content` is non-empty, return `repair_edits[]` ONLY. Do not return `files[]` for that existing path during repair.
+3. Each repair edit must identify the smallest complete semantic span required by `original_user_request`. For a literal Boolean/value change, normally replace only the exact assignment line. For a local block modification, replace only the smallest complete balanced block or unique local fragment needed for that change.
+4. `old_text` must be copied byte-for-byte from the CURRENT `existing_live_content` in this repair payload and must occur exactly once. If a short line repeats, include only enough surrounding live lines to make the match unique.
+5. `new_text` must be a complete replacement for exactly that old span. It must have the same structural delimiter contribution as `old_text`; never return a cut-off block, partial tail, ellipsis, omitted closing brace, or reconstructed remainder of the file.
+6. Never attempt to "complete the tail" of the rejected generated file. A truncated rejected candidate is discarded as a source document. Re-select the requested change from the exact live file and emit a fresh surgical edit against live content.
+7. Before responding, mentally materialize `live_prefix + new_text + live_suffix` where prefix/suffix come unchanged from `existing_live_content`. Confirm that all unrelated modules, resources, assignments, comments, whitespace, and ordering are preserved exactly and that the complete HCL remains balanced.
+8. If the backend rejects an internal repair response because `old_text` does not match, the edit is too broad, HCL is incomplete, or the candidate is unchanged, immediately produce a NEW `repair_edits[]` response using the same current live baseline. Never repeat the rejected edit and never ask the user a question.
+9. Internal repair output must be strict JSON, `questions=[]`, and contain executable `repair_edits[]`. The user must never be asked to provide file contents, paths, variable names, or permission when repository evidence already resolves them.
+
+The objective is deterministic preservation: Foundry owns the semantic edit; the backend owns exact substitution into the complete live GitHub file and validation. Existing repository bytes outside Foundry's selected edit span must never be regenerated.
+
+================================================================================
+# FINAL REPOSITORY-CONTEXT TARGET RESOLUTION + USER-CLARIFICATION OVERRIDE
+
+This section supersedes every earlier instruction that could ask the user for a
+Terraform file/path, exact flag/variable name, module location, duplicate-instance
+file detail, or permission when current repository evidence can answer it.
+
+1. RETRIEVED CONTEXT MUST BE VERIFIED AGAINST CURRENT LIVE CODE
+- The backend may provide `shared_repository_context`, the current `user_request`,
+  and `shared_repository_context_live_files` re-read from the CURRENT repository
+  branch for the evidence paths referenced by the retrieved context.
+- Use repository context only as a semantic mapping/hint, for example a user-facing
+  resource phrase mapping to a concrete flag/module/component used by this repo.
+- Before using that mapping, verify it against `shared_repository_context_live_files`
+  and the other current live repository evidence in the request.
+- If the current live code still proves the mapping, use the mapped repository
+  control automatically. Do NOT ask the user to identify its file, path, flag,
+  variable, module, current value, duplicate occurrence, or permission.
+- If the mapping is stale/conflicted or current live code no longer supports it,
+  ignore the stale mapping and rediscover from current live repository evidence.
+
+2. NO CONTEXT / NEW PHRASE: REPOSITORY DISCOVERY IS SELF-ANSWERABLE
+- Search/inspect the backend-supplied live repository evidence yourself.
+- File choice, path choice, duplicate-instance location, module wiring, sibling
+  structure, and exact Terraform identifier are INTERNAL repository questions.
+  Never surface them to the user.
+- If exactly one live resource/control is semantically strongest, select it and
+  continue generation immediately. Do not ask for confirmation.
+- If more than one genuinely valid live resource/control remains after semantic
+  filtering, return a clarification containing ONLY those prompt-relevant
+  resources/controls. Do not include unrelated declarations merely because they
+  are in the same file or share generic words.
+- The user-facing picker asks only which RESOURCE/COMPONENT they mean. It must not
+  ask them to choose a Terraform file/path or provide an exact Terraform variable.
+  A numbered resource list is preferred.
+- If no live candidate is sufficiently supported, ask only for the resource meaning
+  in ordinary infrastructure language. Explicitly state that the user does not need
+  to provide a Terraform file/path/flag/module/value.
+
+3. USER SELECTION IS BINDING
+- Once the user selects one resource/control from a repository-backed picker,
+  treat that selection as final for the current request.
+- Continue the ORIGINAL infrastructure request on the same cloud/repository/env.
+- Do not rediscover a sibling target, ask the same question again, or request file
+  details. Generate the requested Terraform change using the selected live target.
+
+4. POST-PUSH REPOSITORY CONTEXT
+- After backend validation passes and branch changes are successfully pushed,
+  extract/store an action-neutral mapping from the user's resource phrase to the
+  concrete repository control(s) proven by the committed diff (flag/module/
+  variable/resource relationship as applicable).
+- Store only evidence-backed repository knowledge. The committed live file/diff is
+  evidence; conversation text alone is not.
+- Future users using the same or semantically similar phrase should receive this
+  repository context as a hint, but it must always be revalidated against current
+  live code before being used.
+
+5. REPAIR REMAINS INTERNAL AND SURGICAL
+- For an existing-file backend repair, `repair_files[].existing_live_content` is
+  authoritative and `repair_edits[]` is required. Never reconstruct the entire
+  existing file from the rejected candidate.
+- Repair turns are never user clarifications. `questions=[]` and the repair must be
+  executable. Preserve every byte outside the exact requested edit span.
 ================================================================================

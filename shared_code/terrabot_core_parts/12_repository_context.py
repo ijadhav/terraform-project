@@ -1,4 +1,40 @@
 from __future__ import annotations
+from typing import TYPE_CHECKING ,Optional
+
+if TYPE_CHECKING:
+    from shared_code.terrabot_core_typing import (
+        AGENT_NAME,
+        GITHUB_OWNER,
+        LOGGER,
+        TEAMS_AWS_ENVIRONMENT_HINTS,
+        TEAMS_AZURE_ENVIRONMENT_HINTS,
+        _ACTIVE_TEAMS_FLOW_CONTEXT,
+        _AGENT_OWNED_PREVIOUS_BUILD_EXISTING_CONTEXT,
+        _TEAMS_CONVERSATION_CONTEXT,
+        _commit_terraform_files_to_branch_for_teams_base,
+        _extract_top_level_tf_blocks,
+        _github_workspace_compare,
+        _prompt_guard_agent_self_validate,
+        _prompt_guard_validate_semantic_relevance,
+        _prompt_guard_validate_terraform_shape,
+        _teams_exact_aws_environment_path,
+        _teams_feature_flag_intent,
+        _teams_remote_context_branch,
+        _teams_requested_aws_environment_paths,
+        call_named_agent,
+        github_get_base_branch_sha_by_repo,
+        github_get_file_content,
+        github_get_file_content_by_repo,
+        github_headers,
+        github_put_file_if_changed,
+        hashlib,
+        json,
+        normalize_cloud,
+        normalize_repo_target,
+        re,
+        shared_repository_context,
+    )
+
 def build_backend_existing_infra_modification_context_stage3(
     prompt: str,
     thread_id: str,

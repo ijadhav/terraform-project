@@ -1,4 +1,63 @@
 from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any, Optional
+
+if TYPE_CHECKING:
+    from shared_code.terrabot_core_typing import (
+        AFFIRMATIVE_REPLIES,
+        AGENT_NAME,
+        AZDO_API_VERSION,
+        AZDO_ORG,
+        AZDO_PAT,
+        AZDO_PIPELINE_BRANCH,
+        AZDO_PIPELINE_ID,
+        AZDO_PROJECT,
+        GITHUB_API,
+        GITHUB_AWS_REPO,
+        GITHUB_AZURE_APPROVED_CONSUMER_REPOS,
+        GITHUB_AZURE_BASE_BRANCH,
+        GITHUB_AZURE_REPO,
+        GITHUB_OWNER,
+        GITHUB_PR_COMMENT_MARKER,
+        GITHUB_TOKEN,
+        GITHUB_VENA_REPO,
+        LOGGER,
+        NEGATIVE_REPLIES,
+        THREAD_PR_STATE,
+        _ACTIVE_GITHUB_TOKEN,
+        _extract_required_variable_names_from_text,
+        _extract_tf_variable_block,
+        _extract_tf_variable_names_from_text,
+        _extract_top_level_hcl_assignment_names,
+        _modular_pr_body_follows_template,
+        _modular_pr_template_headings,
+        _require_setting,
+        _teams_generated_preserves_existing_lines,
+        _terraform_safe_variable_name,
+        _validate_hcl_content_complete,
+        base64,
+        build_branch_name,
+        build_branch_prefix,
+        build_grounded_azure_contexts,
+        build_stable_folder,
+        escape,
+        extract_json_from_text,
+        find_agent_reference,
+        get_approved_azure_consumer_repos,
+        get_project_client,
+        github_base_branch_for_cloud,
+        github_repo_for_cloud,
+        json,
+        normalize_cloud,
+        normalize_repo_target,
+        normalize_yes_no_reply,
+        os,
+        parse_branch_cycle,
+        re,
+        requests,
+        state_bucket_for_target,
+    )
+    
 def _require_github_token() -> str:
     token = (GITHUB_TOKEN or os.getenv("TERRABOT_GITHUB_TOKEN") or os.getenv("GH_TOKEN") or "").strip()
     if not token:

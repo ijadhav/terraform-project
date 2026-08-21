@@ -134,4 +134,18 @@ def apply_surgical_edits(
         if not sep:
             raise ValueError(f"Surgical edit {index} for {path} no longer matches the current materialized candidate.")
         candidate = before + edit.new_text + after
+
+        # The complete materialized candidate must retain the live file's
+        # delimiter signature after every edit. Comparing only old_text and
+        # new_text signatures is insufficient when an overly broad fragment is
+        # selected; the whole-file invariant guarantees a surgical replacement
+        # can never turn a complete live file into a truncated Terraform file.
+        live_signature = delimiter_signature(live_content)
+        candidate_signature = delimiter_signature(candidate)
+        if candidate_signature != live_signature:
+            raise ValueError(
+                f"Surgical edit {index} for {path} changed the complete file delimiter signature "
+                f"from {live_signature} to {candidate_signature}. The edit would make the live file "
+                "structurally incomplete; return a smaller complete old_text/new_text replacement."
+            )
     return candidate
