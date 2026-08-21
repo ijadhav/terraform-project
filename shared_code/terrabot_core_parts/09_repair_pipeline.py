@@ -1,4 +1,85 @@
 from __future__ import annotations
+# Compatibility definitions required by the repair pipeline. These existed in
+# the monolithic core but were separated into a later override section during
+# the refactor. Keeping them here prevents NameError when this part is used as
+# the active repair implementation. Later overrides may safely replace them.
+try:
+    UnsafeGeneratedChangeError
+except NameError:
+    class UnsafeGeneratedChangeError(ValueError):
+        pass
+
+
+def _terrabot_placeholder_content_detected(content: str) -> bool:
+    text = str(content or "").lower()
+    markers = (
+        "<existing content preserved as in evidence>",
+        "existing content preserved as in evidence",
+        "<existing content preserved>",
+        "existing content unchanged",
+        "... existing content ...",
+        "# existing content preserved",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _validate_agent_full_file_preservation_for_write(
+    existing_content: str,
+    generated_content: str,
+    path: str,
+    workflow: str | None,
+) -> None:
+    """Reject destructive existing-file rewrites without generating Terraform."""
+    if existing_content is None:
+        return
+    if _terrabot_placeholder_content_detected(generated_content):
+        raise UnsafeGeneratedChangeError(
+            f"Generated modification for {path} contains a repository-content placeholder. "
+            "Foundry must return the complete real file with unrelated content preserved."
+        )
+
+    normalized_workflow = str(workflow or "").strip()
+    if normalized_workflow not in INFRA_MODIFICATION_WORKFLOWS:
+        return
+
+    try:
+        _validate_full_file_modification_preserves_existing(
+            existing_content,
+            generated_content,
+            path,
+        )
+    except ValueError as exc:
+        raise UnsafeGeneratedChangeError(str(exc)) from exc
+
+    existing = (existing_content or "").replace("\r\n", "\n")
+    generated = (generated_content or "").replace("\r\n", "\n")
+    if not existing.strip():
+        return
+
+    flow_context = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
+    effective_prompt = str(flow_context.get("effective_prompt") or "").lower()
+    explicit_delete = bool(re.search(r"\b(?:delete|remove)\b", effective_prompt))
+    if path.endswith(".tf") and not explicit_delete:
+        existing_headers = _top_level_tf_headers_for_modification(existing)
+        generated_headers = _top_level_tf_headers_for_modification(generated)
+        missing_headers = sorted(existing_headers - generated_headers)
+        if missing_headers:
+            raise UnsafeGeneratedChangeError(
+                f"Generated modification for {path} removed existing Terraform blocks: "
+                + ", ".join(missing_headers[:12])
+                + ". Foundry must preserve unrelated repository content and edit only the requested code."
+            )
+
+    existing_nonblank = [line for line in existing.splitlines() if line.strip()]
+    generated_nonblank = [line for line in generated.splitlines() if line.strip()]
+    if len(existing_nonblank) >= 20 and len(generated_nonblank) < max(8, int(len(existing_nonblank) * 0.70)):
+        raise UnsafeGeneratedChangeError(
+            f"Generated modification for {path} is substantially shorter than the live repository file "
+            f"({len(generated_nonblank)} vs {len(existing_nonblank)} nonblank lines). "
+            "Refusing a likely truncated overwrite; Foundry must return the complete final file."
+        )
+
+
 def _teams_build_backend_repair_payload(
     current_result: dict,
     original_user_request: str,

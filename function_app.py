@@ -70,6 +70,18 @@ def _request_json(req: func.HttpRequest) -> dict:
 def _query_dict(req: func.HttpRequest) -> dict:
     return {key: value for key, value in req.params.items()}
 
+
+def _terrabot_service():
+    """Load the refactored Terrabot compatibility facade lazily.
+
+    Keeping this import package-qualified is required after moving the stateful
+    implementation to shared_code.terrabot_service_core. Lazy loading preserves
+    the existing Function App startup behavior for routes that do not use Terrabot.
+    """
+    from shared_code import terrabot_service
+
+    return terrabot_service
+
 def get_authenticated_user(req: func.HttpRequest) -> dict:
     return {
         "email": req.headers.get("X-MS-CLIENT-PRINCIPAL-NAME", ""),
@@ -330,8 +342,8 @@ def vscode_github_branch(req: func.HttpRequest) -> func.HttpResponse:
   
     data = _request_json(req)
     try:
-        from shared_code.terrabot_service import handle_workspace_branch_request
-        return json_response(handle_workspace_branch_request(data), status_code=200)
+        service = _terrabot_service()
+        return json_response(service.handle_workspace_branch_request(data), status_code=200)
     except PermissionError as exc:
         return json_response({"ok": False, "reply": str(exc)}, status_code=403)
     except ValueError as exc:
@@ -343,8 +355,8 @@ def vscode_github_branch(req: func.HttpRequest) -> func.HttpResponse:
 def vscode_github_pr_metadata(req: func.HttpRequest) -> func.HttpResponse:
     data = _request_json(req)
     try:
-        from shared_code.terrabot_service import handle_workspace_pr_metadata_request
-        return json_response(handle_workspace_pr_metadata_request(data), status_code=200)
+        service = _terrabot_service()
+        return json_response(service.handle_workspace_pr_metadata_request(data), status_code=200)
     except PermissionError as exc:
         return json_response({"ok": False, "reply": str(exc)}, status_code=403)
     except ValueError as exc:
@@ -365,8 +377,8 @@ def vscode_github_pr(req: func.HttpRequest) -> func.HttpResponse:
     
     data = _request_json(req)
     try:
-        from shared_code.terrabot_service import handle_workspace_pr_request
-        return json_response(handle_workspace_pr_request(data), status_code=200)
+        service = _terrabot_service()
+        return json_response(service.handle_workspace_pr_request(data), status_code=200)
     except PermissionError as exc:
         return json_response({"ok": False, "reply": str(exc)}, status_code=403)
     except ValueError as exc:
@@ -480,9 +492,9 @@ def chat(req: func.HttpRequest) -> func.HttpResponse:
         )
 
     try:
-        from shared_code.terrabot_service import handle_chat_request
+        service = _terrabot_service()
 
-        result, status_code = handle_chat_request(data)
+        result, status_code = service.handle_chat_request(data)
     except Exception as e:
         return json_response(
             {
@@ -526,9 +538,9 @@ def trigger_pr_pipeline(req: func.HttpRequest) -> func.HttpResponse:
         )
 
     try:
-        from shared_code.terrabot_service import trigger_test_branch_pipeline_for_pr
+        service = _terrabot_service()
 
-        result = trigger_test_branch_pipeline_for_pr(
+        result = service.trigger_test_branch_pipeline_for_pr(
             repo_owner=str(data["repo_owner"]),
             repo_name=str(data["repo_name"]),
             pr_number=int(data["pr_number"]),
@@ -569,9 +581,9 @@ def plan_risk(req: func.HttpRequest) -> func.HttpResponse:
         )
 
     try:
-        from shared_code.terrabot_service import handle_plan_risk_request
+        service = _terrabot_service()
 
-        result, status_code = handle_plan_risk_request(data, req.headers)
+        result, status_code = service.handle_plan_risk_request(data, req.headers)
     except Exception as e:
         return json_response(
             {
@@ -636,9 +648,9 @@ def repository_context_search(req: func.HttpRequest) -> func.HttpResponse:
         return auth_error
     data = _request_json(req)
     try:
-        from shared_code.terrabot_service import search_repository_context
+        service = _terrabot_service()
 
-        result = search_repository_context(
+        result = service.search_repository_context(
             str(data.get("repo_owner") or ""),
             str(data.get("repo_name") or ""),
             str(data.get("query") or ""),
@@ -659,9 +671,9 @@ def repository_context_add(req: func.HttpRequest) -> func.HttpResponse:
         return auth_error
     data = _request_json(req)
     try:
-        from shared_code.terrabot_service import add_repository_context
+        service = _terrabot_service()
 
-        result = add_repository_context(
+        result = service.add_repository_context(
             str(data.get("repo_owner") or ""),
             str(data.get("repo_name") or ""),
             str(data.get("evidence_commit_sha") or ""),
@@ -683,9 +695,9 @@ def repository_context_update(req: func.HttpRequest) -> func.HttpResponse:
         return auth_error
     data = _request_json(req)
     try:
-        from shared_code.terrabot_service import update_repository_context
+        service = _terrabot_service()
 
-        result = update_repository_context(
+        result = service.update_repository_context(
             str(data.get("context_id") or ""),
             str(data.get("repo_owner") or ""),
             str(data.get("repo_name") or ""),
@@ -708,9 +720,9 @@ def repository_context_invalidate(req: func.HttpRequest) -> func.HttpResponse:
         return auth_error
     data = _request_json(req)
     try:
-        from shared_code.terrabot_service import invalidate_repository_context
+        service = _terrabot_service()
 
-        result = invalidate_repository_context(
+        result = service.invalidate_repository_context(
             str(data.get("context_id") or ""),
             str(data.get("reason") or ""),
             current_commit_sha=str(data.get("current_commit_sha") or ""),
@@ -728,9 +740,9 @@ def repository_context_tools(req: func.HttpRequest) -> func.HttpResponse:
     if auth_error:
         return auth_error
     try:
-        from shared_code.terrabot_service import repository_context_tool_schemas
+        service = _terrabot_service()
 
-        return json_response({"ok": True, "tools": repository_context_tool_schemas()})
+        return json_response({"ok": True, "tools": service.repository_context_tool_schemas()})
     except Exception as exc:
         return _repository_context_api_error("repository_context_tool_schemas", exc)
 
@@ -836,7 +848,7 @@ async def teams_messages(req: func.HttpRequest) -> func.HttpResponse:
     auth_level=func.AuthLevel.ANONYMOUS,
 )
 def github_teams_callback(req: func.HttpRequest) -> func.HttpResponse:
-    from shared_code.terrabot_service import handle_teams_github_oauth_callback
+    service = _terrabot_service()
 
     code = (req.params.get("code") or "").strip()
     state = (req.params.get("state") or "").strip()
@@ -860,7 +872,7 @@ def github_teams_callback(req: func.HttpRequest) -> func.HttpResponse:
         )
 
     try:
-        handle_teams_github_oauth_callback(code, state)
+        service.handle_teams_github_oauth_callback(code, state)
     except Exception as exc:
         return func.HttpResponse(
             "<html><body><h2>GitHub connection failed</h2>"
@@ -888,9 +900,9 @@ def teams_test(req: func.HttpRequest) -> func.HttpResponse:
     prompt = str(data.get("prompt") or "hey").strip()
 
     try:
-        from shared_code.terrabot_service import handle_teams_chat_request
+        service = _terrabot_service()
 
-        result, status_code = handle_teams_chat_request(
+        result, status_code = service.handle_teams_chat_request(
             {
                 "prompt": prompt,
                 "thread_id": "",

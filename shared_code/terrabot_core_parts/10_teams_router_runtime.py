@@ -2264,6 +2264,57 @@ def _repository_context_should_capture_clarification(prompt: str) -> bool:
     ))
 
 
+def _repository_context_evidence_fetcher(
+    repo_owner: str,
+    repo_name: str,
+    path: str,
+    ref: str,
+) -> Optional[str]:
+    return github_get_file_content_by_repo(
+        repo_owner,
+        repo_name,
+        path,
+        ref=ref or None,
+    )
+
+
+def search_repository_context(
+    repo_owner: str,
+    repo_name: str,
+    query: str,
+    current_commit_sha: str = "",
+    top_k: int = 8,
+) -> dict:
+    """Backend/tool API: retrieve shared durable knowledge for one repository."""
+    return shared_repository_context.search_repository_context(
+        repo_owner=repo_owner,
+        repo_name=repo_name,
+        query=query,
+        current_commit_sha=current_commit_sha,
+        top_k=top_k,
+    )
+
+
+def add_repository_context(
+    repo_owner: str,
+    repo_name: str,
+    evidence_commit_sha: str,
+    candidate: dict,
+    evidence_branch: str = "",
+    source_task_hash: str = "",
+) -> dict:
+    """Backend/tool API: validate and add one durable repository conclusion."""
+    return shared_repository_context.add_repository_context(
+        repo_owner=repo_owner,
+        repo_name=repo_name,
+        evidence_commit_sha=evidence_commit_sha,
+        evidence_branch=evidence_branch,
+        source_task_hash=source_task_hash,
+        candidate=candidate,
+        evidence_fetcher=_repository_context_evidence_fetcher,
+    )
+
+
 def _extract_and_store_repository_context_from_clarification(agent_input: str, active: dict) -> dict:
     """Promote an evidence-backed clarification before any commit occurs.
 

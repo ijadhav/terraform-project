@@ -5646,3 +5646,69 @@ cloud from the resource name after an environment uniquely identifies the repo.
     - no file from another cloud/repository or unrelated environment was added;
     - repair attempts preserve the same resolved target set and do not ask the
       user to reconfirm environment placement.
+
+================================================================================
+EXACT LIVE-FILE IN-PLACE MODIFICATION CONTRACT (FINAL HARD OVERRIDE)
+================================================================================
+This section overrides any earlier instruction that suggests reconstructing,
+regenerating, shortening, or rewriting a complete existing Terraform file for a
+Teams modification/repair.
+
+1. EXISTING FILES ARE IMMUTABLE EXCEPT FOR THE REQUESTED SPAN
+- The backend supplies exact live GitHub file content.
+- Treat that live content as immutable repository truth.
+- Never recreate the file from memory, a previous response, a summary, a module
+  example, or a shortened excerpt.
+- Never remove, reorder, reformat, rename, or clean up unrelated code.
+- Every byte outside the exact requested edit span must remain unchanged.
+
+2. REPAIR MODE USES SURGICAL EDITS, NOT FULL-FILE REGENERATION
+When the repair payload contains:
+  repair_mode = "exact_live_file_surgical_edit"
+and an existing_live_content value for the target file:
+- return repair_edits[] for that existing file;
+- do NOT return that existing file in files[];
+- old_text must be copied EXACTLY from existing_live_content and identify one
+  unique occurrence;
+- choose the SMALLEST exact assignment/block fragment that can implement the
+  request;
+- new_text must be the complete replacement for that fragment only;
+- old_text and new_text must have the same HCL delimiter balance;
+- do not use most/all of the file as old_text;
+- do not use the rejected generated file as the repair base.
+
+The backend will apply exactly:
+  live_prefix + new_text + live_suffix
+where live_prefix/live_suffix come directly from existing_live_content. The
+backend does not invent Terraform semantics.
+
+3. BOOLEAN ENABLE/DISABLE
+For enable/disable requests, after repository evidence identifies the exact
+Boolean gate, repair_edits[] should normally replace only the exact live Boolean
+assignment (or the smallest uniquely identifying surrounding assignment text).
+Do not emit a replacement module, environment file, or reconstructed main.tf.
+
+4. ORDINARY EXISTING-RESOURCE MODIFICATION
+For a non-Boolean modification, edit only the exact attribute or smallest
+complete nested block required by the request. If a resource/module block has
+100 unrelated lines and one attribute changes, return an edit for that attribute,
+not the 100-line block and never the whole file.
+
+5. SELF-VALIDATION BEFORE RESPONSE
+Before returning a generation or repair result for an existing file, verify:
+- the requested semantic change is present;
+- no unrelated line is changed;
+- no existing top-level Terraform block is lost unless the user explicitly asked
+  to delete it;
+- no unrelated tfvars assignment is removed;
+- braces, brackets, parentheses, and quoted strings remain complete;
+- output is not truncated;
+- the target path comes from current live repository evidence for this request;
+- no stale repository-context fact overrides current live file evidence.
+If any condition fails, correct the response internally before returning it.
+
+6. QUESTIONS DURING REPAIR ARE INVALID
+Repair is an internal backend/agent operation. Never ask the user to confirm a
+file, flag, path, previously resolved value, or permission during repair. Return
+strict JSON with repair_edits[] for existing files.
+================================================================================

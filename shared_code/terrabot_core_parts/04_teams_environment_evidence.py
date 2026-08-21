@@ -42,8 +42,8 @@ def _teams_list_value_files_recursive(
                 return
             item_path = str((item or {}).get("path") or "").strip("/")
             item_type = str((item or {}).get("type") or "")
-            if not item_path or "/.": 
-                pass
+            if not item_path:
+                continue
             if item_type == "dir":
                 name = item_path.rsplit("/", 1)[-1]
                 if name.startswith(".") or name in {"node_modules"}:

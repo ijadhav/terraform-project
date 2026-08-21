@@ -9,7 +9,7 @@ compatibility functions used by the existing Teams bot/function app.
 """
 from __future__ import annotations
 
-import terrabot_service_core as _core
+from shared_code import terrabot_service_core as _core
 from shared_code.terrabot_teams_handlers import handle_teams_chat_request as _teams_handle
 
 for _name, _value in vars(_core).items():

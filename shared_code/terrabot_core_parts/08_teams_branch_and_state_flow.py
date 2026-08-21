@@ -396,6 +396,11 @@ def _build_backend_existing_infra_modification_context_teams_v1(
 
 
 
+def _teams_context_file_identity(item: dict) -> str:
+    """Return the canonical repo-relative identity for a context file."""
+    return str((item or {}).get("path") or (item or {}).get("filename") or "").strip().strip("/")
+
+
 def _teams_feature_flag_intent(prompt: str) -> str:
     """Return enable/disable only for explicit feature-state requests."""
     text = re.sub(r"\s+", " ", str(prompt or "").strip().lower())
