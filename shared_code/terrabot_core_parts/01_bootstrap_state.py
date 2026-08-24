@@ -23,6 +23,7 @@ import threading
 import contextvars
 import zlib
 import importlib
+from concurrent.futures import ThreadPoolExecutor
 
 try:
     import jwt
@@ -88,6 +89,11 @@ load_dotenv()
 
 LOGGER = logging.getLogger("terrabot.service")
 LOGGER.setLevel(logging.INFO)
+
+_TERRABOT_IO_EXECUTOR = ThreadPoolExecutor(
+    max_workers=max(4, int(os.getenv("TERRABOT_IO_MAX_WORKERS", "12"))),
+    thread_name_prefix="terrabot-io",
+)
 
 from shared_code.keyvault_loader import load_keyvault_secrets
 load_keyvault_secrets()

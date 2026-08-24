@@ -2263,6 +2263,41 @@ def _repository_context_branch_and_sha(
     return branch, str(sha or "").strip()
 
 
+
+def _repository_context_prefetch_worker(active: dict) -> dict:
+    prompt = str(active.get("effective_prompt") or "").strip()
+    resolved_cloud = (
+        safe_normalize_cloud(str(active.get("cloud") or ""))
+        or safe_normalize_cloud(infer_cloud_from_prompt(prompt))
+        or ""
+    )
+    owner, repo = _repository_context_repo_identity(
+        resolved_cloud,
+        str(active.get("repo_target") or ""),
+        "",
+        str(active.get("repo_name") or ""),
+    )
+    if not owner or not repo:
+        return {"owner": owner, "repo": repo, "branch": "", "sha": "", "search_result": {"results": []}}
+    preferred_branch = str(active.get("context_branch") or active.get("existing_branch") or "").strip()
+    branch, current_sha = _repository_context_branch_and_sha(owner, repo, preferred_branch)
+    search_result = shared_repository_context.search_repository_context(
+        repo_owner=owner,
+        repo_name=repo,
+        query=prompt,
+        current_commit_sha=current_sha,
+    )
+    return {"owner": owner, "repo": repo, "branch": branch, "sha": current_sha, "search_result": search_result}
+
+
+def _start_repository_context_prefetch(active: dict) -> None:
+    """Overlap repository-context retrieval with repository discovery."""
+    if not active or active.get("repository_context_future") is not None:
+        return
+    active["repository_context_future"] = _TERRABOT_IO_EXECUTOR.submit(
+        _repository_context_prefetch_worker, dict(active)
+    )
+
 def _teams_repository_context_live_files(
     owner: str,
     repo: str,
@@ -2306,10 +2341,17 @@ def _teams_repository_context_live_files(
                 entry["statements"].append(statement)
             entry["stale_context"] = bool(entry["stale_context"] or result.get("stale"))
 
+    selected = list(path_context.items())[:max_files]
+    futures = {}
+    for path, _metadata in selected:
+        worker_context = contextvars.copy_context()
+        futures[path] = _TERRABOT_IO_EXECUTOR.submit(
+            worker_context.run, github_get_file_content_by_repo, owner, repo, path, branch or None
+        )
     live_files: list[dict] = []
-    for path, metadata in list(path_context.items())[:max_files]:
+    for path, metadata in selected:
         try:
-            content = github_get_file_content_by_repo(owner, repo, path, ref=branch or None)
+            content = futures[path].result()
         except Exception as exc:
             LOGGER.warning(
                 "[TerrabotDiag] event=repository_context_live_evidence_fetch_failed repo=%s/%s path=%s branch=%s error=%s",
@@ -2369,16 +2411,35 @@ def _teams_attach_repository_context(agent_input: str, active: dict) -> str:
         or payload.get("repository_ref")
         or ""
     ).strip()
-    branch, current_sha = _repository_context_branch_and_sha(owner, repo, preferred_branch)
+    prefetched = None
+    future = active.get("repository_context_future")
+    if future is not None:
+        try:
+            candidate = future.result()
+            if candidate.get("owner") == owner and candidate.get("repo") == repo:
+                prefetched = candidate
+        except Exception as exc:
+            LOGGER.warning(
+                "[TerrabotDiag] event=repository_context_prefetch_failed repo=%s/%s error=%s",
+                owner, repo, exc,
+            )
     try:
-        search_result = shared_repository_context.search_repository_context(
-            repo_owner=owner,
-            repo_name=repo,
-            query=prompt_for_relevance,
-            current_commit_sha=current_sha,
-        )
+        if prefetched is not None:
+            branch = str(prefetched.get("branch") or preferred_branch or "main")
+            current_sha = str(prefetched.get("sha") or "")
+            search_result = prefetched.get("search_result") or {"results": []}
+        else:
+            branch, current_sha = _repository_context_branch_and_sha(owner, repo, preferred_branch)
+            search_result = shared_repository_context.search_repository_context(
+                repo_owner=owner,
+                repo_name=repo,
+                query=prompt_for_relevance,
+                current_commit_sha=current_sha,
+            )
         context_block = shared_repository_context.format_repository_context_for_agent(search_result)
     except Exception as exc:
+        branch = str((prefetched or {}).get("branch") or preferred_branch or "main")
+        current_sha = str((prefetched or {}).get("sha") or "")
         LOGGER.warning(
             "[TerrabotDiag] event=repository_context_attach_failed repo=%s/%s error=%s",
             owner,

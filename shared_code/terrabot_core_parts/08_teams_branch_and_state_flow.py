@@ -1988,6 +1988,12 @@ def _handle_teams_chat_request_safe(data: dict):
     }
     context_token = _ACTIVE_TEAMS_FLOW_CONTEXT.set(flow_context)
     try:
+        prefetch = globals().get("_start_repository_context_prefetch")
+        if callable(prefetch):
+            try:
+                prefetch(flow_context)
+            except Exception as exc:
+                LOGGER.warning("[TerrabotDiag] event=repository_context_prefetch_start_failed error=%s", exc)
         result, status_code = _ORIGINAL_HANDLE_TEAMS_CHAT_REQUEST(request_data)
 
         # AWS create/add/provision requests are execute-now after branch choice.

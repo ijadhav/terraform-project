@@ -733,6 +733,7 @@ def github_put_file(cloud: Any | None, path: str, content: str, branch: str, com
 
     response = requests.put(url, headers=github_headers(), json=payload, timeout=30)
     response.raise_for_status()
+    _github_invalidate_request_snapshot(GITHUB_OWNER, repo, branch)
     return response.json()
 
 
@@ -1379,10 +1380,53 @@ def github_folder_exists(cloud: Any | None, path: str, branch: str, repo_target:
     return True
 
 
+def _github_request_snapshot() -> Optional[dict]:
+    """Return the current Teams request-local GitHub snapshot, if any."""
+    flow_var = globals().get("_ACTIVE_TEAMS_FLOW_CONTEXT")
+    if flow_var is None:
+        return None
+    try:
+        active = flow_var.get() or {}
+    except Exception:
+        return None
+    if not active.get("active"):
+        return None
+    snapshot = active.setdefault("repository_snapshot", {})
+    snapshot.setdefault("files", {})
+    snapshot.setdefault("directories", {})
+    snapshot.setdefault("repos", {})
+    snapshot.setdefault("branch_shas", {})
+    snapshot.setdefault("tf_trees", {})
+    return snapshot
+
+
+def _github_snapshot_key(owner: str, repo: str, ref: str, path: str = "") -> tuple[str, str, str, str]:
+    return (str(owner or ""), str(repo or ""), str(ref or ""), str(path or "").strip("/"))
+
+
+def _github_invalidate_request_snapshot(owner: str, repo: str, ref: str = "") -> None:
+    snapshot = _github_request_snapshot()
+    if not snapshot:
+        return
+    prefix = (str(owner or ""), str(repo or ""))
+    normalized_ref = str(ref or "")
+    for bucket in ("files", "directories", "tf_trees"):
+        for key in list(snapshot.get(bucket, {})):
+            if key[:2] == prefix and (not normalized_ref or key[2] == normalized_ref):
+                snapshot[bucket].pop(key, None)
+    for key in list(snapshot.get("branch_shas", {})):
+        if key[:2] == prefix and (not normalized_ref or key[2] == normalized_ref):
+            snapshot["branch_shas"].pop(key, None)
+
+
 def github_get_directory_listing(cloud: Any | None, path: str, branch: str, repo_target: Optional[str] = None, workflow: Optional[str] = None):
     repo = github_repo_for_cloud(cloud, repo_target=repo_target, workflow=workflow)
-
     normalized_path = (path or "").strip("/")
+    snapshot = _github_request_snapshot()
+    cache_key = _github_snapshot_key(GITHUB_OWNER, repo, branch, normalized_path)
+    if snapshot is not None and cache_key in snapshot["directories"]:
+        return snapshot["directories"][cache_key]
+
     if normalized_path in {"", "."}:
         url = f"{GITHUB_API}/repos/{GITHUB_OWNER}/{repo}/contents"
     else:
@@ -1394,11 +1438,18 @@ def github_get_directory_listing(cloud: Any | None, path: str, branch: str, repo
 
     response.raise_for_status()
     data = response.json()
-    return data if isinstance(data, list) else [data]
+    result = data if isinstance(data, list) else [data]
+    if snapshot is not None:
+        snapshot["directories"][cache_key] = result
+    return result
 
 
 def github_get_file_content(cloud: Any | None, path: str, branch: str, repo_target: Optional[str] = None, workflow: Optional[str] = None):
     repo = github_repo_for_cloud(cloud, repo_target=repo_target, workflow=workflow)
+    snapshot = _github_request_snapshot()
+    cache_key = _github_snapshot_key(GITHUB_OWNER, repo, branch, path)
+    if snapshot is not None and cache_key in snapshot["files"]:
+        return snapshot["files"][cache_key]
     url = f"{GITHUB_API}/repos/{GITHUB_OWNER}/{repo}/contents/{path}"
     response = requests.get(url, headers=github_headers(), params={"ref": branch}, timeout=30)
 
@@ -1412,7 +1463,10 @@ def github_get_file_content(cloud: Any | None, path: str, branch: str, repo_targ
     if not encoded:
         return None
 
-    return base64.b64decode(encoded).decode("utf-8")
+    content = base64.b64decode(encoded).decode("utf-8")
+    if snapshot is not None:
+        snapshot["files"][cache_key] = content
+    return content
 
 def _github_get_repo_metadata_base(owner: str, repo: str):
     url = f"{GITHUB_API}/repos/{owner}/{repo}"
@@ -1425,6 +1479,10 @@ def _github_get_repo_metadata_base(owner: str, repo: str):
     return response.json()
 
 def github_get_repo(owner: str, repo: str) -> Optional[dict]:
+    snapshot = _github_request_snapshot()
+    cache_key = (str(owner or ""), str(repo or ""))
+    if snapshot is not None and cache_key in snapshot["repos"]:
+        return snapshot["repos"][cache_key]
     url = f"{GITHUB_API}/repos/{owner}/{repo}"
     response = requests.get(url, headers=github_headers(), timeout=30)
 
@@ -1432,7 +1490,10 @@ def github_get_repo(owner: str, repo: str) -> Optional[dict]:
         return None
 
     response.raise_for_status()
-    return response.json()
+    result = response.json()
+    if snapshot is not None:
+        snapshot["repos"][cache_key] = result
+    return result
 
 
 def github_get_repo_default_branch(owner: str, repo: str) -> Optional[str]:
@@ -1462,6 +1523,10 @@ def github_get_contents(owner: str, repo: str, path: str = "", ref: Optional[str
 
 
 def github_get_file_content_by_repo(owner: str, repo: str, path: str, ref: Optional[str] = None) -> Optional[str]:
+    snapshot = _github_request_snapshot()
+    cache_key = _github_snapshot_key(owner, repo, ref or "", path)
+    if snapshot is not None and cache_key in snapshot["files"]:
+        return snapshot["files"][cache_key]
     data: Any = github_get_contents(owner, repo, path=path, ref=ref)
     if not isinstance(data, dict):
         return None
@@ -1470,9 +1535,16 @@ def github_get_file_content_by_repo(owner: str, repo: str, path: str, ref: Optio
     if not encoded:
         return None
 
-    return base64.b64decode(encoded).decode("utf-8")
+    content = base64.b64decode(encoded).decode("utf-8")
+    if snapshot is not None:
+        snapshot["files"][cache_key] = content
+    return content
 
 def github_get_base_branch_sha_by_repo(owner: str, repo: str, branch_name: str):
+    snapshot = _github_request_snapshot()
+    cache_key = (str(owner or ""), str(repo or ""), str(branch_name or ""))
+    if snapshot is not None and cache_key in snapshot["branch_shas"]:
+        return snapshot["branch_shas"][cache_key]
     url = f"{GITHUB_API}/repos/{owner}/{repo}/git/ref/heads/{branch_name}"
     response = requests.get(url, headers=github_headers(), timeout=30)
 
@@ -1482,7 +1554,10 @@ def github_get_base_branch_sha_by_repo(owner: str, repo: str, branch_name: str):
         )
 
     response.raise_for_status()
-    return response.json()["object"]["sha"]
+    sha = response.json()["object"]["sha"]
+    if snapshot is not None:
+        snapshot["branch_shas"][cache_key] = sha
+    return sha
 
 
 def github_branch_exists_by_repo(owner: str, repo: str, branch_name: str) -> bool:
@@ -1532,6 +1607,7 @@ def github_put_file_by_repo(owner: str, repo: str, path: str, content: str, bran
 
     response = requests.put(url, headers=github_headers(), json=payload, timeout=30)
     response.raise_for_status()
+    _github_invalidate_request_snapshot(owner, repo, branch)
     return response.json()
 
 
@@ -2200,6 +2276,12 @@ def github_list_tf_files_recursive(
     repo_target: Optional[str] = None,
     workflow: Optional[str] = None,
 ):
+    repo = github_repo_for_cloud(cloud, repo_target=repo_target, workflow=workflow)
+    snapshot = _github_request_snapshot()
+    tree_key = _github_snapshot_key(GITHUB_OWNER, repo, branch, root_path or ".")
+    if snapshot is not None and tree_key in snapshot["tf_trees"]:
+        return list(snapshot["tf_trees"][tree_key])
+
     results = []
 
     def walk(current_path: str):
@@ -2220,6 +2302,8 @@ def github_list_tf_files_recursive(
                 results.append(item_path)
 
     walk(root_path or ".")
+    if snapshot is not None:
+        snapshot["tf_trees"][tree_key] = list(results)
     return results
 
 def auth_headers_ok(headers) -> bool:
