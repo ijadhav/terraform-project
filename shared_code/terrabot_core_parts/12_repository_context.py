@@ -1,5 +1,13 @@
 from __future__ import annotations
 from typing import TYPE_CHECKING ,Optional
+import contextvars
+import importlib
+from concurrent.futures import as_completed
+
+_TERRABOT_IO_EXECUTOR = importlib.import_module(
+    "shared_code.terrabot_core_parts.01_bootstrap_state"
+)._TERRABOT_IO_EXECUTOR
+
 
 if TYPE_CHECKING:
     from shared_code.terrabot_core_typing import (
@@ -647,11 +655,43 @@ def _extract_and_store_repository_context_after_commit(
     }
 
 
+def _run_parallel_precommit_validations(agent_result: dict, prompt: str) -> None:
+    """Run independent pre-write validators concurrently and aggregate errors.
+
+    Each validator receives a copy of the current ContextVar state so Teams
+    request-local repository evidence remains visible inside executor workers.
+    No validator mutates Terraform or writes to GitHub.
+    """
+    validators = (
+        ("semantic_relevance", _prompt_guard_validate_semantic_relevance, (agent_result, prompt)),
+        ("terraform_shape", _prompt_guard_validate_terraform_shape, (agent_result,)),
+        ("agent_self_validation", _prompt_guard_agent_self_validate, (agent_result, prompt)),
+    )
+    futures = {}
+    for name, validator, args in validators:
+        ctx = contextvars.copy_context()
+        future = _TERRABOT_IO_EXECUTOR.submit(ctx.run, validator, *args)
+        futures[future] = name
+
+    failures: list[tuple[str, str]] = []
+    for future in as_completed(futures):
+        name = futures[future]
+        try:
+            future.result()
+        except Exception as exc:
+            failures.append((name, str(exc)))
+
+    if failures:
+        failures.sort(key=lambda item: item[0])
+        details = " | ".join(f"{name}: {message}" for name, message in failures)
+        raise ValueError(
+            "BACKEND_VALIDATION_FAILED_MULTIPLE: " + details
+        )
+
+
 def commit_terraform_files_to_branch_for_teams(agent_result: dict, prompt: str, thread_id: str) -> dict:
     """Validate and transport Foundry output without rewriting Terraform."""
-    _prompt_guard_validate_semantic_relevance(agent_result, prompt)
-    _prompt_guard_validate_terraform_shape(agent_result)
-    _prompt_guard_agent_self_validate(agent_result, prompt)
+    _run_parallel_precommit_validations(agent_result, prompt)
     # Use the branch writer that consumes agent_result files directly. The
     # backend must not run surgical materializers, flag togglers, object
     # synthesizers, tfvars mergers, brace repair, or repository-code generators.

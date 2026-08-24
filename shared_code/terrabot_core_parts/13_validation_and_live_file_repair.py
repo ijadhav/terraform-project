@@ -1026,16 +1026,22 @@ def _teams_validate_agent_preserved_existing_file(path: str, generated: str, con
 
 
 def enforce_modification_uses_backend_matched_files(agent_result: dict, retrieved_value_context: list | None) -> dict:
-    """Validate agent-chosen paths; never force a backend file choice.
+    """Validate agent-chosen paths and aggregate independent deterministic failures.
 
     For agent_resolves_target contexts every supplied live evidence path is an
-    allowed candidate, but Foundry must return only the file(s) it actually
-    needs. For creation, repository-declared companion tfvars/variables files
-    are required when the supplied workflow evidence says they participate.
+    allowed candidate. All returned files are checked before raising so Foundry
+    receives one repair package containing every known path/preservation/companion
+    failure instead of discovering them across sequential repair rounds.
     """
     context = _get_backend_existing_infra_context(retrieved_value_context)
+    validation_errors: list[str] = []
+
     if not isinstance(context, dict) or not context.get("agent_resolves_target"):
-        result = _VALIDATED_PREVIOUS_ENFORCE_MOD_PATHS(agent_result, retrieved_value_context)
+        try:
+            result = _VALIDATED_PREVIOUS_ENFORCE_MOD_PATHS(agent_result, retrieved_value_context)
+        except ValueError as exc:
+            validation_errors.append(str(exc))
+            result = agent_result
     else:
         allowed = {
             _teams_context_file_identity(item)
@@ -1047,50 +1053,66 @@ def enforce_modification_uses_backend_matched_files(agent_result: dict, retrieve
             for path in context.get("companion_write_paths") or []
             if str(path or "").strip()
         }
-        returned = []
         for file_data in agent_result.get("files") or []:
             if not isinstance(file_data, dict):
                 continue
             raw = str(file_data.get("filename") or file_data.get("path") or "").strip()
-            normalized = normalize_iac_relative_path(raw, allow_tfvars=True).strip("/")
-            returned.append(normalized)
+            try:
+                normalized = normalize_iac_relative_path(raw, allow_tfvars=True).strip("/")
+            except Exception as exc:
+                validation_errors.append(f"Invalid generated path `{raw}`: {exc}")
+                continue
             if allowed and normalized not in allowed:
-                raise UnsafeGeneratedChangeError(
+                validation_errors.append(
                     f"Generated modification path `{normalized}` is not present in the live repository evidence for this request. "
                     "Foundry must choose only repository-grounded target files supplied by the backend."
                 )
-            _teams_validate_agent_preserved_existing_file(
-                normalized,
-                str(file_data.get("content") or ""),
-                context,
-            )
+                continue
+            try:
+                _teams_validate_agent_preserved_existing_file(
+                    normalized,
+                    str(file_data.get("content") or ""),
+                    context,
+                )
+            except ValueError as exc:
+                validation_errors.append(str(exc))
         result = agent_result
 
-    # Creation companion completeness is a validation contract only. The repair
-    # loop in the handler will send the missing-file error back to Foundry.
+    # Creation companion completeness is part of the same deterministic batch.
     active = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
     effective_prompt = str(active.get("effective_prompt") or agent_result.get("user_prompt") or "")
     if active.get("active") and _teams_is_existing_invocation_creation(effective_prompt):
-        context = _get_backend_existing_infra_context(retrieved_value_context)
+        creation_context = _get_backend_existing_infra_context(retrieved_value_context)
+        creation_context = creation_context if isinstance(creation_context, dict) else {}
         companions = {
             str(path or "").strip().strip("/")
-            for path in (context.get("companion_write_paths") or [])
+            for path in (creation_context.get("companion_write_paths") or [])
             if str(path or "").strip()
         }
-        returned = {
-            normalize_iac_relative_path(
-                str((item or {}).get("filename") or (item or {}).get("path") or ""),
-                allow_tfvars=True,
-            ).strip("/")
-            for item in (result.get("files") or [])
-            if isinstance(item, dict)
-        }
+        returned = set()
+        for item in result.get("files") or []:
+            if not isinstance(item, dict):
+                continue
+            raw = str(item.get("filename") or item.get("path") or "")
+            try:
+                returned.add(normalize_iac_relative_path(raw, allow_tfvars=True).strip("/"))
+            except Exception:
+                continue
         required_tfvars = sorted(path for path in companions if path.endswith((".tfvars", ".tfvars.json")))
         if required_tfvars and not (returned & set(required_tfvars)):
-            raise ValueError(
+            validation_errors.append(
                 "Creation output is missing the repository companion tfvars values file. "
                 f"Foundry must return the complete updated content for one of: {', '.join(required_tfvars)}."
             )
+
+    if validation_errors:
+        # Stable de-duplication keeps the repair prompt concise when two guards
+        # report the same underlying preservation problem.
+        unique_errors = list(dict.fromkeys(error for error in validation_errors if error))
+        raise ValueError(
+            "BACKEND_MODIFICATION_VALIDATION_FAILED_MULTIPLE: "
+            + " | ".join(unique_errors)
+        )
     return result
 
 

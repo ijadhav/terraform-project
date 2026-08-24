@@ -468,63 +468,32 @@ def _teams_repair_reply_has_executable_change(agent_reply: str) -> bool:
 
 
 def _teams_call_agent_for_backend_repair(repair_payload: dict) -> tuple[str, str]:
-    """Use isolated Foundry calls and force non-executable repairs to converge.
+    """Make exactly one isolated Foundry repair call for one validation batch.
 
-    The repair payload is fully self-contained. If Foundry answers the first
-    isolated call with a question, prose, or malformed/non-executable JSON, make
-    one immediate fresh repair-enforcement call using the same live evidence.
-    Terraform semantics remain Foundry-owned; the backend only requires an
-    executable files[]/repair_edits[] response before returning to validation.
+    The repair payload already contains the aggregated backend failure plus exact
+    live repository baselines. A malformed/non-executable response is rejected
+    locally instead of triggering another model round trip.
     """
     raw = json.dumps(repair_payload, ensure_ascii=False, separators=(",", ":"))
     _teams_diag_log(
         "backend_repair_isolated_call",
         input_chars=len(raw),
         repair_files=len(repair_payload.get("repair_files") or []),
+        strategy="single_consolidated_repair",
     )
-    conversation_id, reply = _TEAMS_MULTICLOUD_PREVIOUS_CALL_AGENT(None, raw)
-    if _teams_repair_reply_has_executable_change(reply):
-        return conversation_id, reply
-
-    enforcement_payload = dict(repair_payload)
-    enforcement_payload["repair_response_violation"] = (
-        "The immediately preceding internal repair response contained no executable "
-        "files[] or repair_edits[]. Do not ask a question. Produce the repair now."
-    )
-    enforcement_payload["mandatory_next_output"] = {
-        "json_only": True,
-        "questions": [],
-        "must_include_exactly_one_of": ["repair_edits", "files"],
-        "preferred": "repair_edits for targeted edits to existing files",
-        "instruction": (
-            "Use repair_files[].existing_live_content as the immutable baseline and "
-            "fix backend_validation_error with the smallest Foundry-selected change."
-        ),
-    }
-    enforcement_raw = json.dumps(
-        enforcement_payload, ensure_ascii=False, separators=(",", ":")
-    )
-    _teams_diag_log(
-        "backend_repair_nonexecutable_retry",
-        input_chars=len(enforcement_raw),
-        repair_files=len(repair_payload.get("repair_files") or []),
-    )
-    return _TEAMS_MULTICLOUD_PREVIOUS_CALL_AGENT(None, enforcement_raw)
+    return _TEAMS_MULTICLOUD_PREVIOUS_CALL_AGENT(None, raw)
 
 
 
 def _teams_get_valid_backend_repair(
     repair_payload: dict,
     current_result: dict,
-    max_response_attempts: int = 3,
+    max_response_attempts: int = 1,
 ) -> dict:
-    """Obtain one executable backend-valid repair before consuming an outer retry.
+    """Validate the single consolidated Foundry repair response locally.
 
-    Invalid repair responses (wrong old_text, truncated new_text, malformed HCL,
-    full-file output in surgical mode, or an unchanged candidate) are fed back
-    to Foundry immediately with the same exact GitHub baseline.  This prevents
-    the outer self-correction loop from validating the same rejected draft five
-    times while the repair response itself never converges.
+    Invalid repair output is not re-prompted here. This keeps the normal latency
+    path at one generation plus at most one repair model call.
     """
     working_payload = dict(repair_payload or {})
     last_error: Exception | None = None
@@ -608,19 +577,25 @@ def commit_terraform_files_to_branch_for_teams_with_self_correction(
     current_result = agent_result
     last_error: Optional[Exception] = None
     repair_feedback = ""
+    # Two validation passes mean: validate original -> one consolidated repair ->
+    # validate repaired candidate. MAX_TEAMS_SELF_CORRECTION_ATTEMPTS remains
+    # available for compatibility but no longer multiplies Foundry round trips.
+    effective_max_attempts = min(max(1, int(max_attempts or 1)), 2)
     _teams_diag_log(
         "commit_pipeline_start",
         thread=thread_id,
         prompt=str(prompt or "")[:120],
-        max_attempts=max_attempts,
+        max_attempts=effective_max_attempts,
+        configured_max_attempts=max_attempts,
+        repair_rounds=1,
     )
 
-    for attempt in range(1, max_attempts + 1):
+    for attempt in range(1, effective_max_attempts + 1):
         try:
             _teams_diag_log(
                 "backend_validation_start",
                 thread=thread_id,
-                attempt=f"{attempt}/{max_attempts}",
+                attempt=f"{attempt}/{effective_max_attempts}",
                 files=len(current_result.get("files") or []),
             )
             result = commit_terraform_files_to_branch_for_teams(current_result, prompt, thread_id)
@@ -631,7 +606,7 @@ def commit_terraform_files_to_branch_for_teams_with_self_correction(
             _teams_diag_log(
                 "commit_pipeline_success",
                 thread=thread_id,
-                attempt=f"{attempt}/{max_attempts}",
+                attempt=f"{attempt}/{effective_max_attempts}",
                 branch=result.get("branch"),
             )
             return result
@@ -647,16 +622,16 @@ def commit_terraform_files_to_branch_for_teams_with_self_correction(
                 "backend_validation_failed",
                 level="warning",
                 thread=thread_id,
-                attempt=f"{attempt}/{max_attempts}",
+                attempt=f"{attempt}/{effective_max_attempts}",
                 error=str(backend_error)[:300],
             )
-            if attempt >= max_attempts:
+            if attempt >= effective_max_attempts:
                 break
             LOGGER.warning(
                 "Teams backend guardrail rejected generated Terraform on attempt %s/%s "
                 "(thread=%s): %s. Routing the rejection back to the Foundry agent for "
                 "self-correction instead of surfacing it to the user.",
-                attempt, max_attempts, thread_id, backend_error,
+                attempt, effective_max_attempts, thread_id, backend_error,
             )
 
             # Never repair a truncated existing file by completing the rejected
@@ -669,7 +644,7 @@ def commit_terraform_files_to_branch_for_teams_with_self_correction(
                 _teams_diag_log(
                     "truncation_detected_forcing_live_file_surgical_repair",
                     thread=thread_id,
-                    attempt=f"{attempt}/{max_attempts}",
+                    attempt=f"{attempt}/{effective_max_attempts}",
                     path=trunc_path,
                     open_brackets=f"{open_count}({open_brackets})",
                 )
@@ -740,18 +715,18 @@ def commit_terraform_files_to_branch_for_teams_with_self_correction(
             _teams_diag_log(
                 "sending_exact_live_surgical_repair_to_agent",
                 thread=thread_id,
-                attempt=f"{attempt}/{max_attempts}",
+                attempt=f"{attempt}/{effective_max_attempts}",
             )
             try:
                 current_result = _teams_get_valid_backend_repair(
                     repair_payload,
                     current_result,
-                    max_response_attempts=3,
+                    max_response_attempts=1,
                 )
                 _teams_diag_log(
                     "agent_repair_response_received",
                     thread=thread_id,
-                    attempt=f"{attempt}/{max_attempts}",
+                    attempt=f"{attempt}/{effective_max_attempts}",
                     files_returned=len(current_result.get("files") or []),
                 )
             except Exception as repair_call_error:
@@ -764,7 +739,7 @@ def commit_terraform_files_to_branch_for_teams_with_self_correction(
                     "agent_repair_call_failed",
                     level="warning",
                     thread=thread_id,
-                    attempt=f"{attempt}/{max_attempts}",
+                    attempt=f"{attempt}/{effective_max_attempts}",
                     error=str(repair_call_error)[:200],
                 )
                 # Keep retrying with the same current_result in case this was a
@@ -775,13 +750,13 @@ def commit_terraform_files_to_branch_for_teams_with_self_correction(
         "commit_pipeline_exhausted",
         level="error",
         thread=thread_id,
-        max_attempts=max_attempts,
+        max_attempts=effective_max_attempts,
         last_error=str(last_error)[:300],
     )
     # Keep raw validator details in backend diagnostics only. Teams should never
     # receive preservation/truncation internals such as repository line counts.
     raise ValueError(
-        f"Terrabot could not produce a backend-valid Terraform change after {max_attempts} "
+        f"Terrabot could not produce a backend-valid Terraform change after {effective_max_attempts} validation passes "
         "internal self-correction attempts. No repository file changes were written."
     )
 

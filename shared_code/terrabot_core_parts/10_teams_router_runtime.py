@@ -1,5 +1,10 @@
 from __future__ import annotations
 from typing import TYPE_CHECKING , Any, List , Optional
+import importlib
+
+_TERRABOT_IO_EXECUTOR = importlib.import_module(
+    "shared_code.terrabot_core_parts.01_bootstrap_state"
+)._TERRABOT_IO_EXECUTOR
 
 if TYPE_CHECKING:
     from shared_code.terrabot_core_typing import (

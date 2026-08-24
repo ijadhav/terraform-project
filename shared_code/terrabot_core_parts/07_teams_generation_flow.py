@@ -3271,7 +3271,13 @@ def handle_chat_request(data: dict):
                     # exposed to Teams. The backend validates only; it never repairs HCL.
                     validation_error = None
                     repair_feedback = ""
-                    for repair_attempt in range(1, MAX_TEAMS_SELF_CORRECTION_ATTEMPTS + 1):
+                    # One generation-validation repair round only: pass 1 validates
+                    # the original candidate and may issue one consolidated repair;
+                    # pass 2 validates that repaired candidate without another model call.
+                    generation_validation_passes = min(
+                        max(1, int(MAX_TEAMS_SELF_CORRECTION_ATTEMPTS or 1)), 2
+                    )
+                    for repair_attempt in range(1, generation_validation_passes + 1):
                         try:
                             agent_result = enforce_modification_uses_backend_matched_files(
                                 agent_result, retrieved_value_context
@@ -3284,10 +3290,10 @@ def handle_chat_request(data: dict):
                                 "generation_validation_failed",
                                 level="warning",
                                 thread=conversation_id,
-                                attempt=f"{repair_attempt}/{MAX_TEAMS_SELF_CORRECTION_ATTEMPTS}",
+                                attempt=f"{repair_attempt}/{generation_validation_passes}",
                                 error=str(enforce_error)[:300],
                             )
-                            if repair_attempt >= MAX_TEAMS_SELF_CORRECTION_ATTEMPTS:
+                            if repair_attempt >= generation_validation_passes:
                                 break
 
                             repair_payload = {
@@ -3450,7 +3456,7 @@ def handle_chat_request(data: dict):
                             _teams_diag_log(
                                 "sending_generation_validation_repair_to_agent",
                                 thread=conversation_id,
-                                attempt=f"{repair_attempt}/{MAX_TEAMS_SELF_CORRECTION_ATTEMPTS}",
+                                attempt=f"{repair_attempt}/{generation_validation_passes}",
                             )
 
                             # A malformed/question-style Foundry repair response is itself
@@ -3521,7 +3527,7 @@ def handle_chat_request(data: dict):
                                     "generation_validation_repair_response_invalid",
                                     level="warning",
                                     thread=conversation_id,
-                                    attempt=f"{repair_attempt}/{MAX_TEAMS_SELF_CORRECTION_ATTEMPTS}",
+                                    attempt=f"{repair_attempt}/{generation_validation_passes}",
                                     error=str(repair_response_error)[:300],
                                 )
                                 repair_feedback = str(repair_response_error)
@@ -3530,7 +3536,7 @@ def handle_chat_request(data: dict):
                                     "attempt %s/%s (thread=%s): %s. Keeping the error private "
                                     "and continuing the internal repair loop.",
                                     repair_attempt,
-                                    MAX_TEAMS_SELF_CORRECTION_ATTEMPTS,
+                                    generation_validation_passes,
                                     conversation_id,
                                     repair_response_error,
                                 )
@@ -3542,7 +3548,7 @@ def handle_chat_request(data: dict):
                             _teams_diag_log(
                                 "generation_validation_repair_response_accepted",
                                 thread=conversation_id,
-                                attempt=f"{repair_attempt}/{MAX_TEAMS_SELF_CORRECTION_ATTEMPTS}",
+                                attempt=f"{repair_attempt}/{generation_validation_passes}",
                                 files_returned=len(agent_result.get("files") or []),
                             )
 

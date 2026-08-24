@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+from time import time
 from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
@@ -1380,6 +1382,70 @@ def github_folder_exists(cloud: Any | None, path: str, branch: str, repo_target:
     return True
 
 
+# Cross-request cache for relatively stable repository STRUCTURE only.
+# File contents intentionally remain request-local so generation/validation always
+# uses live repository bytes. Entries are keyed by owner/repo/ref/path and are
+# invalidated whenever Terrabot writes to that repository/ref.
+_GITHUB_STRUCTURE_CACHE: dict[tuple, tuple[float, Any]] = {}
+_GITHUB_STRUCTURE_CACHE_LOCK = threading.RLock()
+_GITHUB_REPO_TREE_TTL_SECONDS = max(30, int(os.getenv("TERRABOT_REPO_TREE_CACHE_TTL_SECONDS", "180")))
+_GITHUB_DIRECTORY_STRUCTURE_TTL_SECONDS = max(30, int(os.getenv("TERRABOT_DIRECTORY_STRUCTURE_CACHE_TTL_SECONDS", "600")))
+_GITHUB_MODULE_STRUCTURE_TTL_SECONDS = max(30, int(os.getenv("TERRABOT_MODULE_STRUCTURE_CACHE_TTL_SECONDS", "600")))
+_GITHUB_REPO_METADATA_TTL_SECONDS = max(30, int(os.getenv("TERRABOT_REPO_METADATA_CACHE_TTL_SECONDS", "300")))
+_GITHUB_STRUCTURE_CACHE_MAX_ENTRIES = max(128, int(os.getenv("TERRABOT_STRUCTURE_CACHE_MAX_ENTRIES", "4096")))
+
+
+def _github_structure_cache_ttl(path: str = "", kind: str = "directory") -> int:
+    normalized = str(path or "").strip("/")
+    segments = {segment.lower() for segment in normalized.split("/") if segment}
+    if kind == "repo":
+        return _GITHUB_REPO_METADATA_TTL_SECONDS
+    if "module" in segments or "modules" in segments:
+        return _GITHUB_MODULE_STRUCTURE_TTL_SECONDS
+    if normalized in {"", "."}:
+        return _GITHUB_REPO_TREE_TTL_SECONDS
+    return _GITHUB_DIRECTORY_STRUCTURE_TTL_SECONDS
+
+
+def _github_structure_cache_get(key: tuple, ttl_seconds: int):
+    now = time.monotonic()
+    with _GITHUB_STRUCTURE_CACHE_LOCK:
+        entry = _GITHUB_STRUCTURE_CACHE.get(key)
+        if not entry:
+            return None
+        stored_at, value = entry
+        if now - stored_at > ttl_seconds:
+            _GITHUB_STRUCTURE_CACHE.pop(key, None)
+            return None
+        return value
+
+
+def _github_structure_cache_put(key: tuple, value: Any) -> None:
+    with _GITHUB_STRUCTURE_CACHE_LOCK:
+        _GITHUB_STRUCTURE_CACHE[key] = (time.monotonic(), value)
+        overflow = len(_GITHUB_STRUCTURE_CACHE) - _GITHUB_STRUCTURE_CACHE_MAX_ENTRIES
+        if overflow > 0:
+            oldest = sorted(
+                _GITHUB_STRUCTURE_CACHE.items(),
+                key=lambda item: item[1][0],
+            )[:overflow]
+            for stale_key, _entry in oldest:
+                _GITHUB_STRUCTURE_CACHE.pop(stale_key, None)
+
+
+def _github_invalidate_structure_cache(owner: str, repo: str, ref: str = "") -> None:
+    prefix = (str(owner or ""), str(repo or ""))
+    normalized_ref = str(ref or "")
+    with _GITHUB_STRUCTURE_CACHE_LOCK:
+        for key in list(_GITHUB_STRUCTURE_CACHE):
+            if len(key) < 2 or key[:2] != prefix:
+                continue
+            # Structure keys use owner/repo/ref/...; repo-metadata keys have no ref.
+            if normalized_ref and len(key) >= 3 and key[2] not in {normalized_ref, "repo"}:
+                continue
+            _GITHUB_STRUCTURE_CACHE.pop(key, None)
+
+
 def _github_request_snapshot() -> Optional[dict]:
     """Return the current Teams request-local GitHub snapshot, if any."""
     flow_var = globals().get("_ACTIVE_TEAMS_FLOW_CONTEXT")
@@ -1405,6 +1471,7 @@ def _github_snapshot_key(owner: str, repo: str, ref: str, path: str = "") -> tup
 
 
 def _github_invalidate_request_snapshot(owner: str, repo: str, ref: str = "") -> None:
+    _github_invalidate_structure_cache(owner, repo, ref)
     snapshot = _github_request_snapshot()
     if not snapshot:
         return
@@ -1426,6 +1493,14 @@ def github_get_directory_listing(cloud: Any | None, path: str, branch: str, repo
     cache_key = _github_snapshot_key(GITHUB_OWNER, repo, branch, normalized_path)
     if snapshot is not None and cache_key in snapshot["directories"]:
         return snapshot["directories"][cache_key]
+    structure_key = (str(GITHUB_OWNER or ""), str(repo or ""), str(branch or ""), "directory", normalized_path)
+    cached_structure = _github_structure_cache_get(
+        structure_key, _github_structure_cache_ttl(normalized_path, kind="directory")
+    )
+    if cached_structure is not None:
+        if snapshot is not None:
+            snapshot["directories"][cache_key] = cached_structure
+        return cached_structure
 
     if normalized_path in {"", "."}:
         url = f"{GITHUB_API}/repos/{GITHUB_OWNER}/{repo}/contents"
@@ -1441,6 +1516,7 @@ def github_get_directory_listing(cloud: Any | None, path: str, branch: str, repo
     result = data if isinstance(data, list) else [data]
     if snapshot is not None:
         snapshot["directories"][cache_key] = result
+    _github_structure_cache_put(structure_key, result)
     return result
 
 
@@ -1483,6 +1559,14 @@ def github_get_repo(owner: str, repo: str) -> Optional[dict]:
     cache_key = (str(owner or ""), str(repo or ""))
     if snapshot is not None and cache_key in snapshot["repos"]:
         return snapshot["repos"][cache_key]
+    structure_key = (str(owner or ""), str(repo or ""), "repo", "metadata")
+    cached_repo = _github_structure_cache_get(
+        structure_key, _github_structure_cache_ttl(kind="repo")
+    )
+    if cached_repo is not None:
+        if snapshot is not None:
+            snapshot["repos"][cache_key] = cached_repo
+        return cached_repo
     url = f"{GITHUB_API}/repos/{owner}/{repo}"
     response = requests.get(url, headers=github_headers(), timeout=30)
 
@@ -1493,6 +1577,7 @@ def github_get_repo(owner: str, repo: str) -> Optional[dict]:
     result = response.json()
     if snapshot is not None:
         snapshot["repos"][cache_key] = result
+    _github_structure_cache_put(structure_key, result)
     return result
 
 
@@ -1505,6 +1590,14 @@ def github_get_repo_default_branch(owner: str, repo: str) -> Optional[str]:
 
 def github_get_contents(owner: str, repo: str, path: str = "", ref: Optional[str] = None):
     normalized_path = (path or "").strip("/")
+    # Only directory-list responses are stored in this cross-request cache.
+    # File payloads (which contain repository content) remain uncached globally.
+    structure_key = (str(owner or ""), str(repo or ""), str(ref or ""), "directory", normalized_path)
+    cached_structure = _github_structure_cache_get(
+        structure_key, _github_structure_cache_ttl(normalized_path, kind="directory")
+    )
+    if cached_structure is not None:
+        return cached_structure
     if normalized_path:
         url = f"{GITHUB_API}/repos/{owner}/{repo}/contents/{normalized_path}"
     else:
@@ -1519,7 +1612,10 @@ def github_get_contents(owner: str, repo: str, path: str = "", ref: Optional[str
         return [] if not normalized_path else None
 
     response.raise_for_status()
-    return response.json()
+    result = response.json()
+    if isinstance(result, list):
+        _github_structure_cache_put(structure_key, result)
+    return result
 
 
 def github_get_file_content_by_repo(owner: str, repo: str, path: str, ref: Optional[str] = None) -> Optional[str]:
@@ -2281,6 +2377,15 @@ def github_list_tf_files_recursive(
     tree_key = _github_snapshot_key(GITHUB_OWNER, repo, branch, root_path or ".")
     if snapshot is not None and tree_key in snapshot["tf_trees"]:
         return list(snapshot["tf_trees"][tree_key])
+    normalized_root = str(root_path or ".").strip("/") or "."
+    structure_key = (str(GITHUB_OWNER or ""), str(repo or ""), str(branch or ""), "tf_tree", normalized_root)
+    cached_tree = _github_structure_cache_get(
+        structure_key, _github_structure_cache_ttl(normalized_root, kind="tree")
+    )
+    if cached_tree is not None:
+        if snapshot is not None:
+            snapshot["tf_trees"][tree_key] = list(cached_tree)
+        return list(cached_tree)
 
     results = []
 
@@ -2304,6 +2409,7 @@ def github_list_tf_files_recursive(
     walk(root_path or ".")
     if snapshot is not None:
         snapshot["tf_trees"][tree_key] = list(results)
+    _github_structure_cache_put(structure_key, list(results))
     return results
 
 def auth_headers_ok(headers) -> bool:
