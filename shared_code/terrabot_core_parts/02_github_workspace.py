@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import threading
-from time import time
+import time as _time_module
 from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
@@ -1408,7 +1408,7 @@ def _github_structure_cache_ttl(path: str = "", kind: str = "directory") -> int:
 
 
 def _github_structure_cache_get(key: tuple, ttl_seconds: int):
-    now = time.monotonic()
+    now = _time_module.monotonic()
     with _GITHUB_STRUCTURE_CACHE_LOCK:
         entry = _GITHUB_STRUCTURE_CACHE.get(key)
         if not entry:
@@ -1422,7 +1422,7 @@ def _github_structure_cache_get(key: tuple, ttl_seconds: int):
 
 def _github_structure_cache_put(key: tuple, value: Any) -> None:
     with _GITHUB_STRUCTURE_CACHE_LOCK:
-        _GITHUB_STRUCTURE_CACHE[key] = (time.monotonic(), value)
+        _GITHUB_STRUCTURE_CACHE[key] = (_time_module.monotonic(), value)
         overflow = len(_GITHUB_STRUCTURE_CACHE) - _GITHUB_STRUCTURE_CACHE_MAX_ENTRIES
         if overflow > 0:
             oldest = sorted(
