@@ -18,7 +18,7 @@ import json
 import base64
 import hashlib
 import uuid
-import time
+import time as _time_module
 import threading
 import contextvars
 import zlib
@@ -477,7 +477,7 @@ def _load_chunked_teams_state(partition_key: str, state_key: str) -> dict:
         return {}
 
     expires_at = float(metadata.get("expires_at_epoch") or 0)
-    if expires_at and time.time() > expires_at:
+    if expires_at and _time_module.time() > expires_at:
         _delete_chunked_teams_state(partition_key, key)
         return {}
 
@@ -536,7 +536,7 @@ def _save_chunked_teams_state(partition_key: str, state_key: str, payload: dict)
         return False
 
     base_row_key = _teams_state_base_row_key(key)
-    now = time.time()
+    now = _time_module.time()
     replace_mode = update_mode.REPLACE
 
     with _TEAMS_STATE_LOCK:
@@ -1181,7 +1181,7 @@ def _github_app_jwt() -> str:
             "PyJWT is required only when GitHub App authentication is enabled. "
             "Add PyJWT[crypto] to requirements.txt or disable the GitHub App settings."
         )
-    now = int(time.time())
+    now = int(_time_module.time())
     payload = {
         "iat": now - 60,
         "exp": now + (9 * 60),
@@ -1195,14 +1195,14 @@ def _github_app_jwt() -> str:
 
 def get_github_app_installation_token(force_refresh: bool = False) -> str:
     """Return a cached, short-lived installation token for Teams GitHub calls."""
-    now = time.time()
+    now = _time_module.time()
     cached = str(_GITHUB_APP_TOKEN_CACHE.get("token") or "").strip()
     expires_at = float(_GITHUB_APP_TOKEN_CACHE.get("expires_at") or 0)
     if not force_refresh and cached and now < expires_at - 300:
         return cached
 
     with _GITHUB_APP_TOKEN_LOCK:
-        now = time.time()
+        now = _time_module.time()
         cached = str(_GITHUB_APP_TOKEN_CACHE.get("token") or "").strip()
         expires_at = float(_GITHUB_APP_TOKEN_CACHE.get("expires_at") or 0)
         if not force_refresh and cached and now < expires_at - 300:
