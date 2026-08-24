@@ -3050,7 +3050,21 @@ def handle_chat_request(data: dict):
             # Terraform generation is Foundry-owned. The backend has already
             # collected live GitHub evidence; pass that evidence to Foundry and
             # never synthesize, toggle, merge, or materialize Terraform here.
+            _teams_diag_log(
+                "foundry_generation_call_start",
+                thread=conversation_id,
+                cloud=target_cloud,
+                workflow=effective_workflow,
+                input_chars=len(str(agent_input or "")),
+            )
             conversation_id, agent_reply = call_agent(conversation_id, agent_input)
+            _teams_diag_log(
+                "foundry_generation_call_complete",
+                thread=conversation_id,
+                cloud=target_cloud,
+                workflow=effective_workflow,
+                reply_chars=len(str(agent_reply or "")),
+            )
 
             if not agent_reply.strip():
                 raise RuntimeError("No response returned from agent.")
@@ -3223,8 +3237,24 @@ def handle_chat_request(data: dict):
 
             try:
                 try:
+                    _teams_diag_log(
+                        "agent_output_parse_start",
+                        thread=conversation_id,
+                        reply_chars=len(str(agent_reply or "")),
+                    )
                     agent_result = try_parse_agent_output(agent_reply)
+                    _teams_diag_log(
+                        "agent_output_parse_success",
+                        thread=conversation_id,
+                        files=len(agent_result.get("files") or []),
+                    )
                 except Exception as first_parse_error:
+                    _teams_diag_log(
+                        "agent_output_parse_failed_starting_internal_repair",
+                        level="warning",
+                        thread=conversation_id,
+                        error=str(first_parse_error)[:300],
+                    )
                     agent_result, agent_reply = repair_and_parse_agent_output(
                         conversation_id=conversation_id,
                         original_agent_input=agent_input,
@@ -3271,11 +3301,18 @@ def handle_chat_request(data: dict):
                     # exposed to Teams. The backend validates only; it never repairs HCL.
                     validation_error = None
                     repair_feedback = ""
-                    # One generation-validation repair round only: pass 1 validates
-                    # the original candidate and may issue one consolidated repair;
-                    # pass 2 validates that repaired candidate without another model call.
-                    generation_validation_passes = min(
-                        max(1, int(MAX_TEAMS_SELF_CORRECTION_ATTEMPTS or 1)), 2
+                    # Restore the original bounded generation-validation depth.
+                    # Every pass validates the current candidate; failures remain private
+                    # and can trigger another Foundry repair until the configured five
+                    # outer attempts are exhausted.
+                    generation_validation_passes = max(
+                        1, int(MAX_TEAMS_SELF_CORRECTION_ATTEMPTS or 5)
+                    )
+                    _teams_diag_log(
+                        "generation_validation_loop_start",
+                        thread=conversation_id,
+                        outer_attempts=generation_validation_passes,
+                        internal_repair_attempts=3,
                     )
                     for repair_attempt in range(1, generation_validation_passes + 1):
                         try:
@@ -3469,76 +3506,102 @@ def handle_chat_request(data: dict):
                             # replacement repair response has been fully parsed/finalized.
                             # The next loop iteration will therefore re-run the same backend
                             # validation and send the rejection back to Foundry again.
-                            try:
-                                repaired_conversation_id, repaired_reply = _teams_call_agent_for_backend_repair(
-                                    repair_payload
-                                )
-                                repaired_reply = _teams_apply_agent_identity(
-                                    repaired_reply,
-                                    target_cloud,
-                                    effective_workflow,
-                                )
-
-                                # Materialize valid Foundry-selected repair_edits BEFORE looking
-                                # for question fields. Some agent responses include an explanatory
-                                # questions[] field even when they also returned a complete surgical
-                                # repair. Rejecting the response before materialization threw away the
-                                # executable repair and caused the same backend failure to loop.
-                                repaired_reply = _teams_materialize_repair_edits_response(
-                                    repaired_reply, repair_payload
-                                )
-
-                                repair_clarification = _teams_intercept_agent_questions(
-                                    repaired_reply
-                                )
-                                if repair_clarification is not None:
-                                    raise ValueError(
-                                        "Foundry returned a blocking question without an executable "
-                                        "internal backend-validation repair. Internal repair responses "
-                                        "must return corrected files[] or valid repair_edits[]."
+                            repaired_result = None
+                            repaired_reply = ""
+                            repaired_conversation_id = conversation_id
+                            internal_repair_error = None
+                            for internal_attempt in range(1, 4):
+                                working_repair_payload = dict(repair_payload)
+                                if internal_repair_error is not None:
+                                    working_repair_payload["prior_repair_feedback"] = str(internal_repair_error)
+                                    working_repair_payload["repair_response_violation"] = (
+                                        "The immediately previous internal repair response was rejected. "
+                                        "Correct that exact response error and return executable repair_edits[] "
+                                        "or complete files[] now; do not ask the user anything."
                                     )
-                                repaired_result = try_parse_agent_output(repaired_reply)
-                                repaired_result = finalize_agent_result_after_parse(
-                                    repaired_result,
-                                    retrieved_module_context,
-                                    retrieved_value_context,
-                                )
-                                repaired_result["workflow"] = effective_workflow
-                                repaired_result["repo_target"] = normalize_repo_target(
-                                    repaired_result["cloud"],
-                                    repo_target=repaired_result.get("repo_target"),
-                                    workflow=effective_workflow,
-                                )
-                                repaired_result["state_bucket"] = state_bucket_for_target(
-                                    repaired_result["cloud"],
-                                    repaired_result.get("repo_target"),
-                                    effective_workflow,
-                                )
-                                if _teams_repair_candidate_is_identical(agent_result, repaired_result):
-                                    raise ValueError(
-                                        "Foundry repair returned byte-identical file content to the backend-rejected candidate. "
-                                        "The repair must actually change the failed output using existing_live_content."
-                                    )
-                                _teams_validate_repair_candidate_against_payload(
-                                    repaired_result, repair_payload
-                                )
-                            except Exception as repair_response_error:
                                 _teams_diag_log(
-                                    "generation_validation_repair_response_invalid",
-                                    level="warning",
+                                    "generation_validation_internal_repair_start",
                                     thread=conversation_id,
-                                    attempt=f"{repair_attempt}/{generation_validation_passes}",
-                                    error=str(repair_response_error)[:300],
+                                    outer_attempt=f"{repair_attempt}/{generation_validation_passes}",
+                                    internal_attempt=f"{internal_attempt}/3",
                                 )
-                                repair_feedback = str(repair_response_error)
+                                try:
+                                    repaired_conversation_id, repaired_reply = _teams_call_agent_for_backend_repair(
+                                        working_repair_payload
+                                    )
+                                    repaired_reply = _teams_apply_agent_identity(
+                                        repaired_reply,
+                                        target_cloud,
+                                        effective_workflow,
+                                    )
+                                    repaired_reply = _teams_materialize_repair_edits_response(
+                                        repaired_reply, working_repair_payload
+                                    )
+                                    repair_clarification = _teams_intercept_agent_questions(
+                                        repaired_reply
+                                    )
+                                    if repair_clarification is not None:
+                                        raise ValueError(
+                                            "Foundry returned a blocking question without an executable "
+                                            "internal backend-validation repair. Internal repair responses "
+                                            "must return corrected files[] or valid repair_edits[]."
+                                        )
+                                    candidate_result = try_parse_agent_output(repaired_reply)
+                                    candidate_result = finalize_agent_result_after_parse(
+                                        candidate_result,
+                                        retrieved_module_context,
+                                        retrieved_value_context,
+                                    )
+                                    candidate_result["workflow"] = effective_workflow
+                                    candidate_result["repo_target"] = normalize_repo_target(
+                                        candidate_result["cloud"],
+                                        repo_target=candidate_result.get("repo_target"),
+                                        workflow=effective_workflow,
+                                    )
+                                    candidate_result["state_bucket"] = state_bucket_for_target(
+                                        candidate_result["cloud"],
+                                        candidate_result.get("repo_target"),
+                                        effective_workflow,
+                                    )
+                                    if _teams_repair_candidate_is_identical(agent_result, candidate_result):
+                                        raise ValueError(
+                                            "Foundry repair returned byte-identical file content to the "
+                                            "backend-rejected candidate. The repair must actually change "
+                                            "the failed output using existing_live_content."
+                                        )
+                                    _teams_validate_repair_candidate_against_payload(
+                                        candidate_result, working_repair_payload
+                                    )
+                                    repaired_result = candidate_result
+                                    _teams_diag_log(
+                                        "generation_validation_internal_repair_success",
+                                        thread=conversation_id,
+                                        outer_attempt=f"{repair_attempt}/{generation_validation_passes}",
+                                        internal_attempt=f"{internal_attempt}/3",
+                                        files_returned=len(repaired_result.get("files") or []),
+                                    )
+                                    break
+                                except Exception as repair_response_error:
+                                    internal_repair_error = repair_response_error
+                                    repair_feedback = str(repair_response_error)
+                                    _teams_diag_log(
+                                        "generation_validation_internal_repair_failed",
+                                        level="warning",
+                                        thread=conversation_id,
+                                        outer_attempt=f"{repair_attempt}/{generation_validation_passes}",
+                                        internal_attempt=f"{internal_attempt}/3",
+                                        error=str(repair_response_error)[:300],
+                                    )
+
+                            if repaired_result is None:
                                 LOGGER.warning(
-                                    "Foundry generation-validation repair response failed on "
-                                    "attempt %s/%s (thread=%s): %s. Keeping the error private "
-                                    "and continuing the internal repair loop.",
+                                    "Foundry generation-validation repair responses failed on "
+                                    "outer attempt %s/%s (thread=%s) after 3 internal repairs: %s. "
+                                    "Keeping the failure private and continuing the outer loop.",
                                     repair_attempt,
                                     generation_validation_passes,
                                     conversation_id,
-                                    repair_response_error,
+                                    internal_repair_error,
                                 )
                                 continue
 

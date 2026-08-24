@@ -1308,20 +1308,69 @@ def repair_and_parse_agent_output(
         ],
     }
 
-    _conversation_id, repaired_reply = call_agent(
-        conversation_id,
-        json.dumps(repair_payload, indent=2),
+    max_internal_repairs = 3
+    working_payload = dict(repair_payload)
+    last_repair_error: Exception | None = None
+
+    _teams_diag_log(
+        "generation_parse_repair_start",
+        thread=conversation_id,
+        internal_repairs=max_internal_repairs,
+        original_error=str(parse_error)[:300],
     )
-    try:
-        return try_parse_agent_output(repaired_reply), repaired_reply
-    except Exception as repair_error:
-        # No deterministic Terraform fallback is permitted. The backend may
-        # retry Foundry with better live evidence/validation feedback, but it
-        # must never generate a feature flag, module consumer, or HCL file.
-        raise ValueError(
-            "Teams Foundry generation did not return valid Terraform files after repair. "
-            f"Original error: {parse_error}. Repair error: {repair_error}"
+
+    for internal_attempt in range(1, max_internal_repairs + 1):
+        _teams_diag_log(
+            "generation_parse_repair_agent_call_start",
+            thread=conversation_id,
+            attempt=f"{internal_attempt}/{max_internal_repairs}",
         )
+        _conversation_id, repaired_reply = call_agent(
+            conversation_id,
+            json.dumps(working_payload, indent=2),
+        )
+        _teams_diag_log(
+            "generation_parse_repair_agent_call_complete",
+            thread=conversation_id,
+            attempt=f"{internal_attempt}/{max_internal_repairs}",
+            reply_chars=len(str(repaired_reply or "")),
+        )
+        try:
+            parsed = try_parse_agent_output(repaired_reply)
+            _teams_diag_log(
+                "generation_parse_repair_success",
+                thread=conversation_id,
+                attempt=f"{internal_attempt}/{max_internal_repairs}",
+                files=len(parsed.get("files") or []),
+            )
+            return parsed, repaired_reply
+        except Exception as repair_error:
+            last_repair_error = repair_error
+            _teams_diag_log(
+                "generation_parse_repair_failed",
+                level="warning",
+                thread=conversation_id,
+                attempt=f"{internal_attempt}/{max_internal_repairs}",
+                error=str(repair_error)[:300],
+            )
+            if internal_attempt >= max_internal_repairs:
+                break
+            working_payload = dict(working_payload)
+            working_payload["prior_repair_feedback"] = str(repair_error)
+            working_payload["repair_attempt"] = internal_attempt + 1
+            working_payload["repair_response_violation"] = (
+                "The previous internal repair response was still not valid executable "
+                "Terraform JSON. Correct that response now. Return one strict JSON object "
+                "with non-empty complete files[] and no blocking questions."
+            )
+
+    # No deterministic Terraform fallback is permitted. Exhaust all three
+    # private Foundry repair opportunities before this error can reach Teams.
+    raise ValueError(
+        "Teams Foundry generation did not return valid Terraform files after "
+        f"{max_internal_repairs} internal repair attempts. "
+        f"Original error: {parse_error}. Last repair error: {last_repair_error}"
+    )
 
 
 def _commit_terraform_files_to_branch_for_teams_v1(

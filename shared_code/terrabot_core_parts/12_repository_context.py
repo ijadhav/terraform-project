@@ -2,6 +2,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING ,Optional
 import contextvars
 import importlib
+import time as _time_module
 from concurrent.futures import as_completed
 
 _TERRABOT_IO_EXECUTOR = importlib.import_module(
@@ -27,6 +28,7 @@ if TYPE_CHECKING:
         _prompt_guard_validate_terraform_shape,
         _teams_exact_aws_environment_path,
         _teams_feature_flag_intent,
+        _teams_diag_log,
         _teams_remote_context_branch,
         _teams_requested_aws_environment_paths,
         call_named_agent,
@@ -655,51 +657,108 @@ def _extract_and_store_repository_context_after_commit(
     }
 
 
-def _run_parallel_precommit_validations(agent_result: dict, prompt: str) -> None:
+def _run_parallel_precommit_validations(agent_result: dict, prompt: str, thread_id: str = "") -> None:
     """Run independent pre-write validators concurrently and aggregate errors.
 
-    Each validator receives a copy of the current ContextVar state so Teams
-    request-local repository evidence remains visible inside executor workers.
-    No validator mutates Terraform or writes to GitHub.
+    Every outer repair attempt calls this function again. Each validator receives
+    a copied ContextVar state so request-local repository evidence is preserved.
+    Diagnostics expose submission, completion, duration and aggregate outcome.
     """
     validators = (
         ("semantic_relevance", _prompt_guard_validate_semantic_relevance, (agent_result, prompt)),
         ("terraform_shape", _prompt_guard_validate_terraform_shape, (agent_result,)),
         ("agent_self_validation", _prompt_guard_agent_self_validate, (agent_result, prompt)),
     )
+    batch_started = _time_module.monotonic()
+    _teams_diag_log(
+        "concurrent_validation_batch_start",
+        thread=thread_id,
+        validators=len(validators),
+        files=len(agent_result.get("files") or []),
+    )
+
     futures = {}
+    submitted_at = {}
     for name, validator, args in validators:
         ctx = contextvars.copy_context()
+        submitted_at[name] = _time_module.monotonic()
         future = _TERRABOT_IO_EXECUTOR.submit(ctx.run, validator, *args)
         futures[future] = name
+        _teams_diag_log(
+            "concurrent_validator_submitted",
+            thread=thread_id,
+            validator=name,
+        )
 
     failures: list[tuple[str, str]] = []
     for future in as_completed(futures):
         name = futures[future]
+        elapsed_ms = int((_time_module.monotonic() - submitted_at[name]) * 1000)
         try:
             future.result()
+            _teams_diag_log(
+                "concurrent_validator_passed",
+                thread=thread_id,
+            validator=name,
+                duration_ms=elapsed_ms,
+            )
         except Exception as exc:
             failures.append((name, str(exc)))
+            _teams_diag_log(
+                "concurrent_validator_failed",
+                level="warning",
+                thread=thread_id,
+                validator=name,
+                duration_ms=elapsed_ms,
+                error=str(exc)[:300],
+            )
+
+    batch_ms = int((_time_module.monotonic() - batch_started) * 1000)
+    _teams_diag_log(
+        "concurrent_validation_batch_complete",
+        thread=thread_id,
+        validators=len(validators),
+        failures=len(failures),
+        duration_ms=batch_ms,
+    )
 
     if failures:
         failures.sort(key=lambda item: item[0])
         details = " | ".join(f"{name}: {message}" for name, message in failures)
-        raise ValueError(
-            "BACKEND_VALIDATION_FAILED_MULTIPLE: " + details
-        )
+        raise ValueError("BACKEND_VALIDATION_FAILED_MULTIPLE: " + details)
 
 
 def commit_terraform_files_to_branch_for_teams(agent_result: dict, prompt: str, thread_id: str) -> dict:
     """Validate and transport Foundry output without rewriting Terraform."""
-    _run_parallel_precommit_validations(agent_result, prompt)
+    _teams_diag_log(
+        "precommit_pipeline_start",
+        thread=thread_id,
+        files=len(agent_result.get("files") or []),
+    )
+    _run_parallel_precommit_validations(agent_result, prompt, thread_id)
+    _teams_diag_log("precommit_concurrent_validation_passed", thread=thread_id)
     # Use the branch writer that consumes agent_result files directly. The
     # backend must not run surgical materializers, flag togglers, object
     # synthesizers, tfvars mergers, brace repair, or repository-code generators.
+    _teams_diag_log("github_branch_write_start", thread=thread_id)
     branch_result = _commit_terraform_files_to_branch_for_teams_base(agent_result, prompt, thread_id)
+    _teams_diag_log(
+        "github_branch_write_complete",
+        thread=thread_id,
+        branch=branch_result.get("branch"),
+        files=len(branch_result.get("files") or []),
+    )
     # Persist only durable repository conclusions after the task has passed the
     # backend validators and the final files are actually on the GitHub branch.
+    _teams_diag_log("repository_context_postcommit_start", thread=thread_id)
     context_result = _extract_and_store_repository_context_after_commit(
         agent_result, prompt, branch_result, thread_id
+    )
+    _teams_diag_log(
+        "repository_context_postcommit_complete",
+        thread=thread_id,
+        stored=int(context_result.get("stored") or 0),
+        rejected=int(context_result.get("rejected") or 0),
     )
     branch_result["repository_context_update"] = {
         "stored": int(context_result.get("stored") or 0),

@@ -3043,7 +3043,3 @@ def is_infra_request(prompt: str, thread_id: Optional[str] = None) -> bool:
     """
     del prompt, thread_id
     return False
-
-
-
-

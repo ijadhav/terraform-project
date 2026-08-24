@@ -29,6 +29,7 @@ _CORE_PARTS = (
     "12_repository_context.py",
     "13_validation_and_live_file_repair.py",
     "14_environment_resolution_overrides.py",
+    "15_extended_repository_scope.py",
 )
 
 
