@@ -2910,14 +2910,42 @@ def _prompt_guard_agent_self_validate_stage1(agent_result: dict, prompt: str) ->
             "content": content if len(content) <= max_chars else content[: max_chars // 2] + "\n...<middle omitted>...\n" + content[-max_chars // 2 :],
         })
 
+    # If repository targeting already resolved one literal Boolean control,
+    # self-validation must validate that resolved target rather than re-run
+    # semantic discovery over a large file containing unrelated flags.
+    resolved_feature_flag = {}
+    for context_item in active.get("retrieved_value_context") or []:
+        if not isinstance(context_item, dict):
+            continue
+        for matched in context_item.get("matched_files") or []:
+            if not isinstance(matched, dict):
+                continue
+            feature_match = matched.get("feature_flag_match") or {}
+            if not isinstance(feature_match, dict) or not feature_match.get("flag"):
+                continue
+            resolved_feature_flag = {
+                "path": str(matched.get("path") or matched.get("filename") or "").strip(),
+                "flag": str(feature_match.get("flag") or "").strip(),
+                "line_number": int(feature_match.get("line_number") or feature_match.get("line") or 0),
+                "current_value": str(feature_match.get("current_value") or "").strip().lower(),
+                "new_value": str(feature_match.get("new_value") or "").strip().lower(),
+                "description": str(feature_match.get("description") or feature_match.get("context") or "").strip(),
+            }
+            break
+        if resolved_feature_flag:
+            break
+
     validation_request = {
         "task": "VALIDATE GENERATED TERRAFORM AGAINST CURRENT USER REQUEST. Return JSON verdict only.",
         "user_request": prompt,
         "expected_cloud": agent_result.get("cloud") or active.get("expected_cloud") or "",
         "expected_workflow": agent_result.get("workflow") or active.get("expected_workflow") or "",
         "generated_files": compact_files,
+        "resolved_repository_target": resolved_feature_flag,
         "required_verdict": {"valid": True, "errors": [], "reason": "short explanation"},
         "rules": [
+            "When resolved_repository_target is non-empty, the repository target has ALREADY been semantically selected and literally verified against live repository evidence. Do not rediscover or challenge that target because other flags/resources also exist in the full file.",
+            "For a resolved_repository_target, validate only that the generated file implements the stated current_value -> new_value transition for that exact path/flag and does not introduce unrelated changes.",
             "The generated files must implement the current user_request, not a previous or neighboring resource request.",
             "Reject output when the requested resource family/name is absent or a different resource family is generated.",
             "Reject stale paths/module sources that belong to a different request unless live repository wiring makes them strictly necessary.",

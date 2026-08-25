@@ -2279,7 +2279,7 @@ def _repository_context_prefetch_worker(active: dict) -> dict:
     owner, repo = _repository_context_repo_identity(
         resolved_cloud,
         str(active.get("repo_target") or ""),
-        "",
+        str(active.get("workflow") or ""),
         str(active.get("repo_name") or ""),
     )
     if not owner or not repo:
@@ -2295,12 +2295,74 @@ def _repository_context_prefetch_worker(active: dict) -> dict:
     return {"owner": owner, "repo": repo, "branch": branch, "sha": current_sha, "search_result": search_result}
 
 
-def _start_repository_context_prefetch(active: dict) -> None:
-    """Overlap repository-context retrieval with repository discovery."""
-    if not active or active.get("repository_context_future") is not None:
+def _repository_context_route_key(active: dict) -> tuple[str, str, str, str]:
+    """Return the exact repository-context route bound to the current infra turn."""
+    return (
+        str(active.get("cloud") or "").strip().lower(),
+        str(active.get("repo_target") or "").strip().lower(),
+        str(active.get("workflow") or "").strip().lower(),
+        str(active.get("repo_name") or "").strip(),
+    )
+
+
+def _start_repository_context_prefetch(active: dict, force: bool = False) -> None:
+    """Overlap repository-context retrieval with repository discovery.
+
+    Prefetch is route-sensitive. A Teams turn can begin before cloud/repository
+    routing is final, so an early future must never be reused after the request
+    is later bound to another cloud/repository/workflow.
+    """
+    if not active:
         return
+    route_key = _repository_context_route_key(active)
+    existing_key = tuple(active.get("repository_context_prefetch_route") or ())
+    future = active.get("repository_context_future")
+    if future is not None and not force and existing_key == route_key:
+        return
+    if future is not None and existing_key != route_key:
+        try:
+            future.cancel()
+        except Exception:
+            pass
+    active["repository_context_prefetch_route"] = route_key
     active["repository_context_future"] = _TERRABOT_IO_EXECUTOR.submit(
         _repository_context_prefetch_worker, dict(active)
+    )
+    LOGGER.info(
+        "[TerrabotDiag] event=repository_context_prefetch_bound cloud=%s repo_target=%s workflow=%s repo_name=%s",
+        *route_key,
+    )
+
+
+def _teams_bind_repository_context_route(
+    cloud: str,
+    repo_target: str,
+    workflow: str,
+    effective_prompt: str = "",
+    repo_name: str = "",
+) -> None:
+    """Bind the final infra route before any semantic/context decision call.
+
+    This closes the gap where repository context was prefetched while the Teams
+    request still carried an empty or previous-turn repository identity.
+    """
+    active = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
+    if not active.get("active"):
+        return
+    previous_key = _repository_context_route_key(active)
+    active["cloud"] = str(cloud or active.get("cloud") or "").strip().lower()
+    active["repo_target"] = str(repo_target or active.get("repo_target") or "").strip().lower()
+    active["workflow"] = str(workflow or active.get("workflow") or "").strip()
+    if effective_prompt:
+        active["effective_prompt"] = str(effective_prompt).strip()
+    if repo_name:
+        active["repo_name"] = str(repo_name).strip()
+    new_key = _repository_context_route_key(active)
+    if new_key != previous_key or active.get("repository_context_future") is None:
+        _start_repository_context_prefetch(active, force=True)
+    LOGGER.info(
+        "[TerrabotDiag] event=repository_context_route_bound cloud=%s repo_target=%s workflow=%s repo_name=%s",
+        *new_key,
     )
 
 def _teams_repository_context_live_files(
@@ -2454,6 +2516,21 @@ def _teams_attach_repository_context(agent_input: str, active: dict) -> str:
         context_block = ""
         search_result = {"results": []}
 
+    payload["shared_repository_context_metadata"] = {
+        "repository": f"{owner}/{repo}",
+        "branch": branch,
+        "current_commit_sha": current_sha,
+        "result_count": len(search_result.get("results") or []),
+        "stale_count": int(search_result.get("stale_count") or 0),
+        "conflicted_count": int(search_result.get("conflicted_count") or 0),
+    }
+    LOGGER.info(
+        "[TerrabotDiag] event=repository_context_pre_generation_ready repo=%s/%s branch=%s results=%s stale=%s conflicted=%s",
+        owner, repo, branch,
+        payload["shared_repository_context_metadata"]["result_count"],
+        payload["shared_repository_context_metadata"]["stale_count"],
+        payload["shared_repository_context_metadata"]["conflicted_count"],
+    )
     if context_block:
         payload["shared_repository_context"] = context_block
         payload["shared_repository_context_metadata"] = {

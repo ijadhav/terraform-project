@@ -79,6 +79,7 @@ if TYPE_CHECKING:
         _teams_locate_environment_value_files,
         _teams_materialize_repair_edits_response,
         _teams_path_question_corrective,
+        _teams_bind_repository_context_route,
         _teams_remote_context_branch,
         _teams_repair_candidate_is_identical,
         _teams_requested_resource_name,
@@ -1858,6 +1859,27 @@ def handle_chat_request(data: dict):
             target_cloud,
             requested_workflow=requested_workflow,
         ) or router_decision.workflow
+
+        # Bind the FINAL cloud/repository/workflow before repository-context
+        # search or semantic target resolution. Early Teams state can still
+        # contain an empty/previous repository identity, which previously let
+        # a valid stored mapping miss the pre-generation Foundry decision.
+        if request_source == "teams" and target_cloud and effective_workflow:
+            try:
+                resolved_repo_target = normalize_repo_target(
+                    target_cloud, workflow=effective_workflow
+                )
+                _teams_bind_repository_context_route(
+                    target_cloud,
+                    resolved_repo_target,
+                    effective_workflow,
+                    effective_prompt=effective_prompt,
+                )
+            except Exception as route_context_error:
+                LOGGER.warning(
+                    "[TerrabotDiag] event=repository_context_route_bind_failed cloud=%s workflow=%s error=%s",
+                    target_cloud, effective_workflow, route_context_error,
+                )
 
         if router_decision.request_type == "infra":
             if not conversation_id:
