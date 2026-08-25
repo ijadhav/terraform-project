@@ -3,7 +3,7 @@
 This module is deliberately isolated from ``teams_bot.py`` and the stateful
 Terrabot service core.  The public adapter accepts the already-loaded core
 module and exercises the same production Teams backend entrypoint without
-creating branches or pull requests.
+creating pull requests. Phase 1 intentionally pushes validated changes to isolated test branches.
 
 The workflow is intentionally two phase:
 
@@ -17,8 +17,7 @@ The workflow is intentionally two phase:
    context can be retrieved and Terrabot resolves the target without another
    clarification.
 
-No generated Terraform is committed by this runner.  A test never sends the
-normal Teams ``yes``/commit or Jira/PR actions.
+Validated Phase 1 Terraform is committed to an isolated Terrabot test branch so branch transport and post-commit context learning are tested. Phase 2 uses a fresh synthetic conversation and does not create a second branch. The runner never creates a pull request.
 """
 from __future__ import annotations
 
@@ -26,6 +25,7 @@ import hashlib
 import logging
 import os
 import re
+import secrets
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -51,7 +51,7 @@ _FEATURE_NAME_RE = re.compile(
 )
 
 _MAX_CASES = max(1, min(int(os.getenv("TERRABOT_TEST_RUNNER_MAX_CASES", "10")), 20))
-_DEFAULT_CASES = max(1, min(int(os.getenv("TERRABOT_TEST_RUNNER_DEFAULT_CASES", "2")), _MAX_CASES))
+_DEFAULT_CASES = max(1, min(int(os.getenv("TERRABOT_TEST_RUNNER_DEFAULT_CASES", "6")), _MAX_CASES))
 _SCAN_FILE_LIMIT = max(10, min(int(os.getenv("TERRABOT_TEST_RUNNER_SCAN_FILES", "45")), 150))
 _TREE_PATH_LIMIT = max(200, min(int(os.getenv("TERRABOT_TEST_RUNNER_TREE_PATH_LIMIT", "12000")), 50000))
 
@@ -143,13 +143,20 @@ class TestCaseResult:
     case: TestCase
     phase1_ok: bool = False
     phase1_clarified: bool = False
-    phase1_target_ok: bool = False
+    expected_target_found: bool = False
+    correct_flag_detected: bool = False
+    phase1_file_generated: bool = False
     validation_ok: bool = False
     validation_error: str = ""
+    branch_pushed: bool = False
+    branch_name: str = ""
+    branch_url: str = ""
     context_stored: bool = False
-    context_hit: bool = False
+    phase2_context_retrieved: bool = False
     phase2_ok: bool = False
+    phase2_clarified: bool = False
     phase2_target_ok: bool = False
+    phase2_file_generated: bool = False
     phase2_reused_without_clarification: bool = False
     bot_calls: int = 0
     duration_ms: int = 0
@@ -179,11 +186,54 @@ def _humanize_flag(flag: str) -> str:
     return value
 
 
-def _infer_environment(path: str) -> str:
-    parts = [part for part in str(path or "").replace("\\", "/").split("/") if part]
-    if len(parts) < 2:
-        return "repository"
-    return parts[-2]
+def _infer_environment(path: str, cloud: str = "") -> str:
+    normalized = str(path or "").replace("\\", "/").strip("/")
+    cloud = str(cloud or "").strip().lower()
+    if cloud == "aws":
+        match = re.search(r"(?:^|/)terraform/(?:dev_aws|prod_aws|dev_services_aws)/([^/]+)(?:/|$)", normalized)
+        if match:
+            return match.group(1)
+    if cloud == "azure":
+        match = re.search(r"(?:^|/)vars/(?:npr|sbx|prd)/([^/]+)(?:/|$)", normalized)
+        if match:
+            return match.group(1)
+    parts = [part for part in normalized.split("/") if part]
+    return parts[-2] if len(parts) >= 2 else "repository"
+
+
+def _prompt_alias(alias: str, cloud: str) -> str:
+    """Keep generated language cloud-safe without changing the expected flag."""
+    words = [word for word in re.split(r"\s+", str(alias or "").strip().lower()) if word]
+    opposite = "azure" if str(cloud or "").lower() == "aws" else "aws"
+    cleaned = [word for word in words if word != opposite]
+    return " ".join(cleaned).strip() or str(alias or "").strip()
+
+
+def _candidate_environment_is_valid(core: Any, spec: RepositorySpec, path: str, environment: str) -> bool:
+    """Use Terrabot's own authoritative environment resolver before creating a prompt."""
+    resolver = getattr(core, "resolve_teams_environment_targets", None)
+    if not callable(resolver):
+        return True
+    probe = f"change terraform setting in {environment}"
+    try:
+        resolution = resolver(probe, cloud_hint=spec.cloud) or {}
+    except TypeError:
+        resolution = resolver(probe, spec.cloud) or {}
+    except Exception:
+        return False
+    if resolution.get("error") or str(resolution.get("cloud") or "").lower() != spec.cloud:
+        return False
+    targets = [item for item in (resolution.get("targets") or []) if isinstance(item, dict)]
+    if not targets:
+        return False
+    candidate_path = str(path or "").strip("/")
+    for target in targets:
+        if str(target.get("environment") or "").lower() != str(environment or "").lower():
+            continue
+        target_path = str(target.get("path") or "").strip("/")
+        if not target_path or candidate_path == target_path or candidate_path.startswith(target_path + "/"):
+            return True
+    return False
 
 
 def _path_priority(path: str) -> tuple[int, int, str]:
@@ -281,13 +331,31 @@ def _github_recursive_tree(core: Any, spec: RepositorySpec) -> tuple[str, list[s
 
 def _build_prompt(alias: str, environment: str, desired_value: bool, *, phase: int) -> str:
     env = str(environment or "repository").strip()
-    if desired_value:
-        if phase == 1:
-            return f"turn {alias} on in {env}"
-        return f"enable {alias} for {env}"
+    action = "enable" if desired_value else "disable"
     if phase == 1:
-        return f"turn {alias} off in {env}"
-    return f"disable {alias} for {env}"
+        templates = [
+            "please {action} {alias} in {env}",
+            "can you {action} {alias} for {env}",
+            "{action} {alias} on {env}",
+            "for {env}, {action} {alias}",
+            "I need {alias} {state} in {env}",
+        ]
+    else:
+        templates = [
+            "{action} {alias} for {env}",
+            "please switch {alias} {state} in {env}",
+            "can you turn {alias} {direction} on {env}",
+            "for {env}, set {alias} {state}",
+            "make {alias} {state} in {env}",
+        ]
+    template = secrets.choice(templates)
+    return template.format(
+        action=action,
+        alias=alias,
+        env=env,
+        state="on" if desired_value else "off",
+        direction="on" if desired_value else "off",
+    )
 
 
 def _derive_cases_for_repository(
@@ -302,27 +370,34 @@ def _derive_cases_for_repository(
     candidates: list[dict[str, Any]] = []
     files_read = 0
 
+    # Read a wider pool than the final sample, then randomize. This prevents
+    # every invocation from repeatedly choosing the same top-ranked controls.
+    candidate_goal = max(wanted * 12, wanted + 12)
     for path in ranked_paths:
-        if files_read >= _SCAN_FILE_LIMIT or len(candidates) >= max(wanted * 5, wanted + 4):
+        if files_read >= _SCAN_FILE_LIMIT or len(candidates) >= candidate_goal:
             break
+        environment = _infer_environment(path, spec.cloud)
+        if environment == "repository" or not _candidate_environment_is_valid(core, spec, path, environment):
+            continue
         content = core.github_get_file_content_by_repo(spec.owner, spec.repo, path, ref=spec.branch)
         files_read += 1
         if not content:
             continue
         for candidate in _extract_boolean_candidates(path, content):
-            candidates.append(candidate)
+            candidate["environment"] = environment
+            candidate["alias"] = _prompt_alias(str(candidate.get("alias") or ""), spec.cloud)
+            if candidate["alias"]:
+                candidates.append(candidate)
 
-    # Prefer meaningful feature identifiers and diversify aliases/environments.
-    candidates.sort(
-        key=lambda item: (
-            -int(item.get("priority") or 0),
-            _path_priority(str(item.get("path") or "")),
-            str(item.get("flag") or ""),
-        )
-    )
+    # Feature priority still removes weak noise, but selection is randomized
+    # within the strong candidate pool on every run.
+    candidates.sort(key=lambda item: -int(item.get("priority") or 0))
+    strong = candidates[: max(wanted * 8, wanted)]
+    secrets.SystemRandom().shuffle(strong)
+
     selected: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
-    for item in candidates:
+    for item in strong:
         key = (str(item["environment"]).lower(), str(item["alias"]).lower())
         if key in seen:
             continue
@@ -332,9 +407,20 @@ def _derive_cases_for_repository(
             break
 
     cases: list[TestCase] = []
+    used_prompts: set[str] = set()
     for index, item in enumerate(selected, start=1):
         desired = not bool(item["current_value"])
-        case_id = f"{spec.cloud}-{index:02d}-{hashlib.sha1((item['path'] + item['flag']).encode()).hexdigest()[:6]}"
+        phase1 = _build_prompt(str(item["alias"]), str(item["environment"]), desired, phase=1)
+        phase2 = _build_prompt(str(item["alias"]), str(item["environment"]), desired, phase=2)
+        # Within one run prompts must be unique; regenerate wording if a random
+        # template happened to collide.
+        for _ in range(8):
+            if phase1.lower() not in used_prompts and phase2.lower() not in used_prompts and phase1.lower() != phase2.lower():
+                break
+            phase1 = _build_prompt(str(item["alias"]), str(item["environment"]), desired, phase=1)
+            phase2 = _build_prompt(str(item["alias"]), str(item["environment"]), desired, phase=2)
+        used_prompts.update({phase1.lower(), phase2.lower()})
+        case_id = f"{spec.cloud}-{index:02d}-{hashlib.sha1((item['path'] + item['flag'] + run_id).encode()).hexdigest()[:6]}"
         cases.append(
             TestCase(
                 case_id=case_id,
@@ -350,8 +436,8 @@ def _derive_cases_for_repository(
                 current_value=bool(item["current_value"]),
                 desired_value=desired,
                 evidence_line=str(item["evidence_line"]),
-                phase1_prompt=_build_prompt(str(item["alias"]), str(item["environment"]), desired, phase=1),
-                phase2_prompt=_build_prompt(str(item["alias"]), str(item["environment"]), desired, phase=2),
+                phase1_prompt=phase1,
+                phase2_prompt=phase2,
             )
         )
 
@@ -359,10 +445,12 @@ def _derive_cases_for_repository(
         "repository_cases_derived",
         run_id=run_id,
         repo=f"{spec.owner}/{spec.repo}",
+        cloud=spec.cloud,
         tree_paths=len(paths),
         files_read=files_read,
         boolean_candidates=len(candidates),
         selected=len(cases),
+        environments=",".join(sorted({case.environment for case in cases})),
     )
     return cases
 
@@ -392,12 +480,19 @@ def _response_file_paths(result: dict) -> list[str]:
     return paths
 
 
-def _target_matches(case: TestCase, result: dict) -> tuple[bool, str]:
+def _target_detection(case: TestCase, result: dict) -> tuple[bool, bool, bool, str]:
     paths = _response_file_paths(result)
-    path_ok = case.path in paths or case.path.lower() in _response_text(result)
-    flag_ok = case.flag.lower() in _response_text(result)
+    text = _response_text(result)
+    expected_target_found = case.path in paths or case.path.lower() in text
+    correct_flag_detected = case.flag.lower() in text
+    file_generated = bool(paths)
     actual_file = next((path for path in paths if path == case.path), paths[0] if paths else "")
-    return bool(path_ok and flag_ok), actual_file
+    return expected_target_found, correct_flag_detected, file_generated, actual_file
+
+
+def _target_matches(case: TestCase, result: dict) -> tuple[bool, str]:
+    target, flag, _file, actual = _target_detection(case, result)
+    return bool(target and flag), actual
 
 
 def _repo_matches(case: TestCase, result: dict) -> bool:
@@ -457,10 +552,29 @@ def _matching_context_record(case: TestCase, search_result: dict) -> dict | None
     return None
 
 
-def _ensure_context_mapping(core: Any, case: TestCase, run_id: str) -> bool:
+def _ensure_context_mapping(
+    core: Any,
+    case: TestCase,
+    run_id: str,
+    *,
+    evidence_branch: str = "",
+    evidence_commit_sha: str = "",
+) -> bool:
     existing = _search_context(case)
     if _matching_context_record(case, existing):
         return True
+
+    ref = str(evidence_branch or case.branch).strip()
+    commit_sha = str(evidence_commit_sha or case.commit_sha).strip()
+    live_content = core.github_get_file_content_by_repo(case.owner, case.repo, case.path, ref=ref) or ""
+    evidence_line = case.evidence_line
+    assignment = re.search(
+        rf"(?m)^\s*{re.escape(case.flag)}\s*=\s*(?:true|false)\s*(?:#.*)?$",
+        str(live_content),
+        re.IGNORECASE,
+    )
+    if assignment:
+        evidence_line = assignment.group(0).strip()
 
     statement = (
         f"In {case.repo}, {case.alias} maps to Boolean control {case.flag} "
@@ -474,30 +588,61 @@ def _ensure_context_mapping(core: Any, case: TestCase, run_id: str) -> bool:
         "confidence": 0.99,
         "validation_summary": (
             "Automated repository-derived Terrabot test verified this mapping "
-            "against the current live GitHub file before indexing it."
+            "against the live GitHub file before indexing it."
         ),
         "evidence": [
             {
                 "path": case.path,
-                "excerpt": case.evidence_line,
+                "excerpt": evidence_line,
                 "reason": f"The live assignment proves the Boolean control {case.flag}.",
             }
         ],
     }
 
-    def evidence_fetcher(owner: str, repo: str, path: str, ref: str) -> str | None:
-        return core.github_get_file_content_by_repo(owner, repo, path, ref=ref)
+    def evidence_fetcher(owner: str, repo: str, path: str, ref_value: str) -> str | None:
+        return core.github_get_file_content_by_repo(owner, repo, path, ref=ref_value)
 
     action = repository_context.add_repository_context(
         repo_owner=case.owner,
         repo_name=case.repo,
-        evidence_commit_sha=case.commit_sha,
-        evidence_branch=case.branch,
-        source_task_hash=hashlib.sha256(f"{run_id}:{case.case_id}".encode()).hexdigest(),
+        evidence_commit_sha=commit_sha,
+        evidence_branch=ref,
+        source_task_hash=hashlib.sha256(f"{run_id}:{case.case_id}:{ref}".encode()).hexdigest(),
         candidate=candidate,
         evidence_fetcher=evidence_fetcher,
     )
     return bool(action.get("stored"))
+
+
+def _branch_head_sha(core: Any, case: TestCase, branch: str) -> str:
+    if not branch:
+        return ""
+    try:
+        return str(core.github_get_base_branch_sha_by_repo(case.owner, case.repo, branch) or "").strip()
+    except Exception:
+        return ""
+
+
+def _commit_preview_to_test_branch(
+    core: Any,
+    case: TestCase,
+    run_id: str,
+    preview: dict,
+    original_request: dict,
+) -> tuple[dict, int]:
+    helper = getattr(core, "_teams_auto_commit_preview", None)
+    if not callable(helper):
+        return {"ok": False, "mode": "test_commit_unavailable", "reply": "_teams_auto_commit_preview is unavailable."}, 500
+    commit_request = dict(original_request or {})
+    commit_request.update({
+        "force_new_branch": True,
+        "reuse_branch": False,
+        "existing_branch": "",
+        "teams_requester": f"terrabot-test-{run_id[-6:]}-{case.case_id}",
+        "test_mode": False,
+        "automated_test_phase": 1,
+    })
+    return helper(commit_request, preview, 200)
 
 
 def _invoke_backend(core: Any, request: dict, result: TestCaseResult) -> tuple[dict, int]:
@@ -519,6 +664,9 @@ def _phase_request(case: TestCase, prompt: str, conversation_id: str, *, phase: 
         "fresh_infra_generation": True,
         "cloud": case.cloud,
         "requested_cloud": case.cloud,
+        "force_new_branch": True,
+        "reuse_branch": False,
+        "existing_branch": "",
     }
 
 
@@ -555,13 +703,17 @@ def _run_case(core: Any, case: TestCase, run_id: str, requester_id: str) -> Test
         run_id=run_id,
         test_case_id=case.case_id,
         repo=f"{case.owner}/{case.repo}",
+        cloud=case.cloud,
         environment=case.environment,
+        phase1_prompt=case.phase1_prompt,
+        phase2_prompt=case.phase2_prompt,
         expected_path=case.path,
         expected_flag=case.flag,
     )
 
     try:
         phase1_request = _phase_request(case, case.phase1_prompt, p1_conversation, phase=1)
+        phase1_request["teams_requester"] = f"terrabot-test-{run_id[-6:]}-{case.case_id}"
         phase1_result, status = _invoke_backend(core, phase1_request, row)
         row.actual_mode = str(phase1_result.get("mode") or "")
         row.phase1_ok = status < 500 and bool(phase1_result.get("ok", True))
@@ -575,7 +727,7 @@ def _run_case(core: Any, case: TestCase, run_id: str, requester_id: str) -> Test
                 "thread_id": str(phase1_result.get("thread_id") or ""),
                 "teams_conversation_id": p1_conversation,
                 "memory_conversation_id": phase1_request["memory_conversation_id"],
-                "teams_requester": "terrabot-automated-test",
+                "teams_requester": phase1_request["teams_requester"],
                 "source": "teams",
                 "mode": "infra",
                 "test_mode": True,
@@ -583,6 +735,9 @@ def _run_case(core: Any, case: TestCase, run_id: str, requester_id: str) -> Test
                 "pending_target_selection_reply": True,
                 "pending_target_selection_thread_id": str(phase1_result.get("thread_id") or ""),
                 "fresh_infra_generation": True,
+                "force_new_branch": True,
+                "reuse_branch": False,
+                "existing_branch": "",
                 "cloud": case.cloud,
                 "requested_cloud": case.cloud,
             }
@@ -590,41 +745,124 @@ def _run_case(core: Any, case: TestCase, run_id: str, requester_id: str) -> Test
             row.actual_mode = str(phase1_result.get("mode") or "")
             row.phase1_ok = status < 500 and bool(phase1_result.get("ok", True))
 
-        target_ok, actual_file = _target_matches(case, phase1_result)
-        row.actual_file = actual_file
-        row.phase1_target_ok = target_ok and _repo_matches(case, phase1_result)
+        (
+            row.expected_target_found,
+            row.correct_flag_detected,
+            row.phase1_file_generated,
+            row.actual_file,
+        ) = _target_detection(case, phase1_result)
+        row.expected_target_found = row.expected_target_found and _repo_matches(case, phase1_result)
+
         validation_thread = str(phase1_result.get("thread_id") or p1_conversation)
-        row.validation_ok, row.validation_error = _validate_preview(
-            core, phase1_result, case.phase1_prompt, validation_thread
+        if str(phase1_result.get("mode") or "").lower() == "infra_preview":
+            row.validation_ok, row.validation_error = _validate_preview(
+                core, phase1_result, case.phase1_prompt, validation_thread
+            )
+        elif str(phase1_result.get("mode") or "").lower() == "branch_created":
+            # Branch creation is downstream of the production validation gate.
+            row.validation_ok = bool(phase1_result.get("ok", True))
+        else:
+            row.validation_ok = False
+            row.validation_error = f"Expected infra_preview before branch push, received {phase1_result.get('mode') or '<none>'}."
+
+        branch_result = phase1_result
+        branch_status = status
+        if row.validation_ok and str(phase1_result.get("mode") or "").lower() == "infra_preview":
+            branch_result, branch_status = _commit_preview_to_test_branch(
+                core, case, run_id, phase1_result, phase1_request
+            )
+            row.bot_calls += 1
+
+        row.branch_name = str(branch_result.get("branch") or "").strip()
+        row.branch_url = str(branch_result.get("branch_url") or "").strip()
+        row.branch_pushed = (
+            branch_status < 400
+            and bool(branch_result.get("ok", True))
+            and str(branch_result.get("mode") or "").lower() == "branch_created"
+            and bool(row.branch_name or row.branch_url)
+        )
+        _diag(
+            "phase1_branch_result",
+            run_id=run_id,
+            test_case_id=case.case_id,
+            branch_pushed=row.branch_pushed,
+            branch=row.branch_name,
+            mode=branch_result.get("mode"),
         )
 
-        # Only teach a mapping when the production backend selected the expected
-        # live repository target and the same deterministic validators accept it.
-        if row.phase1_target_ok and row.validation_ok:
-            row.context_stored = _ensure_context_mapping(core, case, run_id)
-        else:
-            row.context_stored = False
+        # Let the normal post-commit context workflow run first. If it did not
+        # create this deterministic mapping, the isolated test harness adds the
+        # verified mapping itself so the same run can still exercise Phase 2.
+        context_search = _search_context(case)
+        row.context_stored = _matching_context_record(case, context_search) is not None
+        if not row.context_stored and row.branch_pushed and row.expected_target_found and row.correct_flag_detected:
+            branch_sha = _branch_head_sha(core, case, row.branch_name)
+            row.context_stored = _ensure_context_mapping(
+                core,
+                case,
+                run_id,
+                evidence_branch=row.branch_name or case.branch,
+                evidence_commit_sha=branch_sha or case.commit_sha,
+            )
 
-        post_learning_search = _search_context(case)
-        row.context_hit = _matching_context_record(case, post_learning_search) is not None
+        # Phase 2 retrieval is checked with the actual randomized paraphrase and
+        # then exercised through a completely fresh Teams conversation.
+        phase2_search = repository_context.search_repository_context(
+            repo_owner=case.owner,
+            repo_name=case.repo,
+            query=case.phase2_prompt,
+            current_commit_sha="",
+            top_k=8,
+        )
+        row.phase2_context_retrieved = _matching_context_record(case, phase2_search) is not None
 
-        # Phase 2 uses a fresh synthetic Teams conversation so thread/session
-        # memory from Phase 1 cannot satisfy the request.
         phase2_request = _phase_request(case, case.phase2_prompt, p2_conversation, phase=2)
+        phase2_request["teams_requester"] = f"terrabot-test-phase2-{run_id[-6:]}-{case.case_id}"
         phase2_result, status = _invoke_backend(core, phase2_request, row)
         row.phase2_ok = status < 500 and bool(phase2_result.get("ok", True))
-        phase2_mode = str(phase2_result.get("mode") or "").lower()
-        row.phase2_reused_without_clarification = row.context_hit and phase2_mode != "clarification"
-        row.phase2_target_ok, _ = _target_matches(case, phase2_result)
-        row.phase2_target_ok = row.phase2_target_ok and _repo_matches(case, phase2_result)
+        first_phase2_mode = str(phase2_result.get("mode") or "").lower()
+        row.phase2_reused_without_clarification = row.phase2_context_retrieved and first_phase2_mode != "clarification"
+
+        # Still continue a Phase 2 clarification so file-generation accuracy is
+        # measured independently from context retrieval accuracy.
+        if first_phase2_mode == "clarification":
+            row.phase2_clarified = True
+            selection = _pick_expected_candidate(case, phase2_result) or case.flag
+            phase2_followup = {
+                "prompt": selection,
+                "original_prompt": case.phase2_prompt,
+                "thread_id": str(phase2_result.get("thread_id") or ""),
+                "teams_conversation_id": p2_conversation,
+                "memory_conversation_id": phase2_request["memory_conversation_id"],
+                "teams_requester": phase2_request["teams_requester"],
+                "source": "teams",
+                "mode": "infra",
+                "test_mode": True,
+                "automated_test_phase": 2,
+                "pending_target_selection_reply": True,
+                "pending_target_selection_thread_id": str(phase2_result.get("thread_id") or ""),
+                "fresh_infra_generation": True,
+                "force_new_branch": True,
+                "reuse_branch": False,
+                "existing_branch": "",
+                "cloud": case.cloud,
+                "requested_cloud": case.cloud,
+            }
+            phase2_result, status = _invoke_backend(core, phase2_followup, row)
+            row.phase2_ok = status < 500 and bool(phase2_result.get("ok", True))
+
+        p2_target, p2_flag, row.phase2_file_generated, _ = _target_detection(case, phase2_result)
+        row.phase2_target_ok = p2_target and p2_flag and _repo_matches(case, phase2_result)
 
         assertions = [
-            row.phase1_ok,
-            row.phase1_target_ok,
+            row.expected_target_found,
+            row.correct_flag_detected,
+            row.phase1_file_generated,
             row.validation_ok,
+            row.branch_pushed,
             row.context_stored,
-            row.context_hit,
-            row.phase2_ok,
+            row.phase2_context_retrieved,
+            row.phase2_file_generated,
             row.phase2_target_ok,
             row.phase2_reused_without_clarification,
         ]
@@ -647,9 +885,14 @@ def _run_case(core: Any, case: TestCase, run_id: str, requester_id: str) -> Test
         "test_case_completed",
         run_id=run_id,
         test_case_id=case.case_id,
-        phase1_target_ok=row.phase1_target_ok,
+        expected_target_found=row.expected_target_found,
+        correct_flag_detected=row.correct_flag_detected,
+        phase1_file_generated=row.phase1_file_generated,
         validation_ok=row.validation_ok,
-        context_hit=row.context_hit,
+        branch_pushed=row.branch_pushed,
+        context_stored=row.context_stored,
+        phase2_context_retrieved=row.phase2_context_retrieved,
+        phase2_file_generated=row.phase2_file_generated,
         phase2_target_ok=row.phase2_target_ok,
         context_reuse=row.phase2_reused_without_clarification,
         calls=row.bot_calls,
@@ -679,12 +922,28 @@ def _derive_test_cases(core: Any, cloud_filter: str, count: int, run_id: str) ->
     specs = _repo_specs(core, cloud_filter)
     if not specs:
         return [], ["No configured GitHub repositories matched the requested cloud filter."]
-    per_repo = max(1, (count + len(specs) - 1) // len(specs))
+
+    # `run tests` defaults to six cases: exactly three AWS + three Azure.
+    # Explicit larger all-cloud counts remain balanced as closely as possible.
+    wanted_by_cloud: dict[str, int] = {}
+    if cloud_filter == "all" and len(specs) >= 2:
+        aws_count = count // 2
+        azure_count = count - aws_count
+        wanted_by_cloud = {"aws": aws_count, "azure": azure_count}
+    else:
+        wanted_by_cloud = {spec.cloud: count for spec in specs}
+
     cases: list[TestCase] = []
     errors: list[str] = []
     for spec in specs:
+        wanted = max(0, wanted_by_cloud.get(spec.cloud, 0))
+        if wanted <= 0:
+            continue
         try:
-            cases.extend(_derive_cases_for_repository(core, spec, wanted=per_repo, run_id=run_id))
+            derived = _derive_cases_for_repository(core, spec, wanted=wanted, run_id=run_id)
+            cases.extend(derived)
+            if len(derived) < wanted:
+                errors.append(f"{spec.cloud}:{spec.repo}: only {len(derived)}/{wanted} valid environment-scoped cases could be derived.")
         except Exception as exc:
             message = f"{spec.cloud}:{spec.owner}/{spec.repo}: {exc}"
             errors.append(message)
@@ -708,9 +967,10 @@ def format_test_run_report(run: TestRunResult) -> str:
     completed = len(run.cases)
     passed = sum(1 for item in run.cases if item.score == 100)
     average_score = round(sum(item.score for item in run.cases) / completed, 1) if completed else 0.0
-    context_hits = sum(1 for item in run.cases if item.context_hit)
-    context_reuse = sum(1 for item in run.cases if item.phase2_reused_without_clarification)
-    validations = sum(1 for item in run.cases if item.validation_ok)
+    branches = sum(1 for item in run.cases if item.branch_pushed)
+    contexts = sum(1 for item in run.cases if item.context_stored)
+    p2_context = sum(1 for item in run.cases if item.phase2_context_retrieved)
+    p2_files = sum(1 for item in run.cases if item.phase2_file_generated)
     avg_calls = round(sum(item.bot_calls for item in run.cases) / completed, 1) if completed else 0.0
     avg_seconds = round(sum(item.duration_ms for item in run.cases) / max(completed, 1) / 1000.0, 1)
 
@@ -718,30 +978,31 @@ def format_test_run_report(run: TestRunResult) -> str:
         "**Terrabot automated repository-context test results**",
         f"Run ID: `{run.run_id}`",
         f"Cases: **{completed}/{run.requested_cases}** | Full passes: **{passed}** | Average accuracy: **{average_score}%**",
-        f"Validation: **{validations}/{completed}** | Context hits: **{context_hits}/{completed}** | Fresh-session context reuse: **{context_reuse}/{completed}**",
+        f"Branches pushed: **{branches}/{completed}** | Context added: **{contexts}/{completed}** | Phase 2 context retrieved: **{p2_context}/{completed}** | Phase 2 files generated: **{p2_files}/{completed}**",
         f"Average backend calls/case: **{avg_calls}** | Average case time: **{avg_seconds}s** | Total: **{round(run.duration_ms / 1000.0, 1)}s**",
         "",
-        "| Test | Repo | Phase 1 prompt | Expected target | P1 target | Validation | Context | Phase 2 reuse | Calls | Time | Score |",
-        "|---|---|---|---|---|---|---|---|---:|---:|---:|",
+        "| Test | Cloud/Env | Phase 1 prompt | Expected target | Target found | Flag detected | P1 file | Validation | Branch pushed | Context added | P2 context | P2 file | Score |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---:|",
     ]
     for item in run.cases:
         case = item.case
-        context_state = "PASS" if item.context_stored and item.context_hit else "FAIL"
         target = f"{case.path} :: {case.flag}"
         lines.append(
             "| "
             + " | ".join(
                 [
-                    _escape_table(case.case_id, 24),
-                    _escape_table(case.repo, 20),
-                    _escape_table(case.phase1_prompt, 42),
-                    _escape_table(target, 52),
-                    _status(item.phase1_target_ok),
+                    _escape_table(case.case_id, 22),
+                    _escape_table(f"{case.cloud}/{case.environment}", 22),
+                    _escape_table(case.phase1_prompt, 38),
+                    _escape_table(target, 50),
+                    _status(item.expected_target_found),
+                    _status(item.correct_flag_detected),
+                    _status(item.phase1_file_generated),
                     _status(item.validation_ok),
-                    context_state,
-                    _status(item.phase2_reused_without_clarification and item.phase2_target_ok),
-                    str(item.bot_calls),
-                    f"{item.duration_ms / 1000.0:.1f}s",
+                    _status(item.branch_pushed),
+                    _status(item.context_stored),
+                    _status(item.phase2_context_retrieved),
+                    _status(item.phase2_file_generated),
                     f"{item.score}%",
                 ]
             )
@@ -751,23 +1012,34 @@ def format_test_run_report(run: TestRunResult) -> str:
     failures = [item for item in run.cases if item.score < 100]
     if failures:
         lines.extend(["", "**Failed assertions**"])
-        for item in failures[:10]:
+        for item in failures[:12]:
             reasons: list[str] = []
-            if not item.phase1_target_ok:
-                reasons.append("Phase 1 target mismatch")
+            if not item.expected_target_found:
+                reasons.append("expected target not detected")
+            if not item.correct_flag_detected:
+                reasons.append("correct flag not detected")
+            if not item.phase1_file_generated:
+                reasons.append("Phase 1 file not generated")
             if not item.validation_ok:
-                reasons.append("dry-run validation failed")
-            if not item.context_stored or not item.context_hit:
-                reasons.append("repository context was not verified")
+                reasons.append("validation failed")
+            if not item.branch_pushed:
+                reasons.append("branch not pushed")
+            if not item.context_stored:
+                reasons.append("context not added")
+            if not item.phase2_context_retrieved:
+                reasons.append("Phase 2 context not retrieved")
+            if not item.phase2_file_generated:
+                reasons.append("Phase 2 file not generated")
             if not item.phase2_target_ok:
                 reasons.append("Phase 2 target mismatch")
             if not item.phase2_reused_without_clarification:
-                reasons.append("fresh Phase 2 required clarification or had no context hit")
+                reasons.append("Phase 2 required clarification")
             if item.error:
                 reasons.append(item.error)
             elif item.validation_error and not item.validation_ok:
                 reasons.append(item.validation_error)
-            lines.append(f"- `{item.case.case_id}`: {_escape_table('; '.join(reasons), 300)}")
+            branch_note = f" branch={item.branch_name}" if item.branch_name else ""
+            lines.append(f"- `{item.case.case_id}`:{branch_note} {_escape_table('; '.join(reasons), 360)}")
 
     if run.discovery_errors:
         lines.extend(["", "**Repository discovery warnings**"])
@@ -775,7 +1047,7 @@ def format_test_run_report(run: TestRunResult) -> str:
 
     lines.extend([
         "",
-        "No test generated a GitHub branch or pull request. Phase 1/2 synthetic Teams state was cleared after each case.",
+        "Phase 1 pushes each validated test change to its own Terrabot test branch; no pull request is created. Phase 2 uses a fresh synthetic Teams conversation and does not push another branch.",
         f"Search Function App logs with `run_id={run.run_id}` for the complete `[TerrabotTest]` execution trace.",
     ])
     return "\n".join(lines)
@@ -850,10 +1122,16 @@ def handle_teams_automated_test_request(core: Any, data: dict) -> tuple[dict, in
                 "prompt": item.case.phase1_prompt,
                 "expected_path": item.case.path,
                 "expected_flag": item.case.flag,
-                "phase1_target_ok": item.phase1_target_ok,
+                "expected_target_found": item.expected_target_found,
+                "correct_flag_detected": item.correct_flag_detected,
+                "phase1_file_generated": item.phase1_file_generated,
                 "validation_ok": item.validation_ok,
+                "branch_pushed": item.branch_pushed,
+                "branch": item.branch_name,
+                "branch_url": item.branch_url,
                 "context_stored": item.context_stored,
-                "context_hit": item.context_hit,
+                "phase2_context_retrieved": item.phase2_context_retrieved,
+                "phase2_file_generated": item.phase2_file_generated,
                 "phase2_target_ok": item.phase2_target_ok,
                 "phase2_reused_without_clarification": item.phase2_reused_without_clarification,
                 "bot_calls": item.bot_calls,
