@@ -17,8 +17,10 @@ from botbuilder.integration.aiohttp import (
 )
 from botbuilder.schema import Activity, ActivityTypes
 from shared_code import teams_conversation_memory
+from shared_code.automated_tests.terrabot_test_runner import is_automated_test_command
 from shared_code.terrabot_service import (
     handle_teams_chat_request,
+    handle_teams_automated_test_request,
     handle_teams_workspace_branch_request,
     load_teams_conversation_state,
     reset_teams_chat_session,
@@ -849,6 +851,45 @@ class TerrabotTeamsBot(ActivityHandler):
                 turn_context,
                 "Send a message or an infrastructure request, for example: "
                 "create a storage account in npr.",
+            )
+            return
+
+        sender = getattr(activity, "from_property", None)
+        LOGGER.warning(
+            "TEAMS-IDENTITY: name=%s aad_object_id=%s teams_id=%s",
+            getattr(sender, "name", ""),
+            getattr(sender, "aad_object_id", ""),
+            getattr(sender, "id", ""),
+        )
+        # Automated repository-context testing is deliberately intercepted before
+        # the normal Teams workflow state machine. The isolated runner uses fresh
+        # synthetic conversations for every phase and never sends commit/PR actions.
+        if is_automated_test_command(prompt):
+            sender = getattr(activity, "from_property", None)
+            aad_object_id = str(getattr(sender, "aad_object_id", "") or "").strip()
+            await _send(turn_context, "Terrabot automated tests are running. Results will be posted in this conversation when the run completes.")
+            try:
+                test_result, test_status = await asyncio.to_thread(
+                    handle_teams_automated_test_request,
+                    {
+                        "prompt": prompt,
+                        "aad_object_id": aad_object_id,
+                        "teams_conversation_id": thread_id,
+                        "teams_requester": _get_teams_requester(activity),
+                    },
+                )
+            except Exception as exc:
+                LOGGER.exception("Terrabot automated Teams test runner failed", exc_info=exc)
+                await _send(
+                    turn_context,
+                    "Terrabot automated tests failed before a report could be produced. "
+                    "Check the Function App logs for `[TerrabotTest]` entries.",
+                )
+                return
+
+            await _send(
+                turn_context,
+                str(test_result.get("reply") or f"Automated test run finished with HTTP status {test_status}."),
             )
             return
 

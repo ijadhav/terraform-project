@@ -11,6 +11,9 @@ from __future__ import annotations
 
 from shared_code import terrabot_service_core as _core
 from shared_code.terrabot_teams_handlers import handle_teams_chat_request as _teams_handle
+from shared_code.automated_tests.terrabot_test_runner import (
+    handle_teams_automated_test_request as _automated_test_handle,
+)
 
 for _name, _value in vars(_core).items():
     if not _name.startswith("__"):
@@ -25,3 +28,10 @@ def __dir__():
 # Explicit public handler override: adapters call the modular Teams entrypoint.
 def handle_teams_chat_request(data: dict):
     return _teams_handle(_core, data)
+
+# Explicit automated-test handler. The isolated runner receives the loaded core
+# module so it can exercise the real Teams backend without duplicating workflow
+# logic in this compatibility facade.
+def handle_teams_automated_test_request(data: dict):
+    return _automated_test_handle(_core, data)
+
