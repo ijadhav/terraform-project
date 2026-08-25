@@ -15,7 +15,7 @@ from botbuilder.integration.aiohttp import (
     CloudAdapter,
     ConfigurationBotFrameworkAuthentication,
 )
-from botbuilder.schema import Activity, ActivityTypes
+from botbuilder.schema import Activity, ActivityTypes, ConversationReference
 from shared_code import teams_conversation_memory
 from shared_code.automated_tests.terrabot_test_runner import is_automated_test_command
 from shared_code.terrabot_service import (
@@ -861,13 +861,17 @@ class TerrabotTeamsBot(ActivityHandler):
             getattr(sender, "aad_object_id", ""),
             getattr(sender, "id", ""),
         )
-        # Automated repository-context testing is deliberately intercepted before
-        # the normal Teams workflow state machine. The isolated runner uses fresh
-        # synthetic conversations for every phase and never sends commit/PR actions.
+        # Automated repository-context testing is intercepted before the normal
+        # Teams workflow. This path only validates/queues the run (or reads
+        # durable status); the expensive test work executes in the queue worker.
         if is_automated_test_command(prompt):
             sender = getattr(activity, "from_property", None)
             aad_object_id = str(getattr(sender, "aad_object_id", "") or "").strip()
-            await _send(turn_context, "Terrabot automated tests are running. Results will be posted in this conversation when the run completes.")
+            reference = TurnContext.get_conversation_reference(activity)
+            try:
+                reference_payload = reference.serialize() if hasattr(reference, "serialize") else {}
+            except Exception:
+                reference_payload = {}
             try:
                 test_result, test_status = await asyncio.to_thread(
                     handle_teams_automated_test_request,
@@ -876,20 +880,20 @@ class TerrabotTeamsBot(ActivityHandler):
                         "aad_object_id": aad_object_id,
                         "teams_conversation_id": thread_id,
                         "teams_requester": _get_teams_requester(activity),
+                        "conversation_reference": reference_payload,
                     },
                 )
             except Exception as exc:
-                LOGGER.exception("Terrabot automated Teams test runner failed", exc_info=exc)
+                LOGGER.exception("Terrabot automated Teams test queueing failed", exc_info=exc)
                 await _send(
                     turn_context,
-                    "Terrabot automated tests failed before a report could be produced. "
-                    "Check the Function App logs for `[TerrabotTest]` entries.",
+                    "Terrabot could not queue the automated tests. Check the Function App logs for `[TerrabotTest]` entries.",
                 )
                 return
 
             await _send(
                 turn_context,
-                str(test_result.get("reply") or f"Automated test run finished with HTTP status {test_status}."),
+                str(test_result.get("reply") or f"Automated test request finished with HTTP status {test_status}."),
             )
             return
 
@@ -1551,6 +1555,20 @@ class TerrabotTeamsBot(ActivityHandler):
                     "Terrabot is ready. Send a message or mention me with an "
                     "infrastructure request.",
                 )
+
+async def send_automated_test_report(reference_payload: Dict[str, Any], text: str) -> None:
+    """Post a queue-worker result back to the originating Teams conversation."""
+    reference = ConversationReference().deserialize(reference_payload or {})
+    app_id = _required_setting("MicrosoftAppId", "TEAMS_BOT_APP_ID")
+
+    async def _callback(context: TurnContext) -> None:
+        await context.send_activity(str(text or ""))
+
+    # CloudAdapter proactive continuation uses the same bot identity as normal
+    # Teams traffic. The queue worker calls this only after the original HTTP
+    # invocation has already completed.
+    await ADAPTER.continue_conversation(reference, _callback, app_id)
+
 
 BOT = TerrabotTeamsBot()
 

@@ -14,6 +14,9 @@ from shared_code.terrabot_teams_handlers import handle_teams_chat_request as _te
 from shared_code.automated_tests.terrabot_test_runner import (
     handle_teams_automated_test_request as _automated_test_handle,
 )
+from shared_code.automated_tests.terrabot_test_worker import (
+    process_automated_test_queue_message as _automated_test_worker,
+)
 
 for _name, _value in vars(_core).items():
     if not _name.startswith("__"):
@@ -35,3 +38,8 @@ def handle_teams_chat_request(data: dict):
 def handle_teams_automated_test_request(data: dict):
     return _automated_test_handle(_core, data)
 
+
+# Queue-trigger adapter: the Function App passes the queue message here so the
+# long-running test worker stays outside the Teams HTTP invocation.
+def process_automated_test_queue_message(message):
+    return _automated_test_worker(_core, message)

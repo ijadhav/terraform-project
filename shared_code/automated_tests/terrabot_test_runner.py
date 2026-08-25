@@ -21,6 +21,7 @@ Validated Phase 1 Terraform is committed to an isolated Terrabot test branch so 
 """
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
 import logging
 import os
@@ -32,12 +33,17 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
 
 from shared_code import repository_context
+from shared_code.automated_tests import terrabot_test_state
 
 LOGGER = logging.getLogger("terrabot.automated_tests")
 LOGGER.setLevel(logging.INFO)
 
 TEST_COMMAND_RE = re.compile(
     r"^\s*run\s+tests(?:\s+(aws|azure|all))?(?:\s+(\d{1,2}))?\s*$",
+    re.IGNORECASE,
+)
+TEST_STATUS_RE = re.compile(
+    r"^\s*run\s+tests\s+status(?:\s+([A-Za-z0-9._:-]+))?\s*$",
     re.IGNORECASE,
 )
 
@@ -54,6 +60,7 @@ _MAX_CASES = max(1, min(int(os.getenv("TERRABOT_TEST_RUNNER_MAX_CASES", "10")), 
 _DEFAULT_CASES = max(1, min(int(os.getenv("TERRABOT_TEST_RUNNER_DEFAULT_CASES", "6")), _MAX_CASES))
 _SCAN_FILE_LIMIT = max(10, min(int(os.getenv("TERRABOT_TEST_RUNNER_SCAN_FILES", "45")), 150))
 _TREE_PATH_LIMIT = max(200, min(int(os.getenv("TERRABOT_TEST_RUNNER_TREE_PATH_LIMIT", "12000")), 50000))
+_MAX_PARALLEL_CASES = max(1, min(int(os.getenv("TERRABOT_TEST_RUNNER_MAX_PARALLEL_CASES", "2")), 4))
 
 
 def _diag(event: str, level: str = "info", **fields: Any) -> None:
@@ -75,7 +82,8 @@ def _diag(event: str, level: str = "info", **fields: Any) -> None:
 
 
 def is_automated_test_command(prompt: str) -> bool:
-    return bool(TEST_COMMAND_RE.fullmatch(str(prompt or "").strip()))
+    value = str(prompt or "").strip()
+    return bool(TEST_COMMAND_RE.fullmatch(value) or TEST_STATUS_RE.fullmatch(value))
 
 
 def _parse_command(prompt: str) -> tuple[str, int]:
@@ -1053,92 +1061,256 @@ def format_test_run_report(run: TestRunResult) -> str:
     return "\n".join(lines)
 
 
-def _run_tests(core: Any, *, prompt: str, aad_object_id: str) -> TestRunResult:
+def _case_state_payload(item: TestCaseResult) -> dict[str, Any]:
+    return {
+        "test_case_id": item.case.case_id,
+        "cloud": item.case.cloud,
+        "environment": item.case.environment,
+        "repo": item.case.repo,
+        "prompt": item.case.phase1_prompt,
+        "phase2_prompt": item.case.phase2_prompt,
+        "expected_path": item.case.path,
+        "expected_flag": item.case.flag,
+        "expected_target_found": item.expected_target_found,
+        "correct_flag_detected": item.correct_flag_detected,
+        "phase1_file_generated": item.phase1_file_generated,
+        "validation_ok": item.validation_ok,
+        "branch_pushed": item.branch_pushed,
+        "branch": item.branch_name,
+        "branch_url": item.branch_url,
+        "context_stored": item.context_stored,
+        "phase2_context_retrieved": item.phase2_context_retrieved,
+        "phase2_file_generated": item.phase2_file_generated,
+        "phase2_target_ok": item.phase2_target_ok,
+        "phase2_reused_without_clarification": item.phase2_reused_without_clarification,
+        "bot_calls": item.bot_calls,
+        "duration_ms": item.duration_ms,
+        "score": item.score,
+        "error": item.error or item.validation_error,
+    }
+
+
+def _new_run_id() -> str:
+    return "ctx-" + time.strftime("%Y%m%d-%H%M%S", time.gmtime()) + "-" + uuid.uuid4().hex[:6]
+
+
+def _status_report(aad_object_id: str, requested_run_id: str = "") -> tuple[dict, int]:
+    owner_hash = terrabot_test_state.requester_hash(aad_object_id)
+    state = (
+        terrabot_test_state.load_run(owner_hash, requested_run_id)
+        if requested_run_id
+        else terrabot_test_state.latest_run(owner_hash)
+    )
+    if not state:
+        return {
+            "ok": False,
+            "mode": "automated_test_status",
+            "reply": "No automated Terrabot test run was found for this Teams identity.",
+        }, 404
+    run_id = str(state.get("run_id") or "")
+    status = str(state.get("status") or "unknown")
+    requested = int(state.get("requested_cases") or 0)
+    completed = int(state.get("completed_cases") or 0)
+    report = str(state.get("report") or "").strip()
+    if status == "completed" and report:
+        return {"ok": True, "mode": "automated_test_status", "run_id": run_id, "reply": report}, 200
+    lines = [
+        "**Terrabot automated test status**",
+        f"Run ID: `{run_id}`",
+        f"Status: **{status}**",
+        f"Completed: **{completed}/{requested}**",
+    ]
+    if state.get("started_at"):
+        lines.append(f"Started: `{state.get('started_at')}`")
+    if state.get("error"):
+        lines.extend(["", f"Error: `{str(state.get('error'))[:1000]}`"])
+    return {"ok": status != "failed", "mode": "automated_test_status", "run_id": run_id, "reply": "\n".join(lines)}, 200
+
+
+def start_automated_test_run(core: Any, data: dict) -> tuple[dict, int]:
+    """Authorize, persist and enqueue a run; never execute Foundry work inline."""
+    del core
+    prompt = str((data or {}).get("prompt") or "").strip()
+    aad_object_id = str((data or {}).get("aad_object_id") or "").strip()
     _assert_authorized(aad_object_id)
+
+    status_match = TEST_STATUS_RE.fullmatch(prompt)
+    if status_match:
+        return _status_report(aad_object_id, str(status_match.group(1) or "").strip())
+
     cloud_filter, count = _parse_command(prompt)
-    run_id = "ctx-" + time.strftime("%Y%m%d-%H%M%S", time.gmtime()) + "-" + uuid.uuid4().hex[:6]
-    started = time.monotonic()
+    run_id = _new_run_id()
+    owner_hash = terrabot_test_state.requester_hash(aad_object_id)
+    conversation_reference = (data or {}).get("conversation_reference") or {}
+    state = {
+        "run_id": run_id,
+        "requester_hash": owner_hash,
+        "status": "queued",
+        "requested_cases": count,
+        "completed_cases": 0,
+        "cloud_filter": cloud_filter,
+        "created_at": terrabot_test_state.utc_now(),
+        "conversation_reference": conversation_reference,
+    }
+    terrabot_test_state.save_run(state)
+    job = {
+        "run_id": run_id,
+        "prompt": prompt,
+        "aad_object_id": aad_object_id,
+        "requester_hash": owner_hash,
+        "cloud_filter": cloud_filter,
+        "requested_cases": count,
+        "conversation_reference": conversation_reference,
+        "created_at": state["created_at"],
+    }
+    try:
+        terrabot_test_state.enqueue_run(job)
+    except Exception as exc:
+        state.update({"status": "failed", "error": str(exc), "completed_at": terrabot_test_state.utc_now()})
+        terrabot_test_state.save_run(state)
+        raise
+
     _diag(
-        "test_run_started",
+        "test_run_queued",
         run_id=run_id,
-        requester_hash=hashlib.sha256(aad_object_id.encode()).hexdigest()[:12],
+        requester_hash=owner_hash,
         cloud=cloud_filter,
         requested_cases=count,
+        max_parallel_cases=_MAX_PARALLEL_CASES,
     )
-    cases, discovery_errors = _derive_test_cases(core, cloud_filter, count, run_id)
-    result = TestRunResult(run_id=run_id, requested_cases=count, discovery_errors=discovery_errors)
-    for case in cases:
-        result.cases.append(_run_case(core, case, run_id, aad_object_id))
-    result.duration_ms = int((time.monotonic() - started) * 1000)
-    _diag(
-        "test_run_completed",
-        run_id=run_id,
-        requested_cases=count,
-        completed_cases=len(result.cases),
-        full_passes=sum(1 for item in result.cases if item.score == 100),
-        duration_ms=result.duration_ms,
-    )
-    return result
+    return {
+        "ok": True,
+        "mode": "automated_test_queued",
+        "run_id": run_id,
+        "reply": (
+            "**Terrabot automated test run queued**\n"
+            f"Run ID: `{run_id}`\n"
+            f"Cases: **{count}** | Cloud scope: **{cloud_filter}** | Parallel cases: **{_MAX_PARALLEL_CASES}**\n\n"
+            "The Teams request has completed; the queue worker will run the tests in the background "
+            "and post the final table back to this conversation. Use `run tests status` to check progress."
+        ),
+    }, 202
 
+
+def execute_automated_test_job(core: Any, job: dict) -> str:
+    """Run one queued test job with durable progress and bounded parallelism."""
+    run_id = str((job or {}).get("run_id") or "").strip()
+    aad_object_id = str((job or {}).get("aad_object_id") or "").strip()
+    owner_hash = str((job or {}).get("requester_hash") or terrabot_test_state.requester_hash(aad_object_id)).strip()
+    prompt = str((job or {}).get("prompt") or "run tests").strip()
+    if not run_id:
+        raise ValueError("Queued automated-test job is missing run_id.")
+    _assert_authorized(aad_object_id)
+    cloud_filter, count = _parse_command(prompt)
+    started = time.monotonic()
+    run_state = {
+        "run_id": run_id,
+        "requester_hash": owner_hash,
+        "status": "running",
+        "requested_cases": count,
+        "completed_cases": 0,
+        "cloud_filter": cloud_filter,
+        "created_at": str((job or {}).get("created_at") or terrabot_test_state.utc_now()),
+        "started_at": terrabot_test_state.utc_now(),
+        "conversation_reference": (job or {}).get("conversation_reference") or {},
+    }
+    terrabot_test_state.save_run(run_state)
+    _diag(
+        "test_run_worker_started",
+        run_id=run_id,
+        cloud=cloud_filter,
+        requested_cases=count,
+        max_parallel_cases=_MAX_PARALLEL_CASES,
+    )
+
+    try:
+        cases, discovery_errors = _derive_test_cases(core, cloud_filter, count, run_id)
+        result = TestRunResult(run_id=run_id, requested_cases=count, discovery_errors=discovery_errors)
+        indexed_cases = list(enumerate(cases, start=1))
+        completed_by_index: dict[int, TestCaseResult] = {}
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(_MAX_PARALLEL_CASES, max(1, len(indexed_cases))),
+            thread_name_prefix="terrabot-test-case",
+        ) as pool:
+            future_map = {
+                pool.submit(_run_case, core, case, run_id, aad_object_id): index
+                for index, case in indexed_cases
+            }
+            for future in concurrent.futures.as_completed(future_map):
+                index = future_map[future]
+                try:
+                    case_result = future.result()
+                except Exception as exc:
+                    # _run_case normally absorbs case-local errors. Keep the run
+                    # alive even if a worker future itself escapes unexpectedly.
+                    case = indexed_cases[index - 1][1]
+                    case_result = TestCaseResult(case=case, error=str(exc), duration_ms=0)
+                    _diag("test_case_future_failed", level="error", run_id=run_id, test_case_id=case.case_id, error=exc)
+                completed_by_index[index] = case_result
+                terrabot_test_state.save_case_result(owner_hash, run_id, index, _case_state_payload(case_result))
+                run_state["completed_cases"] = len(completed_by_index)
+                run_state["discovery_errors"] = discovery_errors
+                terrabot_test_state.save_run(run_state)
+                _diag(
+                    "test_run_progress_saved",
+                    run_id=run_id,
+                    completed_cases=len(completed_by_index),
+                    requested_cases=count,
+                )
+
+        result.cases = [completed_by_index[index] for index in sorted(completed_by_index)]
+        result.duration_ms = int((time.monotonic() - started) * 1000)
+        report = format_test_run_report(result)
+        run_state.update({
+            "status": "completed",
+            "completed_cases": len(result.cases),
+            "completed_at": terrabot_test_state.utc_now(),
+            "duration_ms": result.duration_ms,
+            "discovery_errors": discovery_errors,
+            "report": report,
+        })
+        terrabot_test_state.save_run(run_state)
+        _diag(
+            "test_run_worker_completed",
+            run_id=run_id,
+            requested_cases=count,
+            completed_cases=len(result.cases),
+            full_passes=sum(1 for item in result.cases if item.score == 100),
+            duration_ms=result.duration_ms,
+        )
+        return report
+    except Exception as exc:
+        run_state.update({
+            "status": "failed",
+            "completed_at": terrabot_test_state.utc_now(),
+            "duration_ms": int((time.monotonic() - started) * 1000),
+            "error": str(exc),
+        })
+        terrabot_test_state.save_run(run_state)
+        _diag("test_run_worker_failed", level="error", run_id=run_id, error=exc)
+        return (
+            "**Terrabot automated test run failed**\n"
+            f"Run ID: `{run_id}`\n"
+            f"Completed cases: **{run_state.get('completed_cases', 0)}/{count}**\n"
+            f"Error: `{str(exc)[:1500]}`\n\n"
+            f"Search Function App logs with `run_id={run_id}` for the complete trace."
+        )
 
 def handle_teams_automated_test_request(core: Any, data: dict) -> tuple[dict, int]:
-    """Run a private repository-derived test suite and return a Teams report."""
+    """Queue a private test run or return durable status; never block Teams."""
     prompt = str((data or {}).get("prompt") or "").strip()
     aad_object_id = str((data or {}).get("aad_object_id") or "").strip()
     if not is_automated_test_command(prompt):
         return {"ok": False, "reply": "Unsupported automated test command."}, 400
     try:
-        run = _run_tests(core, prompt=prompt, aad_object_id=aad_object_id)
+        return start_automated_test_run(core, data)
     except PermissionError as exc:
         _diag("test_run_denied", level="warning", reason=exc)
         return {"ok": False, "reply": str(exc), "mode": "automated_test"}, 403
     except Exception as exc:
-        _diag("test_run_failed", level="error", error=exc)
+        _diag("test_run_enqueue_failed", level="error", error=exc)
         return {
             "ok": False,
-            "reply": f"Terrabot automated test run failed before completion: {exc}",
+            "reply": f"Terrabot could not queue the automated test run: {exc}",
             "mode": "automated_test",
         }, 500
-
-    if not run.cases:
-        reply = format_test_run_report(run)
-        return {
-            "ok": False,
-            "mode": "automated_test",
-            "run_id": run.run_id,
-            "reply": reply,
-            "results": [],
-        }, 422
-
-    return {
-        "ok": True,
-        "mode": "automated_test",
-        "run_id": run.run_id,
-        "reply": format_test_run_report(run),
-        "results": [
-            {
-                "test_case_id": item.case.case_id,
-                "repo": item.case.repo,
-                "prompt": item.case.phase1_prompt,
-                "expected_path": item.case.path,
-                "expected_flag": item.case.flag,
-                "expected_target_found": item.expected_target_found,
-                "correct_flag_detected": item.correct_flag_detected,
-                "phase1_file_generated": item.phase1_file_generated,
-                "validation_ok": item.validation_ok,
-                "branch_pushed": item.branch_pushed,
-                "branch": item.branch_name,
-                "branch_url": item.branch_url,
-                "context_stored": item.context_stored,
-                "phase2_context_retrieved": item.phase2_context_retrieved,
-                "phase2_file_generated": item.phase2_file_generated,
-                "phase2_target_ok": item.phase2_target_ok,
-                "phase2_reused_without_clarification": item.phase2_reused_without_clarification,
-                "bot_calls": item.bot_calls,
-                "duration_ms": item.duration_ms,
-                "score": item.score,
-                "error": item.error or item.validation_error,
-            }
-            for item in run.cases
-        ],
-    }, 200

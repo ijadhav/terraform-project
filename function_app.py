@@ -6,9 +6,11 @@ import azure.functions as func
 import html
 import azure.functions as func
 from shared_code.keyvault_loader import load_keyvault_secrets
+from shared_code.automated_tests.terrabot_test_queue_function import blueprint as terrabot_automated_test_blueprint
 load_keyvault_secrets()
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
+app.register_functions(terrabot_automated_test_blueprint)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TEMPLATES_DIR = os.path.join(BASE_DIR, "templates")
