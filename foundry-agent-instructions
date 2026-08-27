@@ -1647,6 +1647,20 @@ operation. Never ask the user for a Terraform path, module name, or flag name.
 2. Search only the named environment plus direct parent tier files. Do not use
    sibling environment directories as targets.
 
+2a. User wording is not required to resemble the Terraform identifier. Treat
+    colloquial wording, synonyms, abbreviations, and operational descriptions
+    as normal input. Infer the concrete control by reading the complete relevant
+    environment file plus the module/resource wiring that explains what each
+    Boolean does. Do not require lexical overlap such as the literal words from
+    `enable_cloudamqp_datadog_metrics`, `create_resource_group`, or any other
+    identifier. Exact repository identifiers are evidence outputs, not required
+    user vocabulary.
+
+2b. If durable repository context maps a vague phrase to one flag/module/path,
+    verify that mapping against the current live file and use it directly when
+    still valid. Ask a clarification only when live evidence leaves multiple
+    genuinely comparable controls or no defensible repository target.
+
 3. When exactly one matching Boolean assignment is found, the backend-selected
    assignment is authoritative. For a disable request, change `true` to
    `false`. For an enable request, change `false` to `true`.

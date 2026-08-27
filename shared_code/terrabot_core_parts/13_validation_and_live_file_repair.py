@@ -1478,6 +1478,8 @@ def _foundry_repository_change_strategy(
             "For ordinary modifications, use a Boolean only when that Boolean directly implements the requested behavior; do not convert arbitrary setting changes into feature-flag changes.",
             "Include only candidates whose literal value must change. current_value and new_value must differ.",
             "Do not return unrelated Booleans merely because their names share words with the user request.",
+            "The user may use colloquial wording, synonyms, abbreviations, or a phrase that does not literally occur in the flag name. Resolve meaning from the surrounding module/resource wiring, comments, variable names, and shared repository context rather than requiring token overlap with the identifier.",
+            "When a colloquial request maps to one live repository control after reading the complete relevant file, prefer that single control even when the prompt contains none of the exact underscore-separated words from the flag.",
             "When shared_repository_context contains a prior resource/alias mapping, treat it only as a semantic hint and verify it against shared_repository_context_live_files plus repository_evidence. If the current live file still proves the mapping, use that concrete control without asking the user for a file/path/flag/module name.",
             "If a stored mapping is stale, conflicted, missing from the current live file, or contradicted by repository_evidence, ignore it and resolve from current live repository evidence instead.",
             "When one candidate is materially strongest, return only that candidate. Return multiple candidates only for genuine semantic ambiguity.",

@@ -2494,20 +2494,14 @@ def _handle_teams_chat_request_state_machine(data: dict):
     # corrective above, including branch-choice continuations restored from
     # durable state. Retry once with infrastructure mode forced while keeping
     # the exact restored prompt and branch decision.
-    _terminal_reply_lower = str(result.get("reply") or "").lower()
     _terminal_repo_qa_mismatch = bool(
         str(result.get("mode") or "").lower() == "chat"
-        and (
-            request_data.get("mode") == "infra"
-        )
-        and (
-            "intent: repository question/answer" in _terminal_reply_lower
-            or "no direct terraform changes yet" in _terminal_reply_lower
-        )
+        and request_data.get("mode") == "infra"
     )
     if _terminal_repo_qa_mismatch:
         retry = dict(request_data)
         retry["mode"] = "infra"
+        retry["foundry_intent"] = "infra"
         retry["fresh_infra_generation"] = True
         retry["pending_branch_choice_resolved"] = bool(
             retry.get("pending_branch_choice_resolved")

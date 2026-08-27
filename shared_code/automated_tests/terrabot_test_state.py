@@ -187,8 +187,8 @@ def enqueue_run(message: dict[str, Any]) -> None:
             f"HTTP {create.status_code} {create.text[:400]}"
         )
     # Azure Functions queue bindings are configured with MessageEncoding=Base64.
-    # Encode the JSON payload before placing it in MessageText so the queue
-    # trigger can decode and bind the message correctly.
+    # Encode the JSON payload once here; the Functions host decodes it before
+    # exposing QueueMessage.get_body() to the Python worker.
     raw_message = json.dumps(message, ensure_ascii=False).encode("utf-8")
     message_text = base64.b64encode(raw_message).decode("ascii")
     body = f"<QueueMessage><MessageText>{message_text}</MessageText></QueueMessage>".encode("utf-8")

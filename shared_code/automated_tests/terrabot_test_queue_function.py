@@ -15,9 +15,17 @@ LOGGER = logging.getLogger("terrabot.automated_tests.queue_function")
 
 blueprint = func.Blueprint()
 _QUEUE_NAME = os.getenv("TERRABOT_TEST_RUNNER_QUEUE_NAME", "terrabot-automated-tests").strip() or "terrabot-automated-tests"
+# Azure Functions queue_trigger(connection=...) expects the NAME of an app setting,
+# not the connection-string value itself. Prefer the dedicated automated-test
+# connection-string setting whenever it is configured so the producer and
+# consumer always watch the same Storage account.
 _QUEUE_CONNECTION_SETTING = (
-    os.getenv("TERRABOT_TEST_RUNNER_STORAGE_CONNECTION_SETTING", "AzureWebJobsStorage").strip()
-    or "AzureWebJobsStorage"
+    os.getenv("TERRABOT_TEST_RUNNER_STORAGE_CONNECTION_SETTING", "").strip()
+    or (
+        "TERRABOT_TEST_RUNNER_STORAGE_CONNECTION_STRING"
+        if os.getenv("TERRABOT_TEST_RUNNER_STORAGE_CONNECTION_STRING", "").strip()
+        else "AzureWebJobsStorage"
+    )
 )
 
 
