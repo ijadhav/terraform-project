@@ -76,6 +76,9 @@
     "TERRABOT_AI_ENDPOINT": "http://localhost:7071/api/generate",
     "TERRABOT_GENERATOR_COMMAND": "",
     "PYTHON_ENABLE_WORKER_EXTENSIONS": "1",
-    "TERRABOT_REQUIRE_JIRA":"false"
+    "TERRABOT_REQUIRE_JIRA":"false";
+    "TERRABOT_TEST_RUNNER_LOCAL_AAD_OBJECT_ID"="377a7248-9aca-4ac9-97f9-15b2e40d82df";
+    "TERRABOT_TEST_RUNNER_ENABLED"="true";
+    "TERRABOT_TEST_RUNNER_STORAGE_CONNECTION_STRING"="DefaultEndpointsProtocol=https;AccountName=terrabotstorage;AccountKey=j4cqC5/or0Ds3DEwZPSXbZpX1VJnbiFx8ZB0PRUPbnI+gm8xc7HteFPM0omcI8h/Si/bFhhAMYah+ASta6OTYQ==;EndpointSuffix=core.windows.net"
   }
 }

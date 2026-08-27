@@ -2034,6 +2034,11 @@ def _handle_teams_chat_request_safe(data: dict):
         "repo_target": str(state.get("repo_target") or request_data.get("repo_target") or "").strip().lower(),
         "repo_name": str(request_data.get("repo_name") or state.get("repo") or "").strip(),
         "requester": str(request_data.get("teams_requester") or "").strip(),
+        # Test-only observability. These fields do not alter routing/generation;
+        # they let the isolated E2E harness prove that retrieved context was
+        # actually attached before the Foundry call.
+        "test_mode": _teams_truthy(request_data.get("test_mode")),
+        "automated_test_case_id": str(request_data.get("automated_test_case_id") or "").strip(),
     }
     context_token = _ACTIVE_TEAMS_FLOW_CONTEXT.set(flow_context)
     try:
@@ -2044,6 +2049,11 @@ def _handle_teams_chat_request_safe(data: dict):
             except Exception as exc:
                 LOGGER.warning("[TerrabotDiag] event=repository_context_prefetch_start_failed error=%s", exc)
         result, status_code = _ORIGINAL_HANDLE_TEAMS_CHAT_REQUEST(request_data)
+        if flow_context.get("test_mode") and isinstance(result, dict):
+            diagnostics = flow_context.get("repository_context_test_diagnostics")
+            if isinstance(diagnostics, dict):
+                result = dict(result)
+                result["test_diagnostics"] = {"repository_context": dict(diagnostics)}
 
         # AWS create/add/provision requests are execute-now after branch choice.
         # Foundry is not allowed to turn repository placement/module existence

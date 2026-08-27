@@ -76,6 +76,7 @@ def save_run(run: dict[str, Any]) -> None:
         "requested_cases": int(item.get("requested_cases") or 0),
         "completed_cases": int(item.get("completed_cases") or 0),
         "cloud_filter": str(item.get("cloud_filter") or "all"),
+        "run_mode": str(item.get("run_mode") or "regression"),
         "created_at": str(item.get("created_at") or utc_now()),
         "updated_at": utc_now(),
         "started_at": str(item.get("started_at") or ""),
@@ -116,6 +117,81 @@ def load_case_results(owner_hash: str, run_id: str) -> list[dict[str, Any]]:
         parsed.append((int(row.get("case_index") or 0), payload))
     return [payload for _, payload in sorted(parsed, key=lambda value: value[0])]
 
+
+
+def save_context_candidate(owner_hash: str, run_id: str, candidate: dict[str, Any]) -> None:
+    candidate_id = str((candidate or {}).get("candidate_id") or "").strip()
+    if not candidate_id:
+        raise ValueError("candidate_id is required for context-candidate state.")
+    entity = {
+        "PartitionKey": owner_hash,
+        "RowKey": f"candidate::{run_id}::{candidate_id}",
+        "entity_type": "context_candidate",
+        "run_id": run_id,
+        "candidate_id": candidate_id,
+        "status": str((candidate or {}).get("status") or "candidate"),
+        "updated_at": utc_now(),
+        "payload_json": json.dumps(candidate or {}, ensure_ascii=False)[:60000],
+    }
+    _table_client().upsert_entity(entity=entity, mode=UpdateMode.REPLACE)
+
+
+def load_context_candidates(owner_hash: str, run_id: str) -> list[dict[str, Any]]:
+    rows = _table_client().query_entities(
+        query_filter=f"PartitionKey eq '{owner_hash}' and entity_type eq 'context_candidate' and run_id eq '{run_id}'"
+    )
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            result.append(json.loads(str(row.get("payload_json") or "{}")))
+        except Exception:
+            continue
+    return result
+
+
+def update_context_candidate_status(owner_hash: str, run_id: str, candidate_id: str, status: str, **fields: Any) -> None:
+    row_key = f"candidate::{run_id}::{candidate_id}"
+    table = _table_client()
+    try:
+        entity = dict(table.get_entity(partition_key=owner_hash, row_key=row_key))
+        payload = json.loads(str(entity.get("payload_json") or "{}"))
+    except Exception:
+        payload = {"candidate_id": candidate_id, "run_id": run_id}
+    payload.update(fields)
+    payload["status"] = status
+    save_context_candidate(owner_hash, run_id, payload)
+
+
+def load_coverage(repo_full_name: str) -> dict[str, dict[str, Any]]:
+    partition = "coverage::" + hashlib.sha256(str(repo_full_name or "").lower().encode()).hexdigest()[:24]
+    rows = _table_client().query_entities(
+        query_filter=f"PartitionKey eq '{partition}' and entity_type eq 'coverage'"
+    )
+    result: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        try:
+            payload = json.loads(str(row.get("payload_json") or "{}"))
+        except Exception:
+            payload = {}
+        key = str(payload.get("coverage_key") or row.get("coverage_key") or "")
+        if key:
+            result[key] = payload
+    return result
+
+
+def save_coverage(repo_full_name: str, coverage_key: str, payload: dict[str, Any]) -> None:
+    partition = "coverage::" + hashlib.sha256(str(repo_full_name or "").lower().encode()).hexdigest()[:24]
+    current = dict(payload or {})
+    current["coverage_key"] = coverage_key
+    entity = {
+        "PartitionKey": partition,
+        "RowKey": "coverage::" + hashlib.sha256(coverage_key.encode()).hexdigest()[:32],
+        "entity_type": "coverage",
+        "coverage_key": coverage_key,
+        "updated_at": utc_now(),
+        "payload_json": json.dumps(current, ensure_ascii=False)[:60000],
+    }
+    _table_client().upsert_entity(entity=entity, mode=UpdateMode.REPLACE)
 
 def latest_run(owner_hash: str) -> dict[str, Any] | None:
     rows = _table_client().query_entities(

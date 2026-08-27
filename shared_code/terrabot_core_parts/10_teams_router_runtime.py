@@ -2524,6 +2524,19 @@ def _teams_attach_repository_context(agent_input: str, active: dict) -> str:
         "stale_count": int(search_result.get("stale_count") or 0),
         "conflicted_count": int(search_result.get("conflicted_count") or 0),
     }
+    if active.get("test_mode"):
+        active["repository_context_test_diagnostics"] = {
+            "case_id": str(active.get("automated_test_case_id") or ""),
+            "repository": f"{owner}/{repo}",
+            "searched": True,
+            "attached": bool(context_block),
+            "result_count": len(search_result.get("results") or []),
+            "context_ids": [
+                str(item.get("id") or "")
+                for item in (search_result.get("results") or [])
+                if isinstance(item, dict) and str(item.get("id") or "").strip()
+            ],
+        }
     LOGGER.info(
         "[TerrabotDiag] event=repository_context_pre_generation_ready repo=%s/%s branch=%s results=%s stale=%s conflicted=%s",
         owner, repo, branch,

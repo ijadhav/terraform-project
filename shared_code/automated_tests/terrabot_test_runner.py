@@ -34,12 +34,21 @@ from typing import Any, Callable, Iterable
 
 from shared_code import repository_context
 from shared_code.automated_tests import terrabot_test_state
+from shared_code.automated_tests import terrabot_semantic_engine
+from shared_code.automated_tests import terrabot_test_analysis
+from shared_code.automated_tests import terrabot_test_coverage
+from shared_code.automated_tests import terrabot_context_revalidation
 
 LOGGER = logging.getLogger("terrabot.automated_tests")
 LOGGER.setLevel(logging.INFO)
 
 TEST_COMMAND_RE = re.compile(
     r"^\s*run\s+tests(?:\s+(aws|azure|all))?(?:\s+(\d{1,2}))?\s*$",
+    re.IGNORECASE,
+)
+TEST_MODE_COMMAND_RE = re.compile(
+    r"^\s*run\s+tests\s+(regression|exploration|context-regression|mixed)"
+    r"(?:\s+(aws|azure|all))?(?:\s+(\d{1,2}))?\s*$",
     re.IGNORECASE,
 )
 TEST_STATUS_RE = re.compile(
@@ -83,16 +92,27 @@ def _diag(event: str, level: str = "info", **fields: Any) -> None:
 
 def is_automated_test_command(prompt: str) -> bool:
     value = str(prompt or "").strip()
-    return bool(TEST_COMMAND_RE.fullmatch(value) or TEST_STATUS_RE.fullmatch(value))
+    return bool(TEST_COMMAND_RE.fullmatch(value) or TEST_MODE_COMMAND_RE.fullmatch(value) or TEST_STATUS_RE.fullmatch(value))
 
 
 def _parse_command(prompt: str) -> tuple[str, int]:
-    match = TEST_COMMAND_RE.fullmatch(str(prompt or "").strip())
+    value = str(prompt or "").strip()
+    mode_match = TEST_MODE_COMMAND_RE.fullmatch(value)
+    if mode_match:
+        cloud = str(mode_match.group(2) or "all").lower()
+        count = int(mode_match.group(3) or _DEFAULT_CASES)
+        return cloud, max(1, min(count, _MAX_CASES))
+    match = TEST_COMMAND_RE.fullmatch(value)
     if not match:
         raise ValueError("Unsupported automated test command.")
     cloud = str(match.group(1) or "all").lower()
     count = int(match.group(2) or _DEFAULT_CASES)
     return cloud, max(1, min(count, _MAX_CASES))
+
+
+def _parse_test_mode(prompt: str) -> str:
+    match = TEST_MODE_COMMAND_RE.fullmatch(str(prompt or "").strip())
+    return str(match.group(1) if match else "regression").lower()
 
 
 def _authorized_aad_ids() -> set[str]:
@@ -161,7 +181,16 @@ class TestCaseResult:
     branch_name: str = ""
     branch_url: str = ""
     context_stored: bool = False
+    context_present_before: bool = False
+    production_context_created: bool = False
+    fallback_context_created: bool = False
+    context_gap_detected: bool = False
+    context_candidate_created: bool = False
+    context_candidate_verified: bool = False
+    context_candidate_promoted: bool = False
     phase2_context_retrieved: bool = False
+    phase2_context_attached: bool = False
+    phase2_context_useful: bool = False
     phase2_ok: bool = False
     phase2_clarified: bool = False
     phase2_target_ok: bool = False
@@ -173,6 +202,7 @@ class TestCaseResult:
     score: int = 0
     actual_file: str = ""
     actual_mode: str = ""
+    failure_classification: str = ""
 
 
 @dataclass
@@ -414,6 +444,7 @@ def _derive_cases_for_repository(
     *,
     wanted: int,
     run_id: str,
+    semantic_generation: bool = False,
 ) -> list[TestCase]:
     commit_sha, paths = _github_recursive_tree(core, spec)
     ranked_paths = sorted(paths, key=_path_priority)
@@ -460,8 +491,22 @@ def _derive_cases_for_repository(
     used_prompts: set[str] = set()
     for index, item in enumerate(selected, start=1):
         desired = not bool(item["current_value"])
-        phase1 = _build_prompt(str(item["alias"]), str(item["environment"]), desired, phase=1)
-        phase2 = _build_prompt(str(item["alias"]), str(item["environment"]), desired, phase=2)
+        semantic = (
+            terrabot_semantic_engine.generate_semantic_variants(
+                cloud=spec.cloud,
+                environment=str(item["environment"]),
+                alias=str(item["alias"]),
+                desired_value=desired,
+                path=str(item["path"]),
+                flag=str(item["flag"]),
+                count=2,
+                workspace=os.getenv("TERRABOT_TEST_CURSOR_WORKSPACE", "").strip(),
+            )
+            if semantic_generation
+            else []
+        )
+        phase1 = semantic[0] if semantic else _build_prompt(str(item["alias"]), str(item["environment"]), desired, phase=1)
+        phase2 = semantic[1] if len(semantic) > 1 else _build_prompt(str(item["alias"]), str(item["environment"]), desired, phase=2)
         # Within one run prompts must be unique; regenerate wording if a random
         # template happened to collide.
         for _ in range(8):
@@ -912,6 +957,7 @@ def _phase_request(case: TestCase, prompt: str, conversation_id: str, *, phase: 
         "source": "teams",
         "test_mode": True,
         "automated_test_phase": phase,
+        "automated_test_case_id": case.case_id,
         "fresh_infra_generation": True,
         "cloud": case.cloud,
         "requested_cloud": case.cloud,
@@ -1016,6 +1062,9 @@ def _run_case(core: Any, case: TestCase, run_id: str, requester_id: str) -> Test
     )
 
     try:
+        if case.case_type == "boolean_context":
+            baseline_context = _search_context(case)
+            row.context_present_before = _matching_context_record(case, baseline_context) is not None
         phase1_request = _phase_request(case, case.phase1_prompt, p1_conversation, phase=1)
         phase1_request["teams_requester"] = f"terrabot-test-{run_id[-6:]}-{case.case_id}"
         phase1_result, status = _invoke_backend(core, phase1_request, row)
@@ -1109,15 +1158,72 @@ def _run_case(core: Any, case: TestCase, run_id: str, requester_id: str) -> Test
         # verified mapping itself so the same run can still exercise Phase 2.
         context_search = _search_context(case)
         row.context_stored = _matching_context_record(case, context_search) is not None
-        if not row.context_stored and row.branch_pushed and row.expected_target_found and row.correct_flag_detected:
+        row.production_context_created = row.context_stored and not row.context_present_before
+        row.context_gap_detected = terrabot_test_analysis.is_context_gap(
+            case, row, context_present_before=row.context_present_before
+        )
+        if not row.context_stored and row.branch_pushed and row.context_gap_detected:
+            evidence_branch = row.branch_name or case.branch
             branch_sha = _branch_head_sha(core, case, row.branch_name)
-            row.context_stored = _ensure_context_mapping(
-                core,
-                case,
-                run_id,
-                evidence_branch=row.branch_name or case.branch,
-                evidence_commit_sha=branch_sha or case.commit_sha,
+            live_content = core.github_get_file_content_by_repo(
+                case.owner, case.repo, case.path, ref=evidence_branch
+            ) or ""
+            assignment = re.search(
+                rf"(?m)^\s*{re.escape(case.flag)}\s*=\s*(?:true|false)\s*(?:#.*)?$",
+                str(live_content),
+                re.IGNORECASE,
             )
+            candidate = terrabot_test_analysis.build_boolean_context_candidate(
+                case,
+                run_id=run_id,
+                evidence_line=assignment.group(0).strip() if assignment else case.evidence_line,
+            )
+            row.context_candidate_created = True
+            owner_hash = terrabot_test_state.requester_hash(requester_id)
+            try:
+                terrabot_test_state.save_context_candidate(owner_hash, run_id, candidate)
+            except Exception as exc:
+                _diag("context_candidate_state_save_failed", level="warning", run_id=run_id, test_case_id=case.case_id, error=exc)
+
+            def candidate_fetcher(owner: str, repo: str, path: str, ref_value: str) -> str | None:
+                return core.github_get_file_content_by_repo(owner, repo, path, ref=ref_value)
+
+            validation = repository_context.validate_repository_context_candidate(
+                candidate,
+                repo_owner=case.owner,
+                repo_name=case.repo,
+                evidence_ref=branch_sha or evidence_branch,
+                evidence_fetcher=candidate_fetcher,
+            )
+            row.context_candidate_verified = bool(validation.get("valid"))
+            try:
+                terrabot_test_state.update_context_candidate_status(
+                    owner_hash, run_id, candidate["candidate_id"],
+                    "verified" if row.context_candidate_verified else "rejected",
+                    validation_errors=validation.get("errors") or [],
+                    verified=row.context_candidate_verified,
+                )
+            except Exception as exc:
+                _diag("context_candidate_verification_state_failed", level="warning", run_id=run_id, test_case_id=case.case_id, error=exc)
+
+            if row.context_candidate_verified:
+                row.fallback_context_created = _ensure_context_mapping(
+                    core,
+                    case,
+                    run_id,
+                    evidence_branch=evidence_branch,
+                    evidence_commit_sha=branch_sha or case.commit_sha,
+                )
+                row.context_candidate_promoted = row.fallback_context_created
+                row.context_stored = row.context_stored or row.fallback_context_created
+                try:
+                    terrabot_test_state.update_context_candidate_status(
+                        owner_hash, run_id, candidate["candidate_id"],
+                        "promoted" if row.context_candidate_promoted else "promotion_failed",
+                        promoted=row.context_candidate_promoted,
+                    )
+                except Exception as exc:
+                    _diag("context_candidate_state_update_failed", level="warning", run_id=run_id, test_case_id=case.case_id, error=exc)
 
         # Phase 2 retrieval is checked with the actual randomized paraphrase and
         # then exercised through a completely fresh Teams conversation.
@@ -1128,13 +1234,21 @@ def _run_case(core: Any, case: TestCase, run_id: str, requester_id: str) -> Test
             current_commit_sha="",
             top_k=8,
         )
-        row.phase2_context_retrieved = _matching_context_record(case, phase2_search) is not None
+        phase2_match = _matching_context_record(case, phase2_search)
+        row.phase2_context_retrieved = phase2_match is not None
 
         phase2_request = _phase_request(case, case.phase2_prompt, p2_conversation, phase=2)
         phase2_request["teams_requester"] = f"terrabot-test-phase2-{run_id[-6:]}-{case.case_id}"
         phase2_result, status = _invoke_backend(core, phase2_request, row)
         row.phase2_ok = status < 500 and bool(phase2_result.get("ok", True))
         first_phase2_mode = str(phase2_result.get("mode") or "").lower()
+        diagnostics = ((phase2_result.get("test_diagnostics") or {}).get("repository_context") or {})
+        attached_ids = {str(value) for value in (diagnostics.get("context_ids") or []) if str(value)}
+        expected_context_id = str((phase2_match or {}).get("id") or "")
+        row.phase2_context_attached = bool(
+            diagnostics.get("attached")
+            and (not expected_context_id or expected_context_id in attached_ids)
+        )
         row.phase2_reused_without_clarification = row.phase2_context_retrieved and first_phase2_mode != "clarification"
 
         # Still continue a Phase 2 clarification so file-generation accuracy is
@@ -1153,6 +1267,12 @@ def _run_case(core: Any, case: TestCase, run_id: str, requester_id: str) -> Test
 
         p2_target, p2_flag, row.phase2_file_generated, _ = _target_detection(case, phase2_result)
         row.phase2_target_ok = p2_target and p2_flag and _repo_matches(case, phase2_result)
+        row.phase2_context_useful = bool(
+            row.phase2_context_retrieved
+            and row.phase2_context_attached
+            and row.phase2_target_ok
+            and row.phase2_reused_without_clarification
+        )
 
         assertions = [
             row.expected_target_found,
@@ -1164,7 +1284,7 @@ def _run_case(core: Any, case: TestCase, run_id: str, requester_id: str) -> Test
             row.phase2_context_retrieved,
             row.phase2_file_generated,
             row.phase2_target_ok,
-            row.phase2_reused_without_clarification,
+            row.phase2_context_useful,
         ]
         row.score = round(100 * sum(bool(value) for value in assertions) / len(assertions))
     except Exception as exc:
@@ -1180,6 +1300,7 @@ def _run_case(core: Any, case: TestCase, run_id: str, requester_id: str) -> Test
         _safe_reset(core, p1_conversation, phase1_result)
         _safe_reset(core, p2_conversation, phase2_result)
         row.duration_ms = int((time.monotonic() - started) * 1000)
+        row.failure_classification = terrabot_test_analysis.classify_result(case, row)
 
     _diag(
         "test_case_completed",
@@ -1218,7 +1339,7 @@ def _repo_specs(core: Any, cloud_filter: str) -> list[RepositorySpec]:
     return specs
 
 
-def _derive_test_cases(core: Any, cloud_filter: str, count: int, run_id: str) -> tuple[list[TestCase], list[str]]:
+def _derive_test_cases(core: Any, cloud_filter: str, count: int, run_id: str, run_mode: str = "regression") -> tuple[list[TestCase], list[str]]:
     specs = _repo_specs(core, cloud_filter)
     if not specs:
         return [], ["No configured GitHub repositories matched the requested cloud filter."]
@@ -1240,9 +1361,34 @@ def _derive_test_cases(core: Any, cloud_filter: str, count: int, run_id: str) ->
         if wanted <= 0:
             continue
         try:
-            creation_slots = 1 if wanted >= 2 else 0
+            creation_slots = 0 if run_mode == "context-regression" else (1 if wanted >= 2 else 0)
             boolean_wanted = max(0, wanted - creation_slots)
-            derived = _derive_cases_for_repository(core, spec, wanted=boolean_wanted, run_id=run_id)
+            pool_size = boolean_wanted * 3 if run_mode in {"exploration", "mixed"} else boolean_wanted
+            derived = _derive_cases_for_repository(
+                core,
+                spec,
+                wanted=max(boolean_wanted, pool_size),
+                run_id=run_id,
+                semantic_generation=run_mode in {"exploration", "mixed"},
+            )
+            if run_mode == "context-regression" and derived:
+                context_backed: list[TestCase] = []
+                for candidate_case in derived:
+                    try:
+                        if _matching_context_record(candidate_case, _search_context(candidate_case)) is not None:
+                            context_backed.append(candidate_case)
+                    except Exception as exc:
+                        _diag("context_regression_selection_failed", level="warning", run_id=run_id, test_case_id=candidate_case.case_id, error=exc)
+                derived = context_backed[:boolean_wanted]
+            elif run_mode in {"exploration", "mixed"} and derived:
+                try:
+                    coverage = terrabot_test_state.load_coverage(f"{spec.owner}/{spec.repo}")
+                    derived = terrabot_test_coverage.select_cases(derived, coverage, boolean_wanted)
+                except Exception as exc:
+                    _diag("coverage_selection_failed", level="warning", run_id=run_id, repo=f"{spec.owner}/{spec.repo}", error=exc)
+                    derived = derived[:boolean_wanted]
+            else:
+                derived = derived[:boolean_wanted]
             if creation_slots:
                 creation_case = _derive_creation_case_for_repository(
                     core,
@@ -1286,6 +1432,10 @@ def format_test_run_report(run: TestRunResult) -> str:
     creation_cases = [item for item in run.cases if item.case.case_type == "resource_creation"]
     contexts = sum(1 for item in context_cases if item.context_stored)
     p2_context = sum(1 for item in context_cases if item.phase2_context_retrieved)
+    p2_attached = sum(1 for item in context_cases if item.phase2_context_attached)
+    p2_useful = sum(1 for item in context_cases if item.phase2_context_useful)
+    production_context = sum(1 for item in context_cases if item.production_context_created)
+    fallback_context = sum(1 for item in context_cases if item.fallback_context_created)
     p2_files = sum(1 for item in context_cases if item.phase2_file_generated)
     avg_calls = round(sum(item.bot_calls for item in run.cases) / completed, 1) if completed else 0.0
     avg_seconds = round(sum(item.duration_ms for item in run.cases) / max(completed, 1) / 1000.0, 1)
@@ -1295,18 +1445,18 @@ def format_test_run_report(run: TestRunResult) -> str:
         f"Run ID: `{run.run_id}`",
         f"Cases: **{completed}/{run.requested_cases}** | Full passes: **{passed}** | Average accuracy: **{average_score}%**",
         f"Phase 1 files generated: **{p1_files}/{completed}** | Branches pushed: **{branches}/{completed}** | Creation cases: **{len(creation_cases)}**",
-        f"Boolean-context cases: **{len(context_cases)}** | Context added: **{contexts}/{len(context_cases) or 1}** | Phase 2 context retrieved: **{p2_context}/{len(context_cases) or 1}** | Phase 2 files generated: **{p2_files}/{len(context_cases) or 1}**",
+        f"Boolean-context cases: **{len(context_cases)}** | Context available: **{contexts}/{len(context_cases) or 1}** | Production learned: **{production_context}** | Harness promoted: **{fallback_context}**",
+        f"Phase 2 context retrieved: **{p2_context}/{len(context_cases) or 1}** | Attached to Foundry: **{p2_attached}/{len(context_cases) or 1}** | Useful: **{p2_useful}/{len(context_cases) or 1}** | Phase 2 files: **{p2_files}/{len(context_cases) or 1}**",
         f"Average backend calls/case: **{avg_calls}** | Average case time: **{avg_seconds}s** | Total: **{round(run.duration_ms / 1000.0, 1)}s**",
         "",
-        "| Test | Type | Cloud/Env | Phase 1 prompt | Expected target | Target found | Control/relevance | P1 file | Validation | Branch pushed | Context added | P2 context | P2 file | Score |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---:|",
+        "| Test | Type | Cloud/Env | Phase 1 prompt | Expected target | Target found | Control/relevance | P1 file | Validation | Branch pushed | Context | P2 retrieved | P2 attached | P2 useful | Classification | Score |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---:|",
     ]
     for item in run.cases:
         case = item.case
         target = f"{case.path} :: {case.flag}" if case.flag else f"repository creation near {case.path}"
         context_status = _status(item.context_stored) if case.case_type == "boolean_context" else "N/A"
         p2_context_status = _status(item.phase2_context_retrieved) if case.case_type == "boolean_context" else "N/A"
-        p2_file_status = _status(item.phase2_file_generated) if case.case_type == "boolean_context" else "N/A"
         lines.append(
             "| "
             + " | ".join(
@@ -1323,7 +1473,9 @@ def format_test_run_report(run: TestRunResult) -> str:
                     _status(item.branch_pushed),
                     context_status,
                     p2_context_status,
-                    p2_file_status,
+                    _status(item.phase2_context_attached) if case.case_type == "boolean_context" else "N/A",
+                    _status(item.phase2_context_useful) if case.case_type == "boolean_context" else "N/A",
+                    _escape_table(item.failure_classification or "", 28),
                     f"{item.score}%",
                 ]
             )
@@ -1349,6 +1501,10 @@ def format_test_run_report(run: TestRunResult) -> str:
                 reasons.append("context not added")
             if item.case.case_type == "boolean_context" and not item.phase2_context_retrieved:
                 reasons.append("Phase 2 context not retrieved")
+            if item.case.case_type == "boolean_context" and not item.phase2_context_attached:
+                reasons.append("Phase 2 context not attached to Foundry")
+            if item.case.case_type == "boolean_context" and not item.phase2_context_useful:
+                reasons.append("Phase 2 context not useful")
             if item.case.case_type == "boolean_context" and not item.phase2_file_generated:
                 reasons.append("Phase 2 file not generated")
             if item.case.case_type == "boolean_context" and not item.phase2_target_ok:
@@ -1393,13 +1549,23 @@ def _case_state_payload(item: TestCaseResult) -> dict[str, Any]:
         "branch": item.branch_name,
         "branch_url": item.branch_url,
         "context_stored": item.context_stored,
+        "context_present_before": item.context_present_before,
+        "production_context_created": item.production_context_created,
+        "fallback_context_created": item.fallback_context_created,
+        "context_gap_detected": item.context_gap_detected,
+        "context_candidate_created": item.context_candidate_created,
+        "context_candidate_verified": item.context_candidate_verified,
+        "context_candidate_promoted": item.context_candidate_promoted,
         "phase2_context_retrieved": item.phase2_context_retrieved,
+        "phase2_context_attached": item.phase2_context_attached,
+        "phase2_context_useful": item.phase2_context_useful,
         "phase2_file_generated": item.phase2_file_generated,
         "phase2_target_ok": item.phase2_target_ok,
         "phase2_reused_without_clarification": item.phase2_reused_without_clarification,
         "bot_calls": item.bot_calls,
         "duration_ms": item.duration_ms,
         "score": item.score,
+        "failure_classification": item.failure_classification,
         "error": item.error or item.validation_error,
     }
 
@@ -1453,6 +1619,7 @@ def start_automated_test_run(core: Any, data: dict) -> tuple[dict, int]:
         return _status_report(aad_object_id, str(status_match.group(1) or "").strip())
 
     cloud_filter, count = _parse_command(prompt)
+    run_mode = _parse_test_mode(prompt)
     run_id = _new_run_id()
     owner_hash = terrabot_test_state.requester_hash(aad_object_id)
     conversation_reference = (data or {}).get("conversation_reference") or {}
@@ -1463,6 +1630,7 @@ def start_automated_test_run(core: Any, data: dict) -> tuple[dict, int]:
         "requested_cases": count,
         "completed_cases": 0,
         "cloud_filter": cloud_filter,
+        "run_mode": run_mode,
         "created_at": terrabot_test_state.utc_now(),
         "conversation_reference": conversation_reference,
     }
@@ -1473,6 +1641,7 @@ def start_automated_test_run(core: Any, data: dict) -> tuple[dict, int]:
         "aad_object_id": aad_object_id,
         "requester_hash": owner_hash,
         "cloud_filter": cloud_filter,
+        "run_mode": run_mode,
         "requested_cases": count,
         "conversation_reference": conversation_reference,
         "created_at": state["created_at"],
@@ -1499,7 +1668,7 @@ def start_automated_test_run(core: Any, data: dict) -> tuple[dict, int]:
         "reply": (
             "**Terrabot automated test run queued**\n"
             f"Run ID: `{run_id}`\n"
-            f"Cases: **{count}** | Cloud scope: **{cloud_filter}** | Parallel cases: **{_MAX_PARALLEL_CASES}**\n\n"
+            f"Cases: **{count}** | Cloud scope: **{cloud_filter}** | Mode: **{run_mode}** | Parallel cases: **{_MAX_PARALLEL_CASES}**\n\n"
             "The Teams request has completed; the queue worker will run the tests in the background "
             "and post the final table back to this conversation. Use `run tests status` to check progress."
         ),
@@ -1516,6 +1685,7 @@ def execute_automated_test_job(core: Any, job: dict) -> str:
         raise ValueError("Queued automated-test job is missing run_id.")
     _assert_authorized(aad_object_id)
     cloud_filter, count = _parse_command(prompt)
+    run_mode = str((job or {}).get("run_mode") or _parse_test_mode(prompt)).lower()
     started = time.monotonic()
     run_state = {
         "run_id": run_id,
@@ -1524,6 +1694,7 @@ def execute_automated_test_job(core: Any, job: dict) -> str:
         "requested_cases": count,
         "completed_cases": 0,
         "cloud_filter": cloud_filter,
+        "run_mode": run_mode,
         "created_at": str((job or {}).get("created_at") or terrabot_test_state.utc_now()),
         "started_at": terrabot_test_state.utc_now(),
         "conversation_reference": (job or {}).get("conversation_reference") or {},
@@ -1538,7 +1709,21 @@ def execute_automated_test_job(core: Any, job: dict) -> str:
     )
 
     try:
-        cases, discovery_errors = _derive_test_cases(core, cloud_filter, count, run_id)
+        if run_mode in {"context-regression", "mixed"}:
+            for spec in _repo_specs(core, cloud_filter):
+                try:
+                    current_sha, _ = _github_recursive_tree(core, spec)
+                    stats = terrabot_context_revalidation.revalidate_repository_context(
+                        core,
+                        repo_owner=spec.owner,
+                        repo_name=spec.repo,
+                        branch=spec.branch,
+                        current_commit_sha=current_sha,
+                    )
+                    _diag("repository_context_revalidation_completed", run_id=run_id, repo=f"{spec.owner}/{spec.repo}", **stats)
+                except Exception as exc:
+                    _diag("repository_context_revalidation_failed", level="warning", run_id=run_id, repo=f"{spec.owner}/{spec.repo}", error=exc)
+        cases, discovery_errors = _derive_test_cases(core, cloud_filter, count, run_id, run_mode=run_mode)
         result = TestRunResult(run_id=run_id, requested_cases=count, discovery_errors=discovery_errors)
         indexed_cases = list(enumerate(cases, start=1))
         completed_by_index: dict[int, TestCaseResult] = {}
@@ -1562,6 +1747,26 @@ def execute_automated_test_job(core: Any, job: dict) -> str:
                     _diag("test_case_future_failed", level="error", run_id=run_id, test_case_id=case.case_id, error=exc)
                 completed_by_index[index] = case_result
                 terrabot_test_state.save_case_result(owner_hash, run_id, index, _case_state_payload(case_result))
+                try:
+                    key = terrabot_test_coverage.coverage_key(case_result.case)
+                    existing = terrabot_test_state.load_coverage(f"{case_result.case.owner}/{case_result.case.repo}").get(key) or {}
+                    test_count = int(existing.get("test_count") or 0) + 1
+                    failure_count = int(existing.get("failure_count") or 0) + (0 if case_result.score == 100 else 1)
+                    terrabot_test_state.save_coverage(
+                        f"{case_result.case.owner}/{case_result.case.repo}",
+                        key,
+                        {
+                            "test_count": test_count,
+                            "failure_count": failure_count,
+                            "last_score": case_result.score,
+                            "last_run_id": run_id,
+                            "last_commit_sha": case_result.case.commit_sha,
+                            "last_classification": case_result.failure_classification,
+                            "updated_at": terrabot_test_state.utc_now(),
+                        },
+                    )
+                except Exception as exc:
+                    _diag("coverage_state_save_failed", level="warning", run_id=run_id, test_case_id=case_result.case.case_id, error=exc)
                 run_state["completed_cases"] = len(completed_by_index)
                 run_state["discovery_errors"] = discovery_errors
                 terrabot_test_state.save_run(run_state)

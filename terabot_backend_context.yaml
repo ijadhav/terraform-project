@@ -1,0 +1,529 @@
+# Terrabot backend context — tf-devops + tf-azure-hub
+# Generated: 2026-08-27 (refined from live repo files, not org-level guesses)
+# Purpose: Primary context for terrabot when authoring Terraform and opening PRs.
+#
+# Precedence (highest first):
+#   1. Live .tf / .tfvars / pipeline YAML in the target repo
+#   2. Repo instruction files (.github/copilot-instructions.md, .github/instructions/*.md, CLAUDE.md)
+#   3. README.md and module READMEs (often terraform-docs; can lag live sources)
+#   4. This file
+#   5. Org-wide guesses
+# If this file disagrees with live files, live files win.
+
+meta:
+  covers:
+    - venasolutions/tf-devops
+    - venasolutions/tf-azure-hub
+  default_branch: main
+  delete_branch_on_merge: true
+  merge_commit_title: PR_TITLE
+  merge_commit_message: BLANK
+  terrabot_must_not:
+    - Push directly to main
+    - Apply terraform except via existing Azure DevOps pipelines after review
+    - Perform terraform state mv/rm/import unless a human runbook was requested
+    - "Fix" legacy code to match newer conventions unless that file is already being changed
+    - Apply terraform-github .serena memories to these repos (different product)
+
+# -----------------------------------------------------------------------------
+# Context sources terrabot MUST read first (per repo)
+# -----------------------------------------------------------------------------
+read_order:
+  both_repos:
+    - .github/PULL_REQUEST_TEMPLATE.md   # org-managed from terraform-github local_file devops.md
+    - .github/CODEOWNERS
+    - .github/copilot-instructions.md
+    - .cm/gitstream.cm
+    - README.md
+  tf_devops_only:
+    - CLAUDE.md
+    - .github/instructions/terraform-modules.instructions.md   # applyTo terraform/modules/**
+    - .github/instructions/hub-environments.instructions.md    # on-demand hub/DR/sqlstaging
+    - .github/instructions/pr_template_assistance.instructions.md
+    - terraform/README.md
+    - terraform/modules/<name>/README.md when touching that module
+  tf_azure_hub_only:
+    - docs/aks.md when touching AKS/k8s.tf
+    - monitoring/dd_monitors/README.md when touching Datadog monitors
+    - .pre-commit-config.yaml
+  serena:
+    - Neither tf-devops nor tf-azure-hub currently contains .serena/
+    - terraform-github/.serena/memories/* is GitHub org/repo/team IaC only
+    - Do NOT copy terraform-github conventions (DynamoDB state lock, vena_repos/*.tf, default_branch develop) into these repos
+    - If .serena/ is added later, parse .serena/memories/ and treat as repo-specific exceptions over this file
+
+# -----------------------------------------------------------------------------
+# Shared PR / git / review (same managed PR template in both repos)
+# -----------------------------------------------------------------------------
+pr_and_git:
+  origin_of_templates:
+    - "PULL_REQUEST_TEMPLATE, gitstream.yml, .cm/gitstream.cm are managed_files from venasolutions/terraform-github"
+    - "Do not rewrite CODEOWNERS or the PR template unless the task is to change managed files in terraform-github"
+  pr_title:
+    - "JIRA key required. gitStream flags missing JIRA in branch name AND description"
+    - "Checklist in template: PR Title is [#INF-<num>] (eg., [#STO-1])"
+    - "tf-devops copilot-instructions: STO-NNNN Brief description"
+    - "pr_template_assistance: [TICKET-NUM] Brief description (e.g. STO-7741 …)"
+    - "Terrabot should use: STO-NNNN Short summary  (or [#STO-NNNN] Short summary). Put the JIRA URL as the first line of the body."
+  pr_body:
+    - Fill .github/PULL_REQUEST_TEMPLATE.md structure; do not invent a different template
+    - Sections: JIRA ticket link, Description, Why was this required?, How to test?, Deployment plan, Checklist, Risk assessment [REQUIRED]
+    - Risk assessment: default to "No to all" + label requires-review:team-only for routine Terraform
+    - Labels from template: requires-review:hotfix-process | requires-review:cab | requires-review:security | requires-review:third-party-libraries | requires-review:team-only
+    - How to test: include terraform fmt/validate/plan commands for affected env dirs or var-file sets
+    - Deployment plan: Azure DevOps pipeline apply after merge (prod/statestreet/bolt have extra ADO approval); npr/sbx may applyFromBranch
+  codeowners:
+    tf-devops: "* @venasolutions/devops-guardians-team; dns_firewall.tf also @venasolutions/information-security-team; .github/workflows and .cm @venasolutions/tooling-team"
+    tf-azure-hub: "* @venasolutions/saaseng-team; .github/workflows and .cm @venasolutions/tooling-team"
+  gitstream:
+    - LinearB AI review on non-draft PRs
+    - Optional labels: gitstream:time-to-review, gitstream:jira-check, gitstream:code-experts, gitstream:share-knowledge
+  commits:
+    - Conventional-ish is fine: feat|fix|chore|docs|ci|refactor
+    - Include JIRA id in subject or body when known
+  branches:
+    - Feature branches off main; no GitFlow develop branch in these two repos
+    - Prefer names that include the JIRA key so gitStream sees it
+
+# -----------------------------------------------------------------------------
+# tf-devops — AWS SaaS monorepo
+# -----------------------------------------------------------------------------
+tf_devops:
+  identity:
+    description: Terraform for Vena multi-tenant SaaS on AWS. No Azure workload code lives here.
+    github_actions: enabled
+    cicd: Azure DevOps Pipelines
+    terraform_pipeline_pin: "1.11.4"
+    required_version_hubs: ">= 1.11.4"
+    aws_provider_typical: "~> 5.34.0"
+    aws_provider_exception: "Some global backends pin ~> 6.21.0; copy the pin from the sibling backend.tf in that account directory, do not 'standardize' them."
+
+  accounts:
+    npr-aws-saas:
+      id: "520103559707"
+      dir: terraform/dev_aws/
+      state_bucket: venacloud-terraform-minidev
+      ado_role: arn:aws:iam::520103559707:role/vena-ado-role-520103559707
+      pipeline: azure-pipelines_dev.yml
+    prd-aws-saas:
+      id: "987100187255"
+      dir: terraform/prod_aws/
+      state_bucket: venacloud-terraform
+      ado_role: arn:aws:iam::987100187255:role/vena-ado-role-987100187255
+      pipeline: azure-pipelines_prod.yml
+    statestreet:
+      id: "652061513354"
+      dir: terraform/statestreet/
+      pipeline: azure-pipelines_prod.yml (folderListStateStreet)
+      note: Private hub; included when people say prod pipelines, excluded from casual "all hubs" unless named
+    other_account_dirs:
+      - terraform/services_aws
+      - terraform/dev_services_aws
+      - terraform/network_services
+      - terraform/logarchive
+      - terraform/ops_shared_services
+      - terraform/audit
+      - terraform/root
+      - terraform/datadog
+      - terraform/pagerduty
+
+  nomenclature:
+    hub: One end-to-end implementation of the Vena system (tier npr/prd + name like dev or us4)
+    all_hubs: Every env dir under dev_aws, prod_aws, and statestreet EXCEPT devops/global/sqlstaging/observe
+    primary_region: At least 3 AZs
+    dr: Directory suffix _dr; different region and VPC CIDR from primary
+
+  layout: |
+    terraform/
+      modules/                 # local modules only; never a registry
+      dev_aws/                 # npr hubs + bolt + global + devops + sqlstaging + observe
+      prod_aws/                # prod hubs + DR + sqlstaging* + global + devops + observe
+      statestreet/
+      ...
+    pipeline-templates/        # local ADO templates (tf-stages.yml, tf-code-checks.yml)
+    azure-pipelines_*.yml      # entrypoints: _dev, _prod, _bolt, _drift, _ops_shared_services, _logarchive_observe
+
+  environment_types:
+    vena_hub:
+      examples: [bolt, dev, minidev, us1, us2, us3, us4, eu1, eu2, eu4, ca3, statestreet]
+      required_files: [backend.tf, versions.tf, main.tf, outputs.tf]
+      optional: [s3.tf, providers in main.tf]
+      main_tf_must_open_with_locals:
+        required: [env, subdomain, region, network_base, source_account_id]
+        typical_extras: [env_dashes, sqlstaging_env, high_priority_alert_sns, low_priority_alert_sns, builds_bucket]
+      tags: "Always env + role; prod (and prod DR) set VantaNonProd = false in default_tags"
+      composition:
+        root_module: vena_datacentre via source = "../../modules/vena_datacentre"
+        approved_satellites:
+          - vena_sqlstaging_peering
+          - patch_management (usually twice: Linux + Windows)
+        anti_pattern: New standalone modules called from hub main.tf (otel_collector etc. are tech debt; do not add more)
+        new_features: Implement as terraform/modules/<name>/ then call from vena_datacentre/*.tf gated by create_* or enable_*
+    dr_hub:
+      dir_suffix: _dr
+      pass: is_dr_region = true
+      different_region_and_cidr: true
+      subdomain_suffix_example: us1-dr / bolt-dr
+      disable_cost_heavy_create_flags:
+        - create_mtserver_rds
+        - create_template_rds
+        - create_auditdb_redshift
+        - create_staging_redshift
+        - create_bucketav
+      keep: VPC, subnets, SGs, Kinesis, S3 (fast failover)
+      asg: asg_min_size = 0, asg_max_size = 0
+      never_delete_gated_resources: gate with count / create_* / is_dr_region
+    sqlstaging:
+      dirs: ["*_sqlstaging", "sqlstaging", "sqlstaging_ca", "sqlstaging_eu", "sqlstaging_eu2", "sqlstaging_eu4", "sqlstaging_us4", "sqlstaging_west"]
+      root_module: vena_sqlstaging
+      files: [backend.tf, main.tf, outputs.tf, versions.tf]
+      often_uses: data.terraform_remote_state for Route53 from tf-dns
+    global:
+      no_hub_locals_pattern: true
+      split_files:
+        - kms.tf, iam.tf, roles.tf, roles_policy.tf, policy.tf, policy_attachment.tf
+        - s3.tf, ecr.tf, acm.tf, acm_pca.tf, cdn.tf, waf.tf, sns.tf
+        - lambdas.tf, groups.tf, historian.tf, eks_roles.tf
+    devops:
+      dirs: [dev_devops, devops]
+      unique_files: [hydra.tf, peering.tf, routes.tf, security_groups.tf, lookups.tf]
+
+  actual_env_lists:
+    terraform/dev_aws:
+      - bolt
+      - bolt_dr
+      - bolt_sqlstaging
+      - dev
+      - dev_devops
+      - dev_sqlstaging
+      - global
+      - minidev
+      - minidev_sqlstaging
+      - observe
+    terraform/prod_aws:
+      - us1, us1_dr, us2, us2_dr, us3, us3_dr, us4, us4_dr
+      - eu1, eu1_dr, eu2, eu2_dr, eu4, eu4_dr
+      - ca3, ca3_dr
+      - sqlstaging, sqlstaging_ca, sqlstaging_eu, sqlstaging_eu2, sqlstaging_eu4, sqlstaging_us4, sqlstaging_west
+      - devops, global, observe
+    note_readme_drift:
+      - "Root README omits eu4 and sqlstaging_eu4; prod_aws directory and azure-pipelines_prod.yml include them. Trust directories + pipeline folderList."
+      - "Bolt is isolated on azure-pipelines_bolt.yml (STO-8969); do not add bolt folders back to azure-pipelines_dev.yml."
+
+  vena_datacentre:
+    role: Root module for every Vena hub
+    owns:
+      - VPC/subnets/SGs/routing
+      - RDS (mtserver, template)
+      - Redshift (audit, staging)
+      - ECS/Fargate/ALB
+      - Kinesis + Firehose
+      - S3, KMS, Secrets Manager, SSM
+      - Route53, CloudFront, WAF
+      - CloudWatch, Datadog integration, CloudAMQP
+    file_split_examples:
+      - vpc.tf, ecs.tf, kinesis.tf, s3.tf, kms.tf, rds_mtserver.tf, rds_template.tf, redshift.tf
+      - load_balancers.tf, cloudwatch.tf, dns_firewall.tf (CODEOWNERS: info-sec + guardians)
+    wiring_outputs:
+      - vpc_id, private_subnet_ids, private_subnet_rtbs
+      - ecs_load_balancer_listener_arn, ecs_load_balancer_dns_name, ecs_agent_role_name
+      - audit_stream_arn, s3_ss3_arn, rds_sse_arn
+    known_exceptions:
+      - "local.public_route53_role_arn is a hardcoded IAM ARN in vena_datacentre/main.tf; do not proliferate hardcoded ARNs"
+      - "vena_datacentre/versions.tf still has required_version >= 0.12; do not 'fix' unless asked"
+
+  modules:
+    path: terraform/modules/<name>
+    required_files_for_new_modules: [main.tf, vars.tf, outputs.tf, versions.tf]
+    never_name_variables_file: variables.tf
+    existing_output_filename_drift: "Some modules use output.tf (s3, security_group, tenant_to_tenant, calc_snapshot). New modules use outputs.tf. Do not rename existing files."
+    source_style: 'source = "../../modules/<name>"  # or ../../../ from nested modules'
+    never_publish_to_registry: true
+    not_all_modules_have_readmes: true
+    readme_modules_include:
+      - s3, kms, kinesis, cdn, cloudamqp, acm_pca, data_access
+      - observe_aws_source, observe_aws_collection
+      - ecs, ecs_service_load_balancer_setup
+      - cross_account_kms, cross_account_route_53
+      - ado-cloudwatch-metrics-publisher, ado-asg-termination-lifecycle
+      - patch_validation, lambdas/*
+    s3_module_defaults:
+      - versioning enabled, logging enabled, SSE required
+      - glacier/delete must be explicit (set to -1 to disable)
+    feature_flags:
+      enable_star: ECS services and app-level features
+      create_star: stateful/cost-heavy infra; default true; DR sets false
+    dr_variable: |
+      variable "is_dr_region" {
+        description = "Set to true in DR hub environments to disable non-essential CloudWatch alarms and secondary resources."
+        type        = bool
+        default     = false
+      }
+    gate_alarms: 'count = var.is_dr_region ? 0 : 1'
+    variables: every variable needs description + type; snake_case
+    kms: always encrypt S3, RDS, Kinesis, Redshift, SQS when supported
+    no_hardcoded_arns: use data.aws_sns_topic, data.aws_kms_key, data.aws_ssm_parameter, data.aws_secretsmanager_secret
+    ssm_optional: |
+      data "aws_ssm_parameter" "optional_key" {
+        count = local.feature_enabled ? 1 : 0
+        name  = "/prod/service/optional-key"
+      }
+
+  backend:
+    type: s3
+    locking: "NO DynamoDB table. Original terrabot drafts were wrong. encrypt = true only."
+    region_of_state_bucket: us-east-1   # even when the hub region is ca-central-1 / eu-*
+    key_pattern: "<env-or-folder>/terraform.tfstate"   # e.g. us1/terraform.tfstate, bolt-dr/terraform.tfstate, global/terraform.tfstate, dev2/terraform.tfstate
+    buckets:
+      npr: venacloud-terraform-minidev
+      prd: venacloud-terraform
+    template_from_live: |
+      terraform {
+        backend "s3" {
+          bucket  = "venacloud-terraform"          # or venacloud-terraform-minidev
+          key     = "<folder>/terraform.tfstate"
+          region  = "us-east-1"
+          encrypt = true
+        }
+        required_providers {
+          aws = {
+            source  = "hashicorp/aws"
+            version = "~> 5.34.0"
+          }
+        }
+      }
+    do_not_use:
+      - dynamodb_table
+      - var interpolations inside backend blocks (backends are static)
+      - invented bucket names like venadev-terraform-state-*
+
+  cicd:
+    templates: pipeline-templates/tf-stages.yml
+    ado_pipeline_templates_tag: v4.11.02
+    auth: ADO service connection + STS assume-role --external-id
+    per_folder_stages:
+      TF_Test: terraform fmt -check (docker hashicorp/terraform) + Checkov (--soft-fail)
+      TF_Plan: terraform plan after assume-role
+    applyFromBranch: true on azure-pipelines_dev.yml (npr)
+    prod_bolt: extra ADO environment approvals; bolt isolated to prevent accidental apply
+    drift: scheduled on npr (cron 30 11 * * 1-5); driftDetectionEnabled on prod/statestreet too
+    checkov_default_tf_image_in_template: "1.3.10 is the template default; pipelines override to 1.11.4 — always pass terraformVersion"
+  local_validation: |
+    cd terraform/dev_aws/dev
+    terraform get -update && terraform validate && terraform plan
+    # all env dirs in an account:
+    cd terraform/dev_aws && make
+    # bulk: terraform/plan_test.sh (init/validate/plan each subdir)
+  gitignore_exceptions:
+    - .terraform.lock.hcl is gitignored in this repo (unusual). Do not add lockfiles.
+    - lambda zip artifacts must not be committed
+
+  add_hub_workflow:
+    - Copy a sibling hub of the same tier (dev or us1), not an invented template dir (there is no terraform/templates/hub_template)
+    - New directory under terraform/<account>/
+    - Set locals; unique network_base; unique env string
+    - backend.tf with existing bucket + new key
+    - Call vena_datacentre + approved satellites only
+    - Add folder to the correct azure-pipelines_*.yml folderList (bolt -> bolt pipeline)
+    - Plan only that directory locally; attach findings in PR How to test
+  change_module_workflow:
+    - Edit terraform/modules/<name>
+    - If inputs/outputs change, update vena_datacentre (preferred) and any hub callers
+    - Plan representative npr hub (dev or minidev) plus one prod hub if the module is used in prod
+    - Call out destroy/replace in the PR
+
+# -----------------------------------------------------------------------------
+# tf-azure-hub — Azure hub ROOT MODULE (not an env-directory monorepo)
+# -----------------------------------------------------------------------------
+tf_azure_hub:
+  identity:
+    description: Single root Terraform module that deploys one Azure Vena hub per pipeline stage via tfvars. Not structured like tf-devops env directories.
+    github_actions: disabled (actions_enabled = false in terraform-github)
+    owners: saaseng-team
+    cicd: Azure DevOps using venasolutions/ado-pipeline-templates (NOT this repo's pipeline-templates/)
+    ado_pipeline_templates_ref: refs/tags/v4.11.8
+    terraform: "1.11.4 (.tool-versions; gitignored). provider.tf required_version >=1.11.4"
+    readme_drift: "Root README terraform-docs table still says terraform >=1.6.5 and stale module tags. Trust provider.tf and module source= lines."
+
+  architecture:
+    style: Root module at repo root. One apply = one hub (or DR overlay) selected by -var-file stack.
+    do_not: Create terraform/prd/us5/ directories. Hubs are var files.
+    resource_files_by_concern:
+      - main.tf          # RG, LAW, provider registration
+      - locals.tf        # aks/app-gw names, insights KV names, app_configurations merge
+      - provider.tf      # required_providers + partial azurerm backend + aliased providers
+      - variables.tf     # NOT vars.tf — this is a hard exception vs tf-devops
+      - outputs.tf, data.tf, vnet.tf, vnet_locals.tf, vnet_peering.tf
+      - k8s.tf, k8s_workload_identities.tf, aca_env.tf, aca_apps.tf
+      - app_gw.tf, waf_policy.tf, private_lb.tf, asgs.tf
+      - storage_accounts.tf, key_vault.tf, db_mysql.tf, sql_staging.tf
+      - audit.tf, api_request.tf, adf.tf, app_configuration.tf
+      - cloudamqp.tf, datadog.tf, observe_integration.tf, rbac.tf
+      - backup.tf, maintenance_configuration.tf, vmss.tf, private_dns_zones.tf
+    monitoring_stack: monitoring/dd_monitors/ is a SEPARATE terraform root with its own pipeline
+
+  var_file_layout: |
+    vars/common.tfvars                         # all hubs
+    vars/<tier>/tier.tfvars                    # sbx/npr/prd
+    vars/<tier>/<subscription>/hub.tfvars      # hub identity, CIDRs, SKU overrides
+    vars/<tier>/<subscription>/dr.tfvars       # DR overlay; applied AFTER hub.tfvars
+  tiers_and_hubs:
+    sbx: [{ name: infra, subscription: sbx-infra, region: centralus, pipeline_moduleName: infra }]
+    npr:
+      - { name: int, subscription: npr-int, region: centralus, pipeline_moduleName: int }
+      - { name: stg, subscription: npr-stg, status: pipeline_stage_commented_out }
+    prd:
+      - { name: us5, region: eastus, dr: westus }
+      - { name: us6, region: centralus, dr: eastus2 }
+      - { name: ca4, region: canadacentral, dr: canadaeast }
+      - { name: eu3, region: northeurope, dr: westeurope }
+  plan_argument_order: |
+    terraform plan \
+      -var-file=vars/common.tfvars \
+      -var-file=vars/<tier>/tier.tfvars \
+      [-var-file=vars/sbx/tier.tfvars] \   # sbx-infra also loads npr/tier.tfvars then sbx/tier.tfvars
+      -var-file=vars/<tier>/<sub>/hub.tfvars \
+      [-var-file=vars/<tier>/<sub>/dr.tfvars]
+  naming:
+    resource_group: rg-${subscription_type}-${hub_name}-${location}
+    dr_resource_group: rg-${subscription_type}-${hub_name}-dr-${dr_location}
+    vnet: vnet-${subscription_type}-${hub_name}-${location}
+    aks: aks-${subscription_type}-${hub_name}-cluster
+    law: law-${subscription_type}-${hub_name}-${location}
+  tags:
+    default: { ManagedBy: Terraform, GithubRepo: https://github.com/venasolutions/tf-azure-hub, Owner: STO }
+    vanta: VantaNonProd from var.vanta_non_prod; prd tier.tfvars sets vanta_non_prod = "false"
+    user_data: VantaContainsUserData true only when subscription_type == prd
+
+  providers:
+    azurerm_version_pin: ">=4.3.0, <4.77.0  # storage_queue + storage_use_azuread bug; do not bump past 4.77.0 until hashicorp/terraform-provider-azurerm#32617 is in a release"
+    storage_use_azuread: true on every azurerm provider
+    aliases:
+      - azurerm (hub subscription)
+      - azurerm.management_sub (ops-mgmt)
+      - azurerm.infradevops_sub (npr or prd infra-devops based on var.infra_devops)
+      - azurerm.npr_infradevops_sub (always NPR; needed for prd patch-management lookups)
+      - azurerm.insights_sub
+      - azurerm.global_sub
+    secrets: ephemeral azurerm_key_vault_secret for CloudAMQP API key; never commit secrets
+    kubernetes_helm: empty provider blocks; configured from AKS module outputs at apply time
+
+  backend:
+    in_repo: |
+      terraform {
+        backend "azurerm" {
+          use_azuread_auth = true
+        }
+      }
+    rest_injected_by_pipeline:
+      stateFileName: tf-azure-hub          # primary
+      stateFileName_dr: tf-azure-hub-dr    # DR stages
+      cloud: azure
+      tenant: venaprimary
+    do_not: Invent resource_group_name/storage_account_name/key inside backend.tf — there is no backend.tf; partial backend lives in provider.tf
+
+  modules:
+    style: External git SSH modules pinned by git tag, not relative terraform/modules/
+    pattern: |
+      #checkov:skip=CKV_TF_1: "Ensure Terraform module sources use a commit hash"
+      source = "git@github.com:venasolutions/<repo>.git?ref=vX.Y.Z"
+    live_pins_examples:  # README table is stale; copy from the calling .tf
+      tf-azure-vnet: v5.0.3
+      tf-azure-storage-account: v1.2.2
+      tf-azure-event-hub: v1.1.0
+      tf-azure-container-apps: v1.1.6
+      tf-azure-app-gateway: v2.0.5
+      tf-azure-rbac: v1.0.0
+      tf-azure-function-app: v1.0.2
+      tf-azure-apim: v1.0.2
+      tf-azure-data-factory: v1.0.2
+      tf-azure-patch-mgmt: v2.5.4
+      tf-module-azure-db-mysql-flexible: v2.0.4
+      tf-module-azure-secret: v1.0.0
+      tf-module-cloudamqp: v2.2.2
+      terraform-azurerm-loadbalancer: v1.0.1
+      Azure/aks/azurerm: "~> 11.4.0"   # registry module, not git
+    when_adding_module:
+      - Prefer existing Vena git modules over inline resources when the capability already exists
+      - Pin an existing tag used elsewhere in this repo unless the task is a module version bump
+      - Pass aliased providers { azurerm = azurerm, azurerm.management_sub = azurerm.management_sub } when the child needs them
+      - Gate with count = var.create_* && var.create_environment ? 1 : 0
+
+  feature_flags:
+    create_star: APIM, app gateway, key vault, LAW, MySQL, SQL, diagnostics, RSV, WAN hub connection, environment, kubernetes-adjacent
+    aca_app_star_enabled: per Container App
+    enable_kubernetes: master flag for AKS + AGW integration + related RBAC
+    deploy_in_dr_region: DR overlay
+  dr_pattern:
+    - Same root module; extra -var-file=.../dr.tfvars
+    - hub_name becomes e.g. us5-dr; primary_hub_name/primary_location point at primary
+    - Flip create_* to false; keep networking/storage as DR tfvars specify
+    - WEST US: ZRS unsupported — storage_account_zrs variable is reused with account_replication = LRS (do not rename the variable)
+    - npr-int DR and npr-stg stages are commented out in azure-pipelines-npr.yml; do not uncomment without an explicit request
+  aks:  # docs/aks.md
+    networking: Azure CNI Overlay; ACNS/Cilium default (aks_acns_enabled)
+    nap: opt-in (aks_nap_enabled); currently sbx-infra only
+    aks_nap_default_node_pools: None recommended so Terraform keeps named pools
+    roll_out_env_by_env: never enable NAP/ACNS globally in common.tfvars without a rollout plan
+  datadog_monitors:
+    path: monitoring/dd_monitors/
+    add_service:
+      1. New *_monitors.tf locals map
+      2. Optional templates/*.tftpl
+      3. merge() into all_monitors in hub_monitors.tf (README still says main.tf — live file is hub_monitors.tf)
+    module: git@github.com:venasolutions/tf-datadog-mac.git//terraform/modules/dd_monitors
+    pipeline: monitoring/datadog-azure-pipelines.yml (older ado-pipeline-templates v3.3.0, pr: none)
+
+  cicd:
+    npr_file: pipelines/azure-pipelines-npr.yml
+    prd_file: pipelines/azure-pipelines-prd.yml
+    stages_per_hub: azure-tf-stages-template.yml@ADOPipelineTemplates
+    code_checks: terraform/tf-code-checks-template.yml@ADOPipelineTemplates
+    npr: applyFromBranch true; drift schedule + Teams webhook
+    prd: one stage pair per hub and *_dr; combine/analyze comment stages at end
+    adding_a_hub_requires: new vars tree + new azure-tf-stages-template invocation + moduleNames entries
+    auth: Azure WIF service connections named vena-azure-sub-<tier>-<hub>-wif
+  pre_commit:
+    repo: antonbabenko/pre-commit-terraform v1.91.0
+    hooks: [terraform_fmt, terraform_docs, terraform_tflint]
+    tflint_disabled: [terraform_unused_declarations, terraform_module_version]
+    after_variable_changes: expect README.md terraform-docs refresh
+
+  add_hub_workflow:
+    - Add vars/<tier>/<sub>/hub.tfvars (copy nearest geography sibling)
+    - Unique vnet_address_space and subnet CIDRs (IPAM; cloudamqp_subnet_cidr often outside the /21)
+    - Optional dr.tfvars
+    - Wire pipeline stage (service connection, adoEnvironment, azureRegion, var-file list, stateFileName)
+    - Do not duplicate .tf resource files per hub
+  add_resource_workflow:
+    - New concern -> new <concern>.tf at repo root (or extend existing file for the same service)
+    - Add variables to variables.tf with description + type
+    - Default in variables.tf or common.tfvars; hub-specific overrides only in hub.tfvars
+    - count/for_each gated by create_* / enable_*
+    - Outputs only for values other stacks need
+    - terraform fmt; pre-commit terraform_docs
+
+# -----------------------------------------------------------------------------
+# Cross-repo alignment
+# -----------------------------------------------------------------------------
+do_not_confuse:
+  - tf-devops environments are directories; tf-azure-hub environments are tfvars + pipeline stages
+  - tf-devops modules are relative paths; tf-azure-hub modules are git:: tags (plus Azure/aks registry)
+  - tf-devops variables file is vars.tf; tf-azure-hub root is variables.tf (monitoring/dd_monitors also uses variables.tf)
+  - tf-devops state is S3 us-east-1 buckets with simple keys; Azure state is azurerm partial backend filled by ADO
+  - DynamoDB locking is terraform-github only, not these two repos
+  - Copilot instructions in tf-azure-hub are a one-liner (Azure best practices tool); all real Azure conventions are in .tf + docs/aks.md + this file
+  - "all hubs" in CLAUDE.md is AWS hubs only
+
+security:
+  - Never commit keys, tokens, PEM files, or tfvars secrets
+  - Azure: Key Vault + ephemeral data; AWS: SSM / Secrets Manager data sources
+  - Least privilege IAM/RBAC; reuse tf-azure-rbac and existing IAM modules
+  - KMS/SSE on by default
+  - Checkov runs soft-fail; still avoid introducing CKV findings in new code; use checkov:skip only with a reason matching existing comments
+
+diagnostics:
+  - terraform init backend errors: Azure needs ADO/WIF; AWS needs the venacloud-terraform* bucket and credentials. Do not create buckets from terrabot.
+  - Plan destroy/replace: annotate PR; do not apply
+  - Module version bumps: change one source pin, plan sbx/npr first
+  - State migrations: write a runbook; do not run terraform state * autonomously
