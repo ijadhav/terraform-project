@@ -1,12 +1,43 @@
 from __future__ import annotations
 import json
+import logging
 import re
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+LOGGER = logging.getLogger("terrabot.generate_handler")
+
 MAX_FILES = 120
 MAX_FILE_BYTES = 64 * 1024
+
+
+def _primary_context_for_context_pack(context_pack: Dict[str, Any]) -> Dict[str, Any]:
+    """Load the primary Terraform context relevant to a VS Code context pack.
+
+    Fail-open: returns a non-loaded result on any error so generation is never
+    blocked by missing/omitted primary context files.
+    """
+    try:
+        from shared_code import primary_context
+
+        profile = context_pack.get("repo_profile") or {}
+        workflow = context_pack.get("workflow_profile") or {}
+        clouds = profile.get("clouds") or []
+        cloud = (workflow.get("cloud") or (clouds[0] if clouds else "") or "")
+        result = primary_context.load_primary_terraform_context(
+            cloud=str(cloud or ""),
+            repo_target=str(profile.get("repo_name") or ""),
+            environment=str(workflow.get("target_environment") or ""),
+            prompt=str(context_pack.get("prompt") or ""),
+            workflow=str(workflow.get("workflow_type") or ""),
+        )
+        if result.get("loaded"):
+            primary_context.log_primary_context_loaded("vscode_generate", result)
+        return result
+    except Exception:  # pragma: no cover - defensive, fail open
+        LOGGER.debug("primary_context: vscode attach skipped", exc_info=True)
+        return {"loaded": False, "block": "", "precedence": ""}
 
 
 def _safe_relpath(value: str) -> str:
@@ -32,6 +63,9 @@ def _materialize_workspace(files: List[Dict[str, Any]], workspace_name: str = "w
 
 
 def _build_agent_prompt(prompt: str, context_pack: Dict[str, Any], follow_up: bool = False) -> str:
+    _pc = _primary_context_for_context_pack(context_pack)
+    _primary_block = _pc.get("block") or ""
+    _primary_precedence = _pc.get("precedence") or ""
     if follow_up:
         # Light envelope for follow-up turns in an existing Foundry
         # conversation: the full context_pack from earlier turns is already
@@ -58,7 +92,10 @@ def _build_agent_prompt(prompt: str, context_pack: Dict[str, Any], follow_up: bo
                 "VS CODE AWS CLONE/MIRROR CREATION: include all Terraform implementation files demonstrated by the template module (for example main.tf, vars.tf/variables.tf, outputs.tf and any additional .tf implementation files). Do not append instance-specific variables or resources into the template module directory.",
                 "VS CODE AWS CLONE/MIRROR CREATION: mirror the template consumer's input set and wiring. Source values from the current repository first; when a required NON-SENSITIVE value cannot be grounded from repository code/defaults, use a syntactically valid __FILL__<input_name>__ placeholder and add matching user_fillable metadata instead of asking the user.",
                 "VS CODE AWS CLONE/MIRROR CREATION: insert_into_block is ONLY for adding attributes inside a top-level block that already exists in the live file. A new module block, variable block, resource block, output block, or locals block must be returned as create/modify content, never as insert_into_block targeting a block that does not exist.",
+                "primary_terraform_context below is concise repo-aligned guidance and is LOWER priority than the live context_pack; if they disagree, trust the live repository files in context_pack.",
             ],
+            "primary_terraform_context": _primary_block,
+            "context_precedence": _primary_precedence,
             "context_pack": context_pack,
         }, indent=2)
 
@@ -100,7 +137,10 @@ def _build_agent_prompt(prompt: str, context_pack: Dict[str, Any], follow_up: bo
             "Never satisfy a second-instance bool-flag request with a single variables.tf change. That is incomplete and must be rejected by your own pre-return check.",
             "paths in files[] must be repo-relative, never absolute.",
             "Do not invent secrets or credentials. Add them to questions[] instead.",
+            "primary_terraform_context below is concise repo-aligned guidance and is LOWER priority than the live context_pack; if they disagree, trust the live repository files in context_pack.",
         ],
+        "primary_terraform_context": _primary_block,
+        "context_precedence": _primary_precedence,
         "context_pack": context_pack,
     }, indent=2)
 

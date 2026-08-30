@@ -14970,6 +14970,26 @@ def _build_agent_input_for_infra_base(
         "existing_pr_context": context_blocks,
     }
 
+    # Attach the primary Terraform context (concise repo-aligned guidance) as a
+    # LOWER-priority grounding layer. It never replaces the live repository
+    # evidence above; the precedence note tells the model the live repo wins.
+    try:
+        from shared_code import primary_context as _primary_context
+
+        _pc = _primary_context.load_primary_terraform_context(
+            cloud=selected_cloud,
+            workflow=workflow,
+            prompt=prompt,
+        )
+        if _pc.get("loaded"):
+            payload["primary_terraform_context"] = _pc.get("block") or ""
+            payload["context_precedence"] = _pc.get("precedence") or ""
+            _primary_context.log_primary_context_loaded(
+                "infra_agent_input", _pc, workflow=workflow
+            )
+    except Exception:
+        LOGGER.debug("primary_context: infra attach skipped", exc_info=True)
+
     return json.dumps(payload, indent=2)
 
 def store_pending_infra_change(
@@ -17647,6 +17667,25 @@ def handle_chat_request(data: dict):
     requested_cloud = data.get("cloud") or data.get("requested_cloud")
     action = (data.get("action") or "").strip().lower()
     pending_change_id = (data.get("pending_change_id") or "").strip()
+
+    # Live-test correlation: when the automated Terrabot test runner drives a
+    # case through this backend it sets run_id/case_id. Emit a single structured,
+    # secret-free line so the full pipeline for a case is traceable in the
+    # Function App logs (constructed prompt, repo/cloud, environment).
+    _test_run_id = str(data.get("run_id") or "").strip()
+    _test_case_id = str(data.get("case_id") or "").strip()
+    if _test_run_id or _test_case_id:
+        LOGGER.info(
+            "TERRABOT-TEST-CASE run_id=%s case_id=%s repo=%s cloud=%s environment=%s "
+            "action=%s constructed_prompt=%r",
+            _test_run_id or "(none)",
+            _test_case_id or "(none)",
+            str(data.get("repo_target") or data.get("repo") or "") or "(unset)",
+            str(requested_cloud or "") or "(unset)",
+            str(data.get("environment") or "") or "(unset)",
+            action or "generate",
+            str(prompt or "")[:300],
+        )
 
     requested_workflow = (data.get("workflow") or "").strip()
     retrieved_module_context = filter_backend_owned_context_list(
@@ -29108,6 +29147,22 @@ def _teams_plain_chat_reply(
         grounding = _teams_build_chat_grounding_context(
             prompt, teams_conversation_id, cloud_hint, repo_target_hint
         )
+        _chat_primary = {}
+        try:
+            from shared_code import primary_context as _primary_context
+
+            _chat_primary = _primary_context.load_primary_terraform_context(
+                cloud=str(grounding.get("cloud") or cloud_hint or ""),
+                repo_target=repo_target_hint,
+                prompt=prompt,
+            )
+            if _chat_primary.get("loaded"):
+                _primary_context.log_primary_context_loaded(
+                    "teams_chat_grounding", _chat_primary
+                )
+        except Exception:
+            LOGGER.debug("primary_context: chat attach skipped", exc_info=True)
+
         chat_input = json.dumps({
             "task": "Answer a Microsoft Teams user conversationally without generating infrastructure.",
             "user_message": prompt,
@@ -29117,10 +29172,13 @@ def _teams_plain_chat_reply(
                 "Do not reuse or summarize a previous infrastructure request unless the user explicitly asks about it.",
                 "If the message is unclear, ask one concise clarifying question.",
                 "When repository_context, pull_request_context, or agent_memory_context is provided below, use it to answer infrastructure/repository questions accurately and cite the specific file or PR you relied on. Live repository_context and pull_request_context are ground truth; agent_memory_context is a cache and must be reconciled with them, never trusted alone for current state.",
+                "primary_terraform_context is concise repo-aligned guidance and is LOWER priority than live repository_context/pull_request_context; if they disagree, trust the live repository.",
             ],
             "repository_context": grounding.get("repo_context_block") or "",
             "pull_request_context": grounding.get("pr_context_block") or "",
             "agent_memory_context": grounding.get("memory_context") or "",
+            "primary_terraform_context": _chat_primary.get("block") or "",
+            "context_precedence": _chat_primary.get("precedence") or "",
         })
         try:
             _thread, candidate = _TEAMS_MULTICLOUD_PREVIOUS_CALL_AGENT(None, chat_input)
