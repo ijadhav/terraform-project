@@ -1,3 +1,0 @@
-shared_code
-terrabot_cli
-terrabot_core

@@ -1,2 +1,0 @@
-[console_scripts]
-terrabot = terrabot_cli.main:main
