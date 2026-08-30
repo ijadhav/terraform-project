@@ -1,0 +1,5 @@
+{
+  "name": "Terrabot (repo-aware infra assistant)",
+  "user": "ubuntu",
+  "install": "./.cursor/install.sh"
+}
