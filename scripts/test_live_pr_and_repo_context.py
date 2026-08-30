@@ -22,7 +22,47 @@ from shared_code import pr_context
 from shared_code import repo_chat_context
 
 
+def run_suite() -> int:
+    """Run the automated live Terrabot test suite and print ONE aggregated result.
+
+    This reuses the same live-context framework as the smoke check below; it
+    constructs prompts from the current live Terraform in tf-devops/tf-azure-hub,
+    verifies each target at HEAD, runs each case through the real backend
+    workflow, aggregates independent per-case results, and (best effort) sends a
+    single aggregated message to the requesting user's Teams chat.
+    """
+    from shared_code import live_test_runner
+
+    summary = live_test_runner.run_suite()
+    print(summary["teams_summary"])
+
+    # Optional Teams delivery from a standalone run. Identity is never hardcoded:
+    # it is taken from the requester's own conversation reference/id supplied via
+    # environment (the Teams-triggered path uses the live turn identity instead).
+    try:
+        from shared_code import teams_bot
+
+        conversation_id = os.getenv("TERRABOT_TEST_TEAMS_CONVERSATION_ID", "").strip()
+        sender = teams_bot.send_proactive_teams_message
+        if conversation_id and callable(sender):
+            delivered = sender(conversation_id, summary["teams_summary"])
+            print(f"\nTeams delivery attempted: {delivered}")
+        else:
+            print(
+                "\nTeams delivery skipped (standalone run). Trigger 'run terrabot tests' "
+                "from Teams to receive the aggregated result in your chat, or set "
+                "TERRABOT_TEST_TEAMS_CONVERSATION_ID with bot credentials configured."
+            )
+    except Exception as exc:  # pragma: no cover - delivery is best effort
+        print(f"\nTeams delivery unavailable: {exc}")
+
+    return 0 if summary["failed"] == 0 else 1
+
+
 def main() -> None:
+    if len(sys.argv) > 1 and sys.argv[1] in {"--run-suite", "run-suite", "suite"}:
+        raise SystemExit(run_suite())
+
     prompt = sys.argv[1] if len(sys.argv) > 1 else "has anyone already added a storage account for checkout?"
     cloud = sys.argv[2] if len(sys.argv) > 2 else "azure"
 

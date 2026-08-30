@@ -1,0 +1,39 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Run Terrabot tests",
+      "type": "shell",
+      "command": "python3",
+      "args": [
+        "scripts/test_live_pr_and_repo_context.py",
+        "--run-suite"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "env": {
+          "PYTHONPATH": "${workspaceFolder}"
+        }
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      },
+      "problemMatcher": [],
+      "detail": "Run the automated live Terrabot test suite (constructs prompts from live tf-devops/tf-azure-hub, executes them through the real Terrabot backend, and posts one aggregated result to Teams)."
+    },
+    {
+      "label": "Run Terrabot unit tests",
+      "type": "shell",
+      "command": "python3",
+      "args": ["-m", "pytest", "-q"],
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "env": { "PYTHONPATH": "${workspaceFolder}" }
+      },
+      "problemMatcher": [],
+      "detail": "Run the offline pytest suite (includes primary-context and live-test-runner logic tests)."
+    }
+  ]
+}

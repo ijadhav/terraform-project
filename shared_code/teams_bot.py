@@ -68,6 +68,17 @@ RESET_CHAT_RE = re.compile(
     r"reset\s+(?:the\s+)?(?:chat|conversation|thread|session))$",
     re.I,
 )
+# Explicit developer command to run the automated live Terrabot test suite and
+# receive ONE aggregated result in this same Teams chat.
+RUN_TESTS_RE = re.compile(
+    r"^(?:please\s+)?run\s+(?:the\s+)?terrabot\s+test(?:s)?(?:\s+suite)?$",
+    re.I,
+)
+
+# Conversation references captured from inbound turns, so a later out-of-turn
+# caller (for example a standalone test-runner invocation) can deliver a single
+# proactive message to the SAME requester without hardcoding any identity.
+_CONVERSATION_REFERENCES: Dict[str, Any] = {}
 
 def _is_freeform_user_message(text: str) -> bool:
     """True for ordinary language that is not a deterministic workflow reply.
@@ -687,6 +698,66 @@ async def _send(
     )
 
 
+def _remember_conversation_reference(activity: Activity) -> None:
+    """Capture the inbound turn's ConversationReference for later proactive use.
+
+    Non-breaking and best-effort: kept in-process and mirrored into the durable
+    Teams state so ``send_proactive_teams_message`` can reach the same requester
+    from an out-of-turn context. Reused identity only — never a hardcoded one.
+    """
+    try:
+        reference = TurnContext.get_conversation_reference(activity)
+        thread_id = _get_thread_id(activity)
+        _CONVERSATION_REFERENCES[thread_id] = reference
+        try:
+            state = load_teams_conversation_state(thread_id) or {}
+            state["conversation_reference"] = (
+                reference.serialize() if hasattr(reference, "serialize") else None
+            )
+            save_teams_conversation_state(thread_id, state)
+        except Exception:
+            LOGGER.debug("conversation reference durable save skipped", exc_info=True)
+    except Exception:
+        LOGGER.debug("conversation reference capture skipped", exc_info=True)
+
+
+def send_proactive_teams_message(conversation_id: str, text: str) -> bool:
+    """Deliver ONE proactive message to a previously seen Teams conversation.
+
+    Returns True on success, False when no reference/credentials are available.
+    Never raises. Identity is the requester's own captured conversation
+    reference; nothing is hardcoded.
+    """
+    reference = _CONVERSATION_REFERENCES.get(conversation_id)
+    if reference is None:
+        try:
+            state = load_teams_conversation_state(conversation_id) or {}
+            raw = state.get("conversation_reference")
+            if raw:
+                from botbuilder.schema import ConversationReference
+
+                reference = ConversationReference().deserialize(raw)
+        except Exception:
+            reference = None
+    if reference is None:
+        LOGGER.warning(
+            "send_proactive_teams_message: no conversation reference for %s", conversation_id
+        )
+        return False
+
+    bot_app_id = _required_setting("MicrosoftAppId", "TEAMS_BOT_APP_ID")
+
+    async def _callback(turn_context: TurnContext) -> None:
+        await turn_context.send_activity(text)
+
+    try:
+        asyncio.run(ADAPTER.continue_conversation(reference, _callback, bot_app_id))
+        return True
+    except Exception:
+        LOGGER.exception("send_proactive_teams_message failed for %s", conversation_id)
+        return False
+
+
 def _remember_user_turn(state: Dict[str, Any], prompt: str) -> None:
     turns = list(state.get("recent_user_turns") or [])
     cleaned = str(prompt or "").strip()
@@ -788,6 +859,7 @@ class TerrabotTeamsBot(ActivityHandler):
         activity = turn_context.activity
         thread_id = _get_thread_id(activity)
         prompt = _strip_bot_mentions(activity)
+        _remember_conversation_reference(activity)
 
         LOGGER.info(
             "Teams message received: channel=%s conversation=%s activity=%s "
@@ -816,6 +888,35 @@ class TerrabotTeamsBot(ActivityHandler):
         set_teams_short_follow_up(_is_short_contextual_follow_up(prompt, state))
         effective_prompt = _contextual_prompt(prompt, state)
         normalized = prompt.strip().lower()
+
+        # Explicit developer command: run the automated live Terrabot test suite
+        # and return ONE aggregated result to this same chat, using the existing
+        # Teams send path and the requester's own turn identity.
+        if RUN_TESTS_RE.match(prompt.strip()):
+            requester = _get_teams_requester(activity)
+            LOGGER.info(
+                "Terrabot live test suite requested via Teams: conversation=%s requester=%s",
+                thread_id, requester,
+            )
+            await _send(
+                turn_context,
+                "Terrabot is running the live test suite against tf-devops and "
+                "tf-azure-hub. This can take a while; I will post one aggregated "
+                "result here when it finishes.",
+            )
+            try:
+                from shared_code import live_test_runner
+
+                summary = await asyncio.to_thread(live_test_runner.run_suite)
+                await _send(turn_context, summary.get("teams_summary") or "Terrabot test run produced no cases.")
+            except Exception:
+                LOGGER.exception("Terrabot live test suite failed: conversation=%s", thread_id)
+                await _send(
+                    turn_context,
+                    "Terrabot could not complete the live test suite. "
+                    "Check the Function App logs for details.",
+                )
+            return
 
         # Reset is an explicit command, not a yes/no workflow. Execute it
         # immediately so a later `no` can never be consumed as reset
