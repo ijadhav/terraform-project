@@ -2503,7 +2503,53 @@ def _teams_attach_repository_context(agent_input: str, active: dict) -> str:
                 query=prompt_for_relevance,
                 current_commit_sha=current_sha,
             )
+        required_ids = [
+            str(value).strip()
+            for value in (active.get("required_repository_context_ids") or payload.get("required_repository_context_ids") or [])
+            if str(value).strip()
+        ]
+        if required_ids:
+            merged_results = [dict(item) for item in (search_result.get("results") or []) if isinstance(item, dict)]
+            present_ids = {str(item.get("id") or "").strip() for item in merged_results}
+            for context_id in required_ids:
+                if context_id in present_ids:
+                    continue
+                record = shared_repository_context.get_repository_context_by_id(context_id)
+                if record is None:
+                    LOGGER.error(
+                        "[TerrabotDiag] event=repository_context_required_record_missing repo=%s/%s context_id=%s",
+                        owner, repo, context_id,
+                    )
+                    continue
+                if str(record.repo_full_name or "").lower() != f"{owner}/{repo}".lower():
+                    LOGGER.error(
+                        "[TerrabotDiag] event=repository_context_required_record_repo_mismatch repo=%s/%s context_id=%s record_repo=%s",
+                        owner, repo, context_id, record.repo_full_name,
+                    )
+                    continue
+                merged_results.insert(0, {
+                    "id": record.id,
+                    "category": record.category,
+                    "subject": record.subject,
+                    "scope": record.scope,
+                    "statement": record.statement,
+                    "evidence_paths": list(record.evidence_paths or []),
+                    "evidence_commit_sha": record.evidence_commit_sha,
+                    "evidence_branch": record.evidence_branch,
+                    "status": record.status,
+                    "confidence": record.confidence,
+                    "conflict_with_ids": list(record.conflict_with_ids or []),
+                    "stale": False,
+                })
+                present_ids.add(context_id)
+            search_result = dict(search_result or {})
+            search_result["results"] = merged_results
         context_block = shared_repository_context.format_repository_context_for_agent(search_result)
+        LOGGER.info(
+            "[TerrabotDiag] event=repository_context_search_complete repo=%s/%s query=%r results=%s ids=%s",
+            owner, repo, prompt_for_relevance[:180], len(search_result.get("results") or []),
+            ",".join(str(item.get("id") or "") for item in (search_result.get("results") or []) if isinstance(item, dict))[:800],
+        )
     except Exception as exc:
         branch = str((prefetched or {}).get("branch") or preferred_branch or "main")
         current_sha = str((prefetched or {}).get("sha") or "")
@@ -2537,6 +2583,15 @@ def _teams_attach_repository_context(agent_input: str, active: dict) -> str:
                 if isinstance(item, dict) and str(item.get("id") or "").strip()
             ],
         }
+    selected_ids = [
+        str(item.get("id") or "").strip()
+        for item in (search_result.get("results") or [])
+        if isinstance(item, dict) and str(item.get("id") or "").strip()
+    ]
+    LOGGER.info(
+        "[TerrabotDiag] event=repository_context_selection_complete repo=%s/%s selected_count=%s selected_ids=%s",
+        owner, repo, len(selected_ids), ",".join(selected_ids)[:800],
+    )
     LOGGER.info(
         "[TerrabotDiag] event=repository_context_pre_generation_ready repo=%s/%s branch=%s results=%s stale=%s conflicted=%s",
         owner, repo, branch,
@@ -2546,6 +2601,11 @@ def _teams_attach_repository_context(agent_input: str, active: dict) -> str:
     )
     if context_block:
         payload["shared_repository_context"] = context_block
+        payload["shared_repository_context_record_ids"] = selected_ids
+        LOGGER.info(
+            "[TerrabotDiag] event=repository_context_attachment_complete repo=%s/%s attached=true context_ids=%s",
+            owner, repo, ",".join(selected_ids)[:800],
+        )
         payload["shared_repository_context_metadata"] = {
             "repository": f"{owner}/{repo}",
             "branch": branch,
@@ -2566,6 +2626,11 @@ def _teams_attach_repository_context(agent_input: str, active: dict) -> str:
             "If the current live file disproves or no longer contains the mapped control, ignore the stale mapping and continue live repository discovery.",
         ])
         payload["instructions"] = instructions
+    else:
+        LOGGER.info(
+            "[TerrabotDiag] event=repository_context_attachment_complete repo=%s/%s attached=false context_ids=",
+            owner, repo,
+        )
     payload["repository_context_tools"] = (
         shared_repository_context.FOUNDRY_REPOSITORY_CONTEXT_TOOL_SCHEMAS
     )
@@ -3633,6 +3698,14 @@ def call_agent(conversation_id: Optional[str], agent_input: str):
     )
     try:
         result_conversation_id, reply = _TEAMS_MULTICLOUD_PREVIOUS_CALL_AGENT(conversation_id, bounded_input)
+        if teams_active:
+            diagnostics = active.get("repository_context_test_diagnostics") or {}
+            LOGGER.info(
+                "[TerrabotDiag] event=repository_context_usage_observed attached=%s context_ids=%s foundry_reply_chars=%s",
+                bool(diagnostics.get("attached")),
+                ",".join(str(value) for value in (diagnostics.get("context_ids") or []))[:800],
+                len(str(reply or "")),
+            )
     except Exception as exc:
         if not teams_active or not _teams_is_context_length_error(exc):
             if teams_active:

@@ -5969,3 +5969,12 @@ Never reverse this order by asking for an exact path/flag/module first.
 - Before returning Terraform, self-check the exact requested delta against the complete live file. For a resolved Boolean control, only that Boolean literal may change; all other bytes/lines/comments/order must remain unchanged.
 - When the backend supplies a `resolved_repository_target` or `feature_flag_match`, that target is already repository-validated. Validation must verify the requested transition and preservation; it must NOT reopen semantic ambiguity because unrelated controls also exist in the file.
 - Prefer one correct repository-grounded generation over speculative generation followed by repair. Use repair only for an actual output defect, not to rediscover a target already resolved from repository context/live code.
+
+TERRABOT ENVIRONMENT-FIRST BOOLEAN RESOLUTION (MANDATORY)
+- For requests that mean create, delete, enable, disable, turn on, or turn off an infrastructure capability in a named environment, inspect the COMPLETE live target-environment Terraform files before proposing ordinary code changes.
+- First determine whether that environment already exposes a literal Boolean control that is the repository mechanism for the requested behavior. Inspect all relevant environment values/consumer files, not only files whose names resemble the user's wording.
+- Use shared_repository_context as a semantic hint in the SAME resolution step. Every retrieved mapping must be revalidated against the current live file. When one retrieved mapping still proves one exact live path + Boolean control, use it directly.
+- A unique live Boolean control is a repository decision. Do not ask the user for the exact flag, module, path, or implementation choice when only one repository-supported control remains.
+- Before clarification, perform a second Boolean-only semantic pass across the complete environment Boolean inventory. Resolve colloquial wording, synonyms, and abbreviations from surrounding Terraform/module/resource semantics; exact lexical overlap with the flag name is not required.
+- Clarify only when two or more genuinely plausible live controls remain after repository-context revalidation and the Boolean-only semantic pass. The clarification must list the actual repository-backed choices.
+- Repository context attached by the backend is part of the Foundry input for target resolution and generation. Preserve its record IDs in diagnostic/usage metadata when supplied; never silently discard retrieved context before generation.

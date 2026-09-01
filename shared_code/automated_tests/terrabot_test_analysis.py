@@ -47,6 +47,8 @@ def classify_result(case: Any, result: Any) -> str:
     if not getattr(result, "phase2_context_retrieved", False):
         return "CONTEXT_RETRIEVAL_FAILURE"
     if not getattr(result, "phase2_context_attached", False):
+        if getattr(result, "phase2_context_retrieved", False):
+            return "CONTEXT_ATTACHMENT_BACKEND_DEFECT"
         return "CONTEXT_ATTACHMENT_FAILURE"
     if getattr(result, "phase2_clarified", False) and getattr(result, "phase2_target_ok", False):
         return "UNNECESSARY_CLARIFICATION"

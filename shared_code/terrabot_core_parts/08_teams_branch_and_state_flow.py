@@ -2039,6 +2039,11 @@ def _handle_teams_chat_request_safe(data: dict):
         # actually attached before the Foundry call.
         "test_mode": _teams_truthy(request_data.get("test_mode")),
         "automated_test_case_id": str(request_data.get("automated_test_case_id") or "").strip(),
+        "required_repository_context_ids": [
+            str(value).strip()
+            for value in (request_data.get("required_repository_context_ids") or [])
+            if str(value).strip()
+        ],
     }
     context_token = _ACTIVE_TEAMS_FLOW_CONTEXT.set(flow_context)
     try:

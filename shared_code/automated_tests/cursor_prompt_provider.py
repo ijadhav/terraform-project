@@ -23,6 +23,7 @@ from typing import Any, Callable, Iterable, Sequence
 import requests
 
 from shared_code import terraform_primary_context
+from shared_code.automated_tests import cursor_readonly_guard
 
 LOGGER = logging.getLogger("terrabot.automated_tests.cursor")
 LOGGER.setLevel(logging.INFO)
@@ -523,6 +524,7 @@ def _generate_for_group(
         "skipReviewerRequest": True,
     }
 
+    remote_before = cursor_readonly_guard.snapshot_remote_branches(create_payload["repos"])
     _emit(
         "cursor_prompt_generation_started",
         log_event=log_event,
@@ -578,7 +580,11 @@ def _generate_for_group(
         )
         git_result = terminal_run.get("git") if isinstance(terminal_run.get("git"), dict) else {}
         pushed_branches = git_result.get("branches") if isinstance(git_result, dict) else []
-        if isinstance(pushed_branches, list) and pushed_branches:
+        remote_after = cursor_readonly_guard.snapshot_remote_branches(create_payload["repos"])
+        mutations = cursor_readonly_guard.cursor_reported_remote_mutations(
+            terminal_run, remote_before, remote_after
+        )
+        if mutations:
             _emit(
                 "cursor_read_only_violation",
                 level="error",
@@ -588,11 +594,20 @@ def _generate_for_group(
                 commit_sha=commit_sha,
                 cursor_agent_id=agent_id,
                 cursor_run_id=cursor_run_id,
-                pushed_branches=json.dumps(pushed_branches, ensure_ascii=False)[:1000],
+                remote_mutations=json.dumps(mutations, ensure_ascii=False)[:1000],
             )
             raise CursorPromptError(
-                "Cursor reported a pushed branch during read-only prompt generation: "
-                + json.dumps(pushed_branches, ensure_ascii=False)[:1000]
+                "Cursor changed a verified remote GitHub branch during read-only prompt generation: "
+                + json.dumps(mutations, ensure_ascii=False)[:1000]
+            )
+        if pushed_branches and not remote_before:
+            _emit(
+                "cursor_remote_verification_unavailable",
+                level="warning",
+                log_event=log_event,
+                run_id=run_id,
+                repo=f"{owner}/{repo}",
+                reported_branches=len(pushed_branches),
             )
         parsed = _parse_result_text(result_text)
         prompts = _validated_prompts(parsed, cases, commit_sha)
@@ -742,3 +757,158 @@ def apply_cursor_generated_prompts(
             + "; ".join(str(error) for error in failures)
         )
     return output
+
+
+def resolve_repository_clarification(
+    *,
+    owner: str,
+    repo: str,
+    commit_sha: str,
+    original_prompt: str,
+    clarification_text: str,
+    candidates: Sequence[dict[str, Any]] | None = None,
+    run_id: str = "",
+    case_id: str = "",
+    session: Any | None = None,
+    log_event: Callable[..., None] | None = None,
+) -> dict[str, Any]:
+    """Ask Cursor to answer a Terrabot clarification from the pinned live repo.
+
+    The immutable expected test target is intentionally *not* supplied. Cursor
+    must inspect the repository and resolve the user's semantic request itself.
+    Structured candidates, when present, are included only as choices already
+    exposed by Terrabot. The result is an answer suitable for the same pending
+    workflow plus optional path/flag evidence for test-side verification.
+    """
+    api_key = _api_key()
+    if not api_key:
+        return {}
+    session = session or requests.Session()
+    base_url = _base_url()
+    request_timeout = _float_setting("TERRABOT_CURSOR_REQUEST_TIMEOUT_SECONDS", 30.0, 5.0, 120.0)
+    run_timeout = _float_setting("TERRABOT_CURSOR_RUN_TIMEOUT_SECONDS", 300.0, 15.0, 1800.0)
+    poll_interval = _float_setting("TERRABOT_CURSOR_POLL_INTERVAL_SECONDS", 2.0, 0.2, 30.0)
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    candidate_payload = [dict(item) for item in (candidates or []) if isinstance(item, dict)]
+    instruction = "\n".join([
+        "You are resolving one Terrabot infrastructure clarification using only the pinned repository.",
+        "This is a read-only repository-analysis task. Do not edit, commit, push, create branches, or open PRs.",
+        f"Repository: https://github.com/{owner}/{repo}",
+        f"Exact commit: {commit_sha}",
+        f"Original user request: {original_prompt}",
+        f"Terrabot clarification: {clarification_text}",
+        "Terrabot structured candidates:",
+        json.dumps(candidate_payload, ensure_ascii=False, indent=2),
+        "Inspect the complete relevant Terraform environment files and repository guidance before answering.",
+        "If exactly one live repository control implements the request, choose it without asking for a path/flag from the user.",
+        "If structured candidates exist, selected_index must refer to one of them. If none exist, selected_index must be null.",
+        "Return JSON only with: answer, selected_index, selected_path, selected_flag, reason.",
+        "The answer must be concise and directly usable as the clarification reply.",
+    ])
+    repos = [{"url": f"https://github.com/{owner}/{repo}", "startingRef": commit_sha}]
+    remote_before = cursor_readonly_guard.snapshot_remote_branches(repos)
+    create_payload = {
+        "name": f"Terrabot clarification {run_id} {case_id}"[:100],
+        "mode": "plan",
+        "prompt": {"text": instruction},
+        "repos": repos,
+        "workOnCurrentBranch": False,
+        "autoCreatePR": False,
+        "skipReviewerRequest": True,
+    }
+    try:
+        _emit(
+            "cursor_clarification_started",
+            log_event=log_event,
+            run_id=run_id,
+            test_case_id=case_id,
+            repo=f"{owner}/{repo}",
+            candidate_count=len(candidate_payload),
+        )
+        created = _http_json(
+            session,
+            "POST",
+            f"{base_url}/v1/agents",
+            headers=headers,
+            timeout=request_timeout,
+            payload=create_payload,
+        )
+        agent_id, cursor_run_id, initial_run = _extract_agent_and_run(created)
+        cursor_run_id = _resolve_run_id(
+            session, agent_id, cursor_run_id,
+            base_url=base_url, headers=headers, timeout=request_timeout,
+        )
+        result_text, terminal = _wait_for_result(
+            session, agent_id, cursor_run_id, initial_run,
+            base_url=base_url,
+            headers=headers,
+            request_timeout=request_timeout,
+            run_timeout=run_timeout,
+            poll_interval=poll_interval,
+            run_label=run_id or case_id or "clarification",
+            log_event=log_event,
+        )
+        remote_after = cursor_readonly_guard.snapshot_remote_branches(repos)
+        mutations = cursor_readonly_guard.cursor_reported_remote_mutations(
+            terminal, remote_before, remote_after
+        )
+        if mutations:
+            raise CursorPromptError(
+                "Cursor changed a verified remote GitHub branch while resolving a clarification: "
+                + json.dumps(mutations, ensure_ascii=False)[:1000]
+            )
+        parsed = _parse_result_text(result_text)
+        answer = re.sub(r"\s+", " ", str(parsed.get("answer") or "")).strip()
+        selected_path = str(parsed.get("selected_path") or "").strip().strip("/")
+        selected_flag = str(parsed.get("selected_flag") or "").strip()
+        selected_index = parsed.get("selected_index")
+        if candidate_payload and selected_index is not None:
+            try:
+                idx = int(selected_index)
+            except (TypeError, ValueError) as exc:
+                raise CursorPromptError("Cursor clarification selected_index must be an integer or null.") from exc
+            if idx < 1 or idx > len(candidate_payload):
+                raise CursorPromptError("Cursor clarification selected_index is outside the Terrabot candidate list.")
+            answer = str(candidate_payload[idx - 1].get("index") or idx)
+        if not answer:
+            if selected_flag and selected_path:
+                answer = f"Use {selected_flag} in {selected_path}."
+            elif selected_flag:
+                answer = selected_flag
+            elif selected_path:
+                answer = selected_path
+        if not answer:
+            raise CursorPromptError("Cursor clarification did not return a usable answer.")
+        result = {
+            "answer": answer,
+            "selected_index": selected_index,
+            "selected_path": selected_path,
+            "selected_flag": selected_flag,
+            "reason": re.sub(r"\s+", " ", str(parsed.get("reason") or "")).strip()[:1200],
+            "agent_id": agent_id,
+            "run_id": cursor_run_id,
+        }
+        _emit(
+            "cursor_clarification_completed",
+            log_event=log_event,
+            run_id=run_id,
+            test_case_id=case_id,
+            selected_path=selected_path,
+            selected_flag=selected_flag,
+            selected_index=selected_index,
+        )
+        return result
+    except Exception as exc:
+        _emit(
+            "cursor_clarification_failed",
+            level="warning",
+            log_event=log_event,
+            run_id=run_id,
+            test_case_id=case_id,
+            error=exc,
+        )
+        return {}

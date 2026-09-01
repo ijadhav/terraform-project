@@ -17,6 +17,8 @@ from typing import Any, Mapping, Sequence
 
 import requests
 
+from shared_code.automated_tests import cursor_readonly_guard
+
 LOGGER = logging.getLogger("terrabot.automated_tests.cursor_validation")
 LOGGER.setLevel(logging.INFO)
 
@@ -33,10 +35,17 @@ def _diag(event: str, level: str = "info", **fields: Any) -> None:
             text = text[:397] + "..."
         parts.append(f"{key}={text}")
     message = "[TerrabotCursorValidation] " + " ".join(parts)
-    if level in {"warning", "error"}:
-        LOGGER.warning(message)
-    else:
-        LOGGER.info(message)
+    # Emit each diagnostic exactly once. In Azure Functions the logging
+    # pipeline/root logger has handlers, so use structured logging. During
+    # lightweight local/unit-test execution there may be no handlers; fall
+    # back to stdout so diagnostics remain visible without triggering
+    # logging.lastResort + print duplicates for warning/error events.
+    if LOGGER.hasHandlers():
+        if level in {"warning", "error"}:
+            LOGGER.warning(message)
+        else:
+            LOGGER.info(message)
+        return
     try:
         print(message, flush=True)
     except Exception:
@@ -354,6 +363,7 @@ def validate_test_run_with_cursor(
             "Accept": "application/json",
             "User-Agent": "terrabot-cursor-validation/1.0",
         }
+        remote_before = cursor_readonly_guard.snapshot_remote_branches(repos)
         _diag(
             "cursor_validation_started",
             run_id=run_id,
@@ -420,15 +430,28 @@ def validate_test_run_with_cursor(
             raise RuntimeError(f"Cursor validation ended with status {status or '<empty>'}: {detail[:800]}")
 
         branches = ((terminal.get("git") or {}).get("branches") or [])
-        if branches:
-            branch_names = ", ".join(
-                str(item.get("branch") or item.get("repoUrl") or "")
-                for item in branches
-                if isinstance(item, Mapping)
-            )
+        remote_after = cursor_readonly_guard.snapshot_remote_branches(repos)
+        mutations = cursor_readonly_guard.cursor_reported_remote_mutations(
+            terminal, remote_before, remote_after
+        )
+        if mutations:
             raise RuntimeError(
-                "Cursor read-only validation reported a pushed branch; verdict rejected: "
-                + (branch_names or "unknown branch")
+                "Cursor read-only validation changed a verified remote GitHub branch; verdict rejected: "
+                + json.dumps(mutations, ensure_ascii=False)[:1200]
+            )
+        if branches and not remote_before:
+            _diag(
+                "cursor_validation_remote_verification_unavailable",
+                level="warning",
+                run_id=run_id,
+                reported_branches=len(branches),
+                reason="GitHub branch snapshot unavailable; Cursor branch metadata alone is not treated as a push.",
+            )
+        elif branches:
+            _diag(
+                "cursor_validation_branch_metadata_verified_read_only",
+                run_id=run_id,
+                reported_branches=len(branches),
             )
 
         assistant_result = str(terminal.get("result") or "")
@@ -469,7 +492,7 @@ def validate_test_run_with_cursor(
     except Exception as exc:
         duration_ms = int((time.monotonic() - started) * 1000)
         error = re.sub(r"\s+", " ", str(exc)).strip()[:1600]
-        event = "cursor_validation_read_only_violation" if "pushed branch" in error.lower() else "cursor_validation_failed"
+        event = "cursor_validation_read_only_violation" if "remote github branch" in error.lower() else "cursor_validation_failed"
         _diag(event, level="error", run_id=run_id, agent_id=base.get("agent_id"), error=error)
         return {**base, "duration_ms": duration_ms, "error": error}
 

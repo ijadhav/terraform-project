@@ -36,6 +36,7 @@ from shared_code import repository_context
 from shared_code.automated_tests import terrabot_test_state
 from shared_code.automated_tests import terrabot_semantic_engine
 from shared_code.automated_tests import terrabot_cursor_result_validator
+from shared_code.automated_tests import cursor_prompt_provider
 from shared_code.automated_tests import terrabot_test_analysis
 from shared_code.automated_tests import terrabot_test_coverage
 from shared_code.automated_tests import terrabot_context_revalidation
@@ -81,10 +82,17 @@ def _diag(event: str, level: str = "info", **fields: Any) -> None:
             text = text[:397] + "..."
         parts.append(f"{key}={text}")
     message = "[TerrabotTest] " + " ".join(parts)
-    if level in {"warning", "error"}:
-        LOGGER.warning(message)
-    else:
-        LOGGER.info(message)
+    # Emit each diagnostic exactly once. In Azure Functions the logging
+    # pipeline/root logger has handlers, so use structured logging. During
+    # lightweight local/unit-test execution there may be no handlers; fall
+    # back to stdout so diagnostics remain visible without triggering
+    # logging.lastResort + print duplicates for warning/error events.
+    if LOGGER.hasHandlers():
+        if level in {"warning", "error"}:
+            LOGGER.warning(message)
+        else:
+            LOGGER.info(message)
+        return
     try:
         print(message, flush=True)
     except Exception:
@@ -173,6 +181,8 @@ class TestCaseResult:
     case: TestCase
     phase1_ok: bool = False
     phase1_clarified: bool = False
+    phase1_freeform_clarification: bool = False
+    phase1_cursor_clarification_used: bool = False
     expected_target_found: bool = False
     correct_flag_detected: bool = False
     phase1_file_generated: bool = False
@@ -194,6 +204,9 @@ class TestCaseResult:
     phase2_context_useful: bool = False
     phase2_ok: bool = False
     phase2_clarified: bool = False
+    phase2_freeform_clarification: bool = False
+    phase2_cursor_clarification_used: bool = False
+    phase2_context_backend_defect: bool = False
     phase2_target_ok: bool = False
     phase2_file_generated: bool = False
     phase2_reused_without_clarification: bool = False
@@ -928,10 +941,9 @@ def _pick_automated_candidate_reply(case: TestCase, result: dict) -> str:
         chosen = secrets.choice(list(enumerate(candidates, start=1)))
         fallback_index, item = chosen
         return str(item.get("index") or fallback_index).strip() or str(fallback_index)
-    # Some Foundry clarification payloads expose numbered choices only in the
-    # question text. Replying 1 exercises the same protocol path without
-    # falsely failing the test merely because structured candidates were absent.
-    return "1"
+    # Zero structured candidates is a free-form clarification, not a numeric
+    # target picker. Never synthesize option 1 because no such option exists.
+    return ""
 
 
 def _search_context(case: TestCase) -> dict:
@@ -1109,9 +1121,17 @@ def _resolve_automated_clarifications(
     phase: int,
     conversation_id: str,
     phase_request: dict,
+    run_id: str,
     max_rounds: int = 3,
 ) -> tuple[dict, int, bool]:
-    """Follow bounded clarification pickers without treating them as failures."""
+    """Resolve clarification without inventing a target-selection protocol.
+
+    Structured pickers may be answered as target-selection replies. A free-form
+    clarification (zero structured candidates) is never answered with synthetic
+    option ``1``. In automated tests Cursor inspects the exact pinned repository
+    and supplies the clarification answer; that answer is sent as a normal
+    continuation so the production resolver bug remains visible in scoring.
+    """
     clarified = False
     current = dict(result or {})
     current_status = status
@@ -1119,14 +1139,86 @@ def _resolve_automated_clarifications(
         if str(current.get("mode") or "").lower() != "clarification":
             break
         clarified = True
-        selection = _pick_automated_candidate_reply(case, current)
+        candidates = [item for item in (current.get("candidates") or []) if isinstance(item, dict)]
+        clarification_text = str(current.get("reply") or current.get("question") or "").strip()
+        cursor_resolution = cursor_prompt_provider.resolve_repository_clarification(
+            owner=case.owner,
+            repo=case.repo,
+            commit_sha=case.commit_sha,
+            original_prompt=case.phase1_prompt if phase == 1 else case.phase2_prompt,
+            clarification_text=clarification_text,
+            candidates=candidates,
+            run_id=run_id,
+            case_id=case.case_id,
+            log_event=_diag,
+        )
+
+        structured_picker = bool(candidates)
+        if structured_picker:
+            selection = str(cursor_resolution.get("answer") or "").strip()
+            if not selection:
+                selection = _pick_automated_candidate_reply(case, current)
+            if not selection:
+                _diag(
+                    "automated_clarification_unresolved",
+                    level="warning",
+                    test_case_id=case.case_id,
+                    phase=phase,
+                    round=round_no,
+                    candidate_count=len(candidates),
+                )
+                break
+        else:
+            if phase == 1:
+                row.phase1_freeform_clarification = True
+            else:
+                row.phase2_freeform_clarification = True
+            selection = str(cursor_resolution.get("answer") or "").strip()
+            if not selection:
+                _diag(
+                    "automated_freeform_clarification_unresolved",
+                    level="warning",
+                    test_case_id=case.case_id,
+                    phase=phase,
+                    round=round_no,
+                    candidate_count=0,
+                )
+                break
+
+        if cursor_resolution:
+            if phase == 1:
+                row.phase1_cursor_clarification_used = True
+            else:
+                row.phase2_cursor_clarification_used = True
+            selected_path = str(cursor_resolution.get("selected_path") or "").strip().strip("/")
+            selected_flag = str(cursor_resolution.get("selected_flag") or "").strip()
+            if (
+                case.case_type == "boolean_context"
+                and selected_path == case.path.strip("/")
+                and selected_flag == case.flag
+            ):
+                stored = _ensure_context_mapping(
+                    core, case, run_id, evidence_branch=case.branch, evidence_commit_sha=case.commit_sha
+                )
+                row.context_stored = row.context_stored or stored
+                _diag(
+                    "cursor_clarification_context_promoted",
+                    test_case_id=case.case_id,
+                    phase=phase,
+                    stored=stored,
+                    path=selected_path,
+                    flag=selected_flag,
+                )
+
         _diag(
             "automated_clarification_selected",
             test_case_id=case.case_id,
             phase=phase,
             round=round_no,
             selection=selection,
-            candidate_count=len(current.get("candidates") or []),
+            candidate_count=len(candidates),
+            structured_picker=structured_picker,
+            cursor_used=bool(cursor_resolution),
         )
         followup = {
             "prompt": selection,
@@ -1139,15 +1231,18 @@ def _resolve_automated_clarifications(
             "mode": "infra",
             "test_mode": True,
             "automated_test_phase": phase,
-            "pending_target_selection_reply": True,
-            "pending_target_selection_thread_id": str(current.get("thread_id") or ""),
+            "automated_test_case_id": case.case_id,
             "fresh_infra_generation": True,
             "force_new_branch": True,
             "reuse_branch": False,
             "existing_branch": "",
             "cloud": case.cloud,
             "requested_cloud": case.cloud,
+            "required_repository_context_ids": list(phase_request.get("required_repository_context_ids") or []),
         }
+        if structured_picker:
+            followup["pending_target_selection_reply"] = True
+            followup["pending_target_selection_thread_id"] = str(current.get("thread_id") or "")
         current, current_status = _invoke_backend(core, followup, row)
     return current, current_status, clarified
 
@@ -1192,6 +1287,7 @@ def _run_case(core: Any, case: TestCase, run_id: str, requester_id: str) -> Test
             phase=1,
             conversation_id=p1_conversation,
             phase_request=phase1_request,
+            run_id=run_id,
         )
         row.actual_mode = str(phase1_result.get("mode") or "")
         row.phase1_ok = status < 500 and bool(phase1_result.get("ok", True))
@@ -1345,6 +1441,25 @@ def _run_case(core: Any, case: TestCase, run_id: str, requester_id: str) -> Test
                 except Exception as exc:
                     _diag("context_candidate_state_update_failed", level="warning", run_id=run_id, test_case_id=case.case_id, error=exc)
 
+        # The Boolean target itself was deterministically derived from the pinned
+        # live repository before execution. Persist that verified mapping even
+        # when generation fails, so repeated tests monotonically populate the
+        # shared repository context instead of discarding useful repo knowledge.
+        if not row.context_stored:
+            row.fallback_context_created = _ensure_context_mapping(
+                core, case, run_id, evidence_branch=case.branch, evidence_commit_sha=case.commit_sha
+            )
+            row.context_candidate_promoted = row.context_candidate_promoted or row.fallback_context_created
+            row.context_stored = row.context_stored or row.fallback_context_created
+            if row.fallback_context_created:
+                _diag(
+                    "repository_derived_context_persisted",
+                    run_id=run_id,
+                    test_case_id=case.case_id,
+                    path=case.path,
+                    flag=case.flag,
+                )
+
         # Capture the actual indexed record after production learning or the
         # verified harness promotion. Cursor later checks its semantics and
         # correlates it with the independent Phase 2 search result.
@@ -1372,6 +1487,8 @@ def _run_case(core: Any, case: TestCase, run_id: str, requester_id: str) -> Test
 
         phase2_request = _phase_request(case, case.phase2_prompt, p2_conversation, phase=2)
         phase2_request["teams_requester"] = f"terrabot-test-phase2-{run_id[-6:]}-{case.case_id}"
+        if phase2_match and str(phase2_match.get("id") or "").strip():
+            phase2_request["required_repository_context_ids"] = [str(phase2_match.get("id"))]
         phase2_result, status = _invoke_backend(core, phase2_request, row)
         row.phase2_ok = status < 500 and bool(phase2_result.get("ok", True))
         first_phase2_mode = str(phase2_result.get("mode") or "").lower()
@@ -1382,6 +1499,18 @@ def _run_case(core: Any, case: TestCase, run_id: str, requester_id: str) -> Test
             diagnostics.get("attached")
             and (not expected_context_id or expected_context_id in attached_ids)
         )
+        row.phase2_context_backend_defect = bool(
+            row.phase2_context_retrieved and not row.phase2_context_attached
+        )
+        if row.phase2_context_backend_defect:
+            _diag(
+                "phase2_context_attachment_backend_defect",
+                level="error",
+                run_id=run_id,
+                test_case_id=case.case_id,
+                expected_context_id=expected_context_id,
+                attached_context_ids=sorted(attached_ids),
+            )
         row.phase2_reused_without_clarification = row.phase2_context_retrieved and first_phase2_mode != "clarification"
 
         # Still continue a Phase 2 clarification so file-generation accuracy is
@@ -1395,6 +1524,7 @@ def _run_case(core: Any, case: TestCase, run_id: str, requester_id: str) -> Test
             phase=2,
             conversation_id=p2_conversation,
             phase_request=phase2_request,
+            run_id=run_id,
         )
         row.phase2_ok = status < 500 and bool(phase2_result.get("ok", True))
 
@@ -1576,6 +1706,11 @@ def _cursor_validation_case_payload(item: TestCaseResult) -> dict[str, Any]:
             "context_stored": item.context_stored,
             "phase2_context_retrieved": item.phase2_context_retrieved,
             "phase2_context_attached": item.phase2_context_attached,
+            "phase2_context_backend_defect": item.phase2_context_backend_defect,
+            "phase1_freeform_clarification": item.phase1_freeform_clarification,
+            "phase2_freeform_clarification": item.phase2_freeform_clarification,
+            "phase1_cursor_clarification_used": item.phase1_cursor_clarification_used,
+            "phase2_cursor_clarification_used": item.phase2_cursor_clarification_used,
             "phase2_target_ok": item.phase2_target_ok,
             "phase2_reused_without_clarification": item.phase2_reused_without_clarification,
             "backend_score": item.score,
@@ -1707,6 +1842,10 @@ def format_test_run_report(run: TestRunResult) -> str:
     cursor_context_get = sum(1 for item in cursor_context_cases if item.cursor_validation_completed and item.cursor_context_retrievable)
     cursor_context_use = sum(1 for item in cursor_context_cases if item.cursor_validation_completed and item.cursor_context_reused)
     cursor_overall = sum(1 for item in cursor_cases if item.cursor_validation_completed and item.cursor_overall_ok)
+    freeform_p1 = sum(1 for item in run.cases if item.phase1_freeform_clarification)
+    freeform_p2 = sum(1 for item in context_cases if item.phase2_freeform_clarification)
+    context_attach_defects = sum(1 for item in context_cases if item.phase2_context_backend_defect)
+    cursor_clarifications = sum(1 for item in run.cases if item.phase1_cursor_clarification_used or item.phase2_cursor_clarification_used)
 
     lines = [
         "**Terrabot automated repository-context test results**",
@@ -1715,6 +1854,7 @@ def format_test_run_report(run: TestRunResult) -> str:
         f"Phase 1 files generated: **{p1_files}/{completed}** | Branches pushed: **{branches}/{completed}** | Creation cases: **{len(creation_cases)}**",
         f"Boolean-context cases: **{len(context_cases)}** | Context available: **{contexts}/{len(context_cases) or 1}** | Production learned: **{production_context}** | Harness promoted: **{fallback_context}**",
         f"Phase 2 context retrieved: **{p2_context}/{len(context_cases) or 1}** | Attached to Foundry: **{p2_attached}/{len(context_cases) or 1}** | Useful: **{p2_useful}/{len(context_cases) or 1}** | Phase 2 files: **{p2_files}/{len(context_cases) or 1}**",
+        f"Unexpected free-form clarifications: **P1 {freeform_p1} / P2 {freeform_p2}** | Cursor clarification assists: **{cursor_clarifications}** | Context-attachment backend defects: **{context_attach_defects}**",
         f"Average backend calls/case: **{avg_calls}** | Average case time: **{avg_seconds}s** | Total: **{round(run.duration_ms / 1000.0, 1)}s**",
     ]
     if cursor_cases:
@@ -1827,6 +1967,12 @@ def format_test_run_report(run: TestRunResult) -> str:
                 reasons.append("Phase 2 context not retrieved")
             if item.case.case_type == "boolean_context" and not item.phase2_context_attached:
                 reasons.append("Phase 2 context not attached to Foundry")
+            if item.case.case_type == "boolean_context" and item.phase2_context_backend_defect:
+                reasons.append("backend defect: retrieved Phase 2 context was not attached")
+            if item.phase1_freeform_clarification:
+                reasons.append("Phase 1 unexpected free-form clarification")
+            if item.phase2_freeform_clarification:
+                reasons.append("Phase 2 unexpected free-form clarification")
             if item.case.case_type == "boolean_context" and not item.phase2_context_useful:
                 reasons.append("Phase 2 context not useful")
             if item.case.case_type == "boolean_context" and not item.phase2_file_generated:

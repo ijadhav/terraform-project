@@ -142,7 +142,27 @@ class CursorResultValidatorTests(unittest.TestCase):
             "https://cursor.example/v1/agents/bc-test-agent/runs/run-cursor-1",
         )
 
-    def test_rejects_any_cursor_pushed_branch(self):
+    def test_allows_cursor_branch_metadata_when_remote_is_unchanged(self):
+        client = FakeHttpClient(finished_payload(branches=[{
+            "repoUrl": "github.com/venasolutions/tf-devops",
+            "branch": "cursor/internal-plan-branch",
+        }]))
+        env = {
+            "TERRABOT_TEST_CURSOR_RESULT_VALIDATION_ENABLED": "true",
+            "TERRABOT_CURSOR_API_KEY": "test-key",
+        }
+        snapshot = {"https://github.com/venasolutions/tf-devops": {"main": "abc123"}}
+        with patch.dict(os.environ, env, clear=False), patch.object(
+            validator.cursor_readonly_guard, "snapshot_remote_branches", side_effect=[snapshot, snapshot]
+        ):
+            result = validator.validate_test_run_with_cursor(
+                run_id="ctx-test",
+                cases=[boolean_case_payload()],
+                http_client=client,
+            )
+        self.assertTrue(result["completed"])
+
+    def test_rejects_verified_remote_cursor_branch_mutation(self):
         client = FakeHttpClient(finished_payload(branches=[{
             "repoUrl": "github.com/venasolutions/tf-devops",
             "branch": "cursor/unexpected-write",
@@ -151,14 +171,18 @@ class CursorResultValidatorTests(unittest.TestCase):
             "TERRABOT_TEST_CURSOR_RESULT_VALIDATION_ENABLED": "true",
             "TERRABOT_CURSOR_API_KEY": "test-key",
         }
-        with patch.dict(os.environ, env, clear=False):
+        before = {"https://github.com/venasolutions/tf-devops": {"main": "abc123"}}
+        after = {"https://github.com/venasolutions/tf-devops": {"main": "abc123", "cursor/unexpected-write": "def456"}}
+        with patch.dict(os.environ, env, clear=False), patch.object(
+            validator.cursor_readonly_guard, "snapshot_remote_branches", side_effect=[before, after]
+        ):
             result = validator.validate_test_run_with_cursor(
                 run_id="ctx-test",
                 cases=[boolean_case_payload()],
                 http_client=client,
             )
         self.assertFalse(result["completed"])
-        self.assertIn("pushed branch", result["error"].lower())
+        self.assertIn("remote github branch", result["error"].lower())
         self.assertEqual(result["case_results"], {})
 
     def test_rejects_incomplete_or_wrong_schema_verdict(self):
