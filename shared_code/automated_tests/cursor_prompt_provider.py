@@ -32,6 +32,7 @@ _TRUE_VALUES = {"1", "true", "yes", "on"}
 _SUCCESS_STATUSES = {"FINISHED", "COMPLETED", "SUCCEEDED", "SUCCESS"}
 _FAILURE_STATUSES = {"ERROR", "FAILED", "CANCELLED", "CANCELED", "EXPIRED"}
 _SCHEMA_VERSION = "terrabot.cursor.test-prompts.v1"
+_CLARIFICATION_SCHEMA_VERSION = "terrabot.cursor.clarification.v1"
 
 
 class CursorPromptError(RuntimeError):
@@ -782,6 +783,15 @@ def resolve_repository_clarification(
     """
     api_key = _api_key()
     if not api_key:
+        _emit(
+            "cursor_clarification_configuration_missing",
+            level="warning",
+            log_event=log_event,
+            run_id=run_id,
+            test_case_id=case_id,
+            repo=f"{owner}/{repo}",
+            reason="TERRABOT_CURSOR_API_KEY/CURSOR_API_KEY is not configured",
+        )
         return {}
     session = session or requests.Session()
     base_url = _base_url()
@@ -804,10 +814,13 @@ def resolve_repository_clarification(
         "Terrabot structured candidates:",
         json.dumps(candidate_payload, ensure_ascii=False, indent=2),
         "Inspect the complete relevant Terraform environment files and repository guidance before answering.",
-        "If exactly one live repository control implements the request, choose it without asking for a path/flag from the user.",
-        "If structured candidates exist, selected_index must refer to one of them. If none exist, selected_index must be null.",
-        "Return JSON only with: answer, selected_index, selected_path, selected_flag, reason.",
-        "The answer must be concise and directly usable as the clarification reply.",
+        "Evaluate Terrabot's structured candidates for semantic relevance before choosing one.",
+        "Do not choose a candidate merely because it is offered. If every supplied candidate is unrelated to the requested resource/behavior, reject the candidate list and independently identify the correct live repository control.",
+        "If exactly one supplied candidate is genuinely correct, set resolution_type=candidate, candidates_relevant=true, and selected_index to its 1-based position.",
+        "If the supplied candidates are all unrelated but exactly one live repository control implements the request, set resolution_type=repository_control, candidates_relevant=false, selected_index=null, and return that exact selected_path and selected_flag.",
+        "If no unique repository-grounded control can be determined, set resolution_type=unresolved and selected_index=null.",
+        f"Return JSON only with schema_version={_CLARIFICATION_SCHEMA_VERSION} and keys: schema_version, answer, resolution_type, candidates_relevant, selected_index, selected_path, selected_flag, reason.",
+        "The answer must be concise and directly usable as the clarification reply. Never invent a path or flag.",
     ])
     repos = [{"url": f"https://github.com/{owner}/{repo}", "startingRef": commit_sha}]
     remote_before = cursor_readonly_guard.snapshot_remote_branches(repos)
@@ -862,29 +875,64 @@ def resolve_repository_clarification(
                 + json.dumps(mutations, ensure_ascii=False)[:1000]
             )
         parsed = _parse_result_text(result_text)
+        schema_version = str(parsed.get("schema_version") or "").strip()
+        if schema_version != _CLARIFICATION_SCHEMA_VERSION:
+            raise CursorPromptError(
+                f"Cursor clarification schema_version must be {_CLARIFICATION_SCHEMA_VERSION}."
+            )
         answer = re.sub(r"\s+", " ", str(parsed.get("answer") or "")).strip()
+        resolution_type = str(parsed.get("resolution_type") or "").strip().lower()
+        if resolution_type not in {"candidate", "repository_control", "unresolved"}:
+            raise CursorPromptError("Cursor clarification resolution_type is invalid.")
+        candidates_relevant = parsed.get("candidates_relevant")
+        if not isinstance(candidates_relevant, bool):
+            raise CursorPromptError("Cursor clarification candidates_relevant must be Boolean.")
         selected_path = str(parsed.get("selected_path") or "").strip().strip("/")
         selected_flag = str(parsed.get("selected_flag") or "").strip()
         selected_index = parsed.get("selected_index")
-        if candidate_payload and selected_index is not None:
+        use_structured_picker = False
+        if resolution_type == "candidate":
+            if not candidate_payload or not candidates_relevant:
+                raise CursorPromptError("Cursor selected candidate resolution without a relevant candidate list.")
             try:
                 idx = int(selected_index)
             except (TypeError, ValueError) as exc:
-                raise CursorPromptError("Cursor clarification selected_index must be an integer or null.") from exc
+                raise CursorPromptError("Cursor clarification selected_index must be an integer for candidate resolution.") from exc
             if idx < 1 or idx > len(candidate_payload):
                 raise CursorPromptError("Cursor clarification selected_index is outside the Terrabot candidate list.")
-            answer = str(candidate_payload[idx - 1].get("index") or idx)
-        if not answer:
-            if selected_flag and selected_path:
-                answer = f"Use {selected_flag} in {selected_path}."
-            elif selected_flag:
-                answer = selected_flag
-            elif selected_path:
-                answer = selected_path
-        if not answer:
+            chosen = candidate_payload[idx - 1]
+            chosen_path = str(chosen.get("path") or "").strip().strip("/")
+            chosen_flag = str(chosen.get("flag") or "").strip()
+            if selected_path and chosen_path and selected_path != chosen_path:
+                raise CursorPromptError("Cursor clarification selected_path disagrees with the selected Terrabot candidate.")
+            if selected_flag and chosen_flag and selected_flag != chosen_flag:
+                raise CursorPromptError("Cursor clarification selected_flag disagrees with the selected Terrabot candidate.")
+            selected_path = selected_path or chosen_path
+            selected_flag = selected_flag or chosen_flag
+            answer = str(chosen.get("index") or idx)
+            selected_index = idx
+            use_structured_picker = True
+        elif resolution_type == "repository_control":
+            if selected_index is not None:
+                raise CursorPromptError("Cursor repository_control resolution must return selected_index=null.")
+            if not selected_path or not selected_flag:
+                raise CursorPromptError("Cursor repository_control resolution requires selected_path and selected_flag.")
+            if candidates_relevant and candidate_payload:
+                raise CursorPromptError("Cursor repository_control resolution cannot mark unrelated supplied candidates as relevant.")
+            answer = answer or f"Use {selected_flag} in {selected_path}."
+        else:
+            selected_index = None
+            selected_path = ""
+            selected_flag = ""
+            answer = ""
+
+        if resolution_type != "unresolved" and not answer:
             raise CursorPromptError("Cursor clarification did not return a usable answer.")
         result = {
             "answer": answer,
+            "resolution_type": resolution_type,
+            "candidates_relevant": candidates_relevant,
+            "use_structured_picker": use_structured_picker,
             "selected_index": selected_index,
             "selected_path": selected_path,
             "selected_flag": selected_flag,
@@ -900,6 +948,9 @@ def resolve_repository_clarification(
             selected_path=selected_path,
             selected_flag=selected_flag,
             selected_index=selected_index,
+            resolution_type=resolution_type,
+            candidates_relevant=candidates_relevant,
+            use_structured_picker=use_structured_picker,
         )
         return result
     except Exception as exc:

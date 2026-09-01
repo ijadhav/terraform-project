@@ -1,2773 +1,2577 @@
+"""Repository-derived automated tests for the Terrabot Teams workflow.
+
+This module is deliberately isolated from ``teams_bot.py`` and the stateful
+Terrabot service core.  The public adapter accepts the already-loaded core
+module and exercises the same production Teams backend entrypoint without
+creating pull requests. Phase 1 intentionally pushes validated changes to isolated test branches.
+
+The workflow is intentionally two phase:
+
+1. Derive a deterministic Boolean-control test case from live GitHub, submit a
+   natural-language prompt through the real Teams backend, automatically answer
+   a repository target clarification when one is required, run the existing
+   deterministic pre-commit validators without writing to GitHub, and ensure a
+   validated repository-context mapping exists.
+2. Start a fresh synthetic Teams conversation and submit a paraphrase.  The
+   test passes the context-reuse assertion only when the stored repository
+   context can be retrieved and Terrabot resolves the target without another
+   clarification.
+
+Validated Phase 1 Terraform is committed to an isolated Terrabot test branch so branch transport and post-commit context learning are tested. Phase 2 uses a fresh synthetic conversation and does not create a second branch. The runner never creates a pull request.
+"""
 from __future__ import annotations
-from typing import TYPE_CHECKING , Any, Optional
 
-if TYPE_CHECKING:
-    from shared_code.terrabot_core_typing import (
-        AGENT_NAME,
-        AWS_MODULES_ROOT,
-        INFRA_MODIFICATION_WORKFLOWS,
-        LOGGER,
-        _ACTIVE_TEAMS_FLOW_CONTEXT,
-        _TEAMS_FLAG_VALUES_BASENAME_PRIORITY,
-        _aws_consumer_files_from_agent_result,
-        _extract_aws_module_source_refs_from_text,
-        _extract_root_variable_names,
-        _extract_top_level_hcl_assignment_names,
-        _extract_top_level_tf_blocks,
-        _find_balanced_curly_end,
-        _get_azure_consumer_routing_context,
-        _get_backend_existing_infra_context,
-        _get_verified_azure_module_source_url,
-        _has_git_conflict_markers,
-        _iter_variable_blocks_with_names,
-        _repository_context_branch_and_sha,
-        _repository_context_completed_task_payload,
-        _repository_context_evidence_excerpt,
-        _repository_context_repo_identity,
-        _repository_context_vague_resource_phrase,
-        _sanitize_aws_module_rel_path,
-        _teams_auto_select_feature_flag_context_stage1,
-        _teams_candidate_friendly_label,
-        _teams_diag_log,
-        _teams_environment_folder_evidence,
-        _teams_feature_flag_intent,
-        _teams_is_existing_invocation_creation,
-        _teams_remote_context_branch,
-        _teams_repository_context_live_files,
-        _teams_save_ui_state,
-        _teams_target_environment_main_tf_evidence,
-        _top_level_tf_block_matches,
-        _top_level_tf_headers_for_modification,
-        _validate_full_file_modification_preserves_existing,
-        _validate_hcl_content_complete,
-        _variable_attr_present,
-        add_repository_context,
-        call_named_agent,
-        extract_json_from_text,
-        github_get_file_content,
-        github_get_file_content_by_repo,
-        github_put_file,
-        hashlib,
-        json,
-        load_teams_conversation_state,
-        normalize_agent_relative_tf_path,
-        normalize_cloud,
-        normalize_iac_relative_path,
-        normalize_repo_target,
-        normalize_tf_relative_path,
-        normalize_yes_no_reply,
-        persist_teams_workflow_state,
-        re,
-        restore_teams_workflow_state,
-        safe_normalize_cloud,
-        shared_repository_context,
-    )
+import concurrent.futures
+import hashlib
+import logging
+import os
+import re
+import secrets
+import time
+import uuid
+from dataclasses import dataclass, field
+from typing import Any, Callable, Iterable
 
-def _terrabot_placeholder_content_detected(content: str) -> bool:
-    text = str(content or "").lower()
-    markers = (
-        "<existing content preserved as in evidence>",
-        "existing content preserved as in evidence",
-        "<existing content preserved>",
-        "existing content unchanged",
-        "... existing content ...",
-        "# existing content preserved",
-    )
-    return any(marker in text for marker in markers)
+from shared_code import repository_context
+from shared_code.automated_tests import terrabot_test_state
+from shared_code.automated_tests import terrabot_semantic_engine
+from shared_code.automated_tests import terrabot_cursor_result_validator
+from shared_code.automated_tests import cursor_prompt_provider
+from shared_code.automated_tests import terrabot_test_analysis
+from shared_code.automated_tests import terrabot_test_coverage
+from shared_code.automated_tests import terrabot_context_revalidation
+
+LOGGER = logging.getLogger("terrabot.automated_tests")
+LOGGER.setLevel(logging.INFO)
+
+TEST_COMMAND_RE = re.compile(
+    r"^\s*run\s+tests(?:\s+(aws|azure|all))?(?:\s+(\d{1,2}))?\s*$",
+    re.IGNORECASE,
+)
+TEST_MODE_COMMAND_RE = re.compile(
+    r"^\s*run\s+tests\s+(regression|exploration|context-regression|mixed)"
+    r"(?:\s+(aws|azure|all))?(?:\s+(\d{1,2}))?\s*$",
+    re.IGNORECASE,
+)
+TEST_STATUS_RE = re.compile(
+    r"^\s*run\s+tests\s+status(?:\s+([A-Za-z0-9._:-]+))?\s*$",
+    re.IGNORECASE,
+)
+
+_BOOLEAN_ASSIGNMENT_RE = re.compile(
+    r"(?m)^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(true|false)\s*(?:#.*)?$"
+)
+
+_FEATURE_NAME_RE = re.compile(
+    r"^(?:create_|enable_|enabled_|deploy_|use_|has_|is_)(.+)$|^(.+?)_enabled$",
+    re.IGNORECASE,
+)
+
+_MAX_CASES = max(1, min(int(os.getenv("TERRABOT_TEST_RUNNER_MAX_CASES", "10")), 20))
+_DEFAULT_CASES = max(1, min(int(os.getenv("TERRABOT_TEST_RUNNER_DEFAULT_CASES", "8")), _MAX_CASES))
+_SCAN_FILE_LIMIT = max(10, min(int(os.getenv("TERRABOT_TEST_RUNNER_SCAN_FILES", "45")), 150))
+_TREE_PATH_LIMIT = max(200, min(int(os.getenv("TERRABOT_TEST_RUNNER_TREE_PATH_LIMIT", "12000")), 50000))
+_MAX_PARALLEL_CASES = max(1, min(int(os.getenv("TERRABOT_TEST_RUNNER_MAX_PARALLEL_CASES", "2")), 4))
 
 
-def _validate_agent_full_file_preservation_for_write_stage1(
-    existing_content: str,
-    generated_content: str,
-    path: str,
-    workflow: str | None,
-) -> None:
-    """Reject destructive Foundry rewrites without generating any Terraform.
-
-    Validation may compare repository truth with Foundry's final file. It may
-    not repair, merge, append, toggle, or otherwise mutate the generated HCL.
-    """
-    if existing_content is None:
+def _diag(event: str, level: str = "info", **fields: Any) -> None:
+    parts = [f"event={event}", f"level={level}"]
+    for key, value in fields.items():
+        text = re.sub(r"\s+", " ", str(value if value is not None else "")).strip()
+        if len(text) > 400:
+            text = text[:397] + "..."
+        parts.append(f"{key}={text}")
+    message = "[TerrabotTest] " + " ".join(parts)
+    # Emit each diagnostic exactly once. In Azure Functions the logging
+    # pipeline/root logger has handlers, so use structured logging. During
+    # lightweight local/unit-test execution there may be no handlers; fall
+    # back to stdout so diagnostics remain visible without triggering
+    # logging.lastResort + print duplicates for warning/error events.
+    if LOGGER.hasHandlers():
+        if level in {"warning", "error"}:
+            LOGGER.warning(message)
+        else:
+            LOGGER.info(message)
         return
-    if _terrabot_placeholder_content_detected(generated_content):
-        raise UnsafeGeneratedChangeError(
-            f"Generated modification for {path} contains a repository-content placeholder. "
-            "Foundry must return the complete real file with unrelated content preserved."
-        )
-
-    normalized_workflow = str(workflow or "").strip()
-    if normalized_workflow not in INFRA_MODIFICATION_WORKFLOWS:
-        return
-
-    # Re-enable the existing non-mutating preservation validator. This function
-    # only rejects destructive replacements; it does not construct file content.
     try:
-        _validate_full_file_modification_preserves_existing(
-            existing_content,
-            generated_content,
-            path,
-        )
-    except ValueError as exc:
-        raise UnsafeGeneratedChangeError(str(exc)) from exc
-
-    existing = (existing_content or "").replace("\r\n", "\n")
-    generated = (generated_content or "").replace("\r\n", "\n")
-    if not existing.strip():
-        return
-
-    # Modification requests must not silently delete existing top-level blocks
-    # unless the user explicitly requested deletion/removal.
-    flow_context = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
-    effective_prompt = str(flow_context.get("effective_prompt") or "").lower()
-    explicit_delete = bool(re.search(r"\b(?:delete|remove)\b", effective_prompt))
-    if path.endswith(".tf") and not explicit_delete:
-        existing_headers = _top_level_tf_headers_for_modification(existing)
-        generated_headers = _top_level_tf_headers_for_modification(generated)
-        missing_headers = sorted(existing_headers - generated_headers)
-        if missing_headers:
-            raise UnsafeGeneratedChangeError(
-                f"Generated modification for {path} removed existing Terraform blocks: "
-                + ", ".join(missing_headers[:12])
-                + ". Foundry must preserve unrelated repository content and edit only the requested code."
-            )
-
-    # A complete-file modification should remain close in size to repository
-    # truth. This catches one-line/single-block replacements while allowing
-    # ordinary targeted edits and additions. It is validation only.
-    existing_nonblank = [line for line in existing.splitlines() if line.strip()]
-    generated_nonblank = [line for line in generated.splitlines() if line.strip()]
-    if len(existing_nonblank) >= 20 and len(generated_nonblank) < max(8, int(len(existing_nonblank) * 0.70)):
-        raise UnsafeGeneratedChangeError(
-            f"Generated modification for {path} is substantially shorter than the live repository file "
-            f"({len(generated_nonblank)} vs {len(existing_nonblank)} nonblank lines). "
-            "Refusing a likely truncated overwrite; Foundry must return the complete final file."
-        )
-_validate_agent_full_file_preservation_for_write = _validate_agent_full_file_preservation_for_write_stage1
-
-
-def github_put_file_if_changed_stage2(
-    cloud: str,
-    path: str,
-    content: str,
-    branch: str,
-    commit_message: str,
-    repo_target: Optional[str] = None,
-    workflow: Optional[str] = None,
-):
-    """Validate preservation, then transport Foundry content exactly as returned."""
-    existing_content = github_get_file_content(
-        cloud,
-        path,
-        branch,
-        repo_target=repo_target,
-        workflow=workflow,
-    )
-    final_content = str(content or "")
-
-    normalized_existing = (existing_content or "").replace("\r\n", "\n").strip()
-    normalized_new = final_content.replace("\r\n", "\n").strip()
-    if existing_content is not None and normalized_existing == normalized_new:
-        return {"changed": False, "path": path, "result": None}
-
-    if path.endswith((".tf", ".tfvars")):
-        _validate_hcl_content_complete(path, final_content)
-        if _has_git_conflict_markers(final_content):
-            raise ValueError(f"Generated {path} contains Git conflict markers.")
-        _validate_agent_full_file_preservation_for_write(
-            existing_content,
-            final_content,
-            path,
-            workflow,
-        )
-
-    # Transport only: no merge, repair, append, normalization, or flag toggle.
-    result = github_put_file(
-        cloud=cloud,
-        path=path,
-        content=final_content,
-        branch=branch,
-        commit_message=commit_message,
-        repo_target=repo_target,
-        workflow=workflow,
-    )
-    return {"changed": True, "path": path, "result": result}
-github_put_file_if_changed = github_put_file_if_changed_stage2
-
-# =============================================================================
-# 2026-08-18 FOUNDRY SEMANTIC BOOLEAN CONTROL + EXACT PRESERVATION — FINAL OVERRIDE
-# =============================================================================
-# This layer intentionally does not infer resource vocabulary in Python. For a
-# Teams AWS modification, the backend resolves the target environment and reads
-# its complete main.tf, then asks Foundry whether the requested operation is
-# implemented by an existing literal Boolean control. Foundry owns semantic
-# interpretation; the backend only verifies that returned candidates literally
-# exist in live repository content and safely transports the final full file.
-
-_FINAL_BOOL_PREVIOUS_BUILD_EXISTING_CONTEXT = build_backend_existing_infra_modification_context
-_FINAL_BOOL_PREVIOUS_SELECT_CANDIDATE = select_infra_modification_candidate_from_reply
-_FINAL_BOOL_PREVIOUS_PATH_QUESTION = _teams_is_path_request_question
-_FINAL_BOOL_PREVIOUS_GITHUB_PUT = github_put_file_if_changed
-
-
-def _foundry_boolean_control_candidates(
-    prompt: str,
-    main_tf_evidence: list[dict],
-) -> dict:
-    """Ask Foundry to semantically identify actionable Boolean controls only.
-
-    This is classification, not Terraform generation. Python does not decide
-    that words such as enable/disable/remove imply a flag; Foundry decides
-    whether the requested repository change is represented by a Boolean gate.
-    """
-    files = [
-        {
-            "path": str(item.get("path") or "").strip(),
-            "content": str(item.get("content") or ""),
-        }
-        for item in (main_tf_evidence or [])
-        if isinstance(item, dict)
-        and str(item.get("path") or "").strip()
-        and str(item.get("content") or "").strip()
-    ]
-    if not files:
-        return {"applicable": False, "candidates": []}
-
-    request = {
-        "task": (
-            "Classify whether the user's requested existing-infrastructure modification can be fulfilled "
-            "by changing an existing literal Boolean assignment in the supplied target-environment main.tf. "
-            "This is semantic repository analysis only; do not generate Terraform."
-        ),
-        "user_request": str(prompt or "").strip(),
-        "target_environment_files": files,
-        "required_output": {
-            "applicable": "boolean",
-            "reason": "short repository-grounded explanation",
-            "candidates": [
-                {
-                    "path": "exact supplied main.tf path",
-                    "module": "exact Terraform module label containing the Boolean",
-                    "flag": "exact Boolean argument name",
-                    "current_value": "true|false",
-                    "new_value": "true|false",
-                    "description": "short description of what this Boolean controls, inferred from the module/source/nearby arguments/comments",
-                }
-            ],
-        },
-        "rules": [
-            "Return JSON only with keys applicable, reason, candidates.",
-            "Decide from the semantics of the user request and repository content; do not rely on a fixed action-word vocabulary supplied by the backend.",
-            "Set applicable=true only when an existing literal Boolean assignment in a semantically relevant module is a valid mechanism for the requested change.",
-            "Candidates must be direct Boolean arguments of semantically relevant module blocks in the supplied main.tf files.",
-            "Include only candidates whose value would actually change for this request; current_value and new_value must differ.",
-            "Do not return data sources, SSM parameters, URLs, secrets, numeric/string parameters, outputs, providers, backend/version settings, or keyword-only matches.",
-            "Do not invent a Boolean, module, path, alias, or value that is not present in the supplied repository content.",
-            "If one Boolean clearly controls the requested resource, return only that Boolean even if unrelated parameters contain similar words.",
-            "If multiple genuinely plausible Boolean controls remain, return all of those Boolean controls so the user can choose among parameters, not files.",
-            "If the repository does not support this request through an existing Boolean control, set applicable=false and return candidates=[].",
-        ],
-    }
-    try:
-        raw = call_named_agent(json.dumps(request, ensure_ascii=False), AGENT_NAME)
-        data = extract_json_from_text(raw)
-        if not isinstance(data, dict):
-            return {"applicable": False, "candidates": []}
-        return data
-    except Exception as exc:
-        LOGGER.warning("Foundry Boolean-control classification failed; continuing normal semantic workflow: %s", exc)
-        return {"applicable": False, "candidates": [], "error": str(exc)}
-
-
-def _literal_module_boolean_index(main_tf_evidence: list[dict]) -> dict[tuple[str, str, str], dict]:
-    """Index literal direct module Boolean assignments for validation only."""
-    index: dict[tuple[str, str, str], dict] = {}
-    for item in main_tf_evidence or []:
-        if not isinstance(item, dict):
-            continue
-        path = str(item.get("path") or "").strip().strip("/")
-        content = str(item.get("content") or "")
-        if not path or not content:
-            continue
-        for block in _extract_top_level_tf_blocks(content):
-            header = str(block.get("header") or "").strip()
-            module_match = re.fullmatch(r'module\s+"([^"]+)"', header)
-            if not module_match:
-                continue
-            module_name = module_match.group(1)
-            block_text = str(block.get("block") or "")
-            # Direct literal Boolean assignments are intentionally narrow. The
-            # semantic decision is Foundry's; this regex only proves the exact
-            # returned flag/value exists in the selected live module block.
-            for match in re.finditer(
-                r'(?m)^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(true|false)\s*(?:#.*)?$',
-                block_text,
-                re.IGNORECASE,
-            ):
-                flag = match.group(1)
-                current = match.group(2).lower()
-                index[(path, module_name, flag)] = {
-                    "path": path,
-                    "module": module_name,
-                    "flag": flag,
-                    "current_value": current,
-                }
-    return index
-
-
-def _foundry_boolean_control_retry(
-    prompt: str,
-    main_tf_evidence: list[dict],
-    literal_index: dict[tuple[str, str, str], dict],
-) -> dict:
-    """Retry semantic resolution against a Boolean-only repository inventory.
-
-    The first classifier sees the complete live main.tf so Foundry can understand
-    module semantics. If it returns no usable control, this retry removes the
-    unrelated Terraform surface area (data blocks, subnet lists, backend values,
-    URLs, etc.) and asks Foundry to compare the user's phrase only against literal
-    Boolean module arguments that really exist in the same live file. Python does
-    not decide which Boolean means the user's phrase; it only supplies a validated
-    structural inventory.
-    """
-    inventory = [
-        {
-            "path": item[0],
-            "module": item[1],
-            "flag": item[2],
-            "current_value": value.get("current_value"),
-        }
-        for item, value in literal_index.items()
-    ]
-    if not inventory:
-        return {"applicable": False, "candidates": [], "reason": "No literal module Boolean controls exist in target main.tf."}
-
-    request = {
-        "task": (
-            "SECOND-PASS SEMANTIC BOOLEAN RESOLUTION. The complete target main.tf was already inspected, "
-            "but no usable Boolean control was returned. Resolve the user's colloquial resource phrase only "
-            "against the repository-proven Boolean controls listed below. Do not generate Terraform."
-        ),
-        "user_request": str(prompt or "").strip(),
-        "literal_boolean_controls": inventory,
-        "target_environment_files": [
-            {"path": str(item.get("path") or ""), "content": str(item.get("content") or "")}
-            for item in main_tf_evidence or []
-            if isinstance(item, dict)
-        ],
-        "required_output": {
-            "applicable": "boolean",
-            "reason": "short repository-grounded semantic explanation",
-            "candidates": [{
-                "path": "exact path from literal_boolean_controls",
-                "module": "exact module from literal_boolean_controls",
-                "flag": "exact flag from literal_boolean_controls",
-                "current_value": "true|false",
-                "new_value": "true|false",
-                "confidence": 0.0,
-                "description": "what this Boolean controls in repository terms",
-            }],
-        },
-        "rules": [
-            "Return JSON only with keys applicable, reason, candidates.",
-            "Choose only from literal_boolean_controls; never invent a path/module/flag.",
-            "Resolve aliases and colloquial wording semantically from module labels, flag names, comments, nearby settings, and the full target main.tf.",
-            "A phrase does not need to literally contain the flag name. For example, repository wording such as patch setup may semantically refer to a patch-monitoring control when the surrounding module evidence supports that relationship.",
-            "Ignore unrelated Boolean controls even though they are structurally valid Booleans.",
-            "Return only controls that actually implement the requested behavior and whose value must change.",
-            "If exactly one control is materially strongest, return only that control.",
-            "Return multiple candidates only when two or more controls are genuinely distinct interpretations of the requested resource phrase, not merely because they share words.",
-            "Use confidence from 0 to 1. Prefer no candidate over a weak semantic match.",
-        ],
-    }
-    try:
-        raw = call_named_agent(json.dumps(request, ensure_ascii=False), AGENT_NAME)
-        parsed = extract_json_from_text(raw)
-        return parsed if isinstance(parsed, dict) else {"applicable": False, "candidates": []}
-    except Exception as exc:
-        LOGGER.warning("Foundry Boolean-control second pass failed: %s", exc)
-        return {"applicable": False, "candidates": [], "error": str(exc)}
-
-
-def _validated_foundry_boolean_candidates(
-    prompt: str,
-    main_tf_evidence: list[dict],
-) -> tuple[bool, list[dict], str]:
-    literal_index = _literal_module_boolean_index(main_tf_evidence)
-    classification = _foundry_boolean_control_candidates(prompt, main_tf_evidence)
-
-    def _validate(classification_payload: dict) -> list[dict]:
-        if not bool(classification_payload.get("applicable")):
-            return []
-        validated_items: list[dict] = []
-        seen: set[tuple[str, str, str]] = set()
-        for candidate in classification_payload.get("candidates") or []:
-            if not isinstance(candidate, dict):
-                continue
-            path = str(candidate.get("path") or "").strip().strip("/")
-            module_name = str(candidate.get("module") or "").strip()
-            flag = str(candidate.get("flag") or "").strip()
-            current = str(candidate.get("current_value") or "").strip().lower()
-            new_value = str(candidate.get("new_value") or "").strip().lower()
-            key = (path, module_name, flag)
-            literal = literal_index.get(key)
-            if not literal:
-                continue
-            if current not in {"true", "false"} or new_value not in {"true", "false"}:
-                continue
-            if current == new_value or literal.get("current_value") != current:
-                continue
-            if key in seen:
-                continue
-            seen.add(key)
-            try:
-                confidence = float(candidate.get("confidence") or 0.0)
-            except (TypeError, ValueError):
-                confidence = 0.0
-            validated_items.append({
-                **literal,
-                "new_value": new_value,
-                "confidence": max(0.0, min(confidence, 1.0)),
-                "context": str(candidate.get("description") or "").strip()
-                or f'Controls the requested behavior in module "{module_name}".',
-                "description": str(candidate.get("description") or "").strip()
-                or f'Controls the requested behavior in module "{module_name}".',
-                "classification_reason": str(classification_payload.get("reason") or "").strip(),
-            })
-        return validated_items
-
-    validated = _validate(classification)
-    if not validated:
-        retry = _foundry_boolean_control_retry(prompt, main_tf_evidence, literal_index)
-        retry_validated = _validate(retry)
-        if retry_validated:
-            LOGGER.warning(
-                "[TerrabotDiag] event=boolean_control_second_pass_resolved candidates=%s request=%s",
-                len(retry_validated),
-                str(prompt or "")[:160],
-            )
-            classification = retry
-            validated = retry_validated
-
-    if not validated:
-        return False, [], str(classification.get("reason") or "")
-
-    # Foundry owns semantic ranking. If it returned confidence values and one
-    # result is materially stronger, do not make the user choose among weaker
-    # alternatives. Equal/near-equal distinct controls remain a real picker.
-    ranked = sorted(validated, key=lambda item: float(item.get("confidence") or 0.0), reverse=True)
-    if len(ranked) > 1:
-        top = float(ranked[0].get("confidence") or 0.0)
-        second = float(ranked[1].get("confidence") or 0.0)
-        if top >= 0.80 and top - second >= 0.15:
-            ranked = [ranked[0]]
-
-    return True, ranked, str(classification.get("reason") or "")
-
-
-def build_backend_existing_infra_modification_context_stage5(
-    prompt: str,
-    thread_id: str,
-    cloud: str,
-    workflow: str,
-    retrieved_value_context: list | None = None,
-) -> dict:
-    """Final modification resolver with Foundry-owned Boolean semantics.
-
-    For Teams AWS modifications, always inspect the resolved environment
-    main.tf first. If Foundry proves the requested operation is controlled by
-    literal Boolean argument(s), only those arguments become candidates. This
-    path is intentionally independent of hardcoded enable/disable keywords.
-    """
-    context = _FINAL_BOOL_PREVIOUS_BUILD_EXISTING_CONTEXT(
-        prompt,
-        thread_id,
-        cloud,
-        workflow,
-        retrieved_value_context=retrieved_value_context,
-    )
-    active = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
-    if not active.get("active"):
-        return context
-    try:
-        normalized_cloud = normalize_cloud(cloud)
+        print(message, flush=True)
     except Exception:
-        return context
-    if normalized_cloud != "aws" or str(workflow or "").strip() not in INFRA_MODIFICATION_WORKFLOWS:
-        return context
+        pass
 
-    context = dict(context or {})
-    branch = str(context.get("context_ref") or "").strip()
-    if not branch:
-        try:
-            branch = _teams_remote_context_branch(
-                "aws",
-                repo_target="tf-devops",
-                workflow=workflow,
-            )
-        except Exception:
-            branch = ""
 
-    main_tf_evidence = _teams_target_environment_main_tf_evidence(
-        prompt,
-        "aws",
-        workflow,
-        branch,
-    )
-    if not main_tf_evidence:
-        return context
+def is_automated_test_command(prompt: str) -> bool:
+    value = str(prompt or "").strip()
+    return bool(TEST_COMMAND_RE.fullmatch(value) or TEST_MODE_COMMAND_RE.fullmatch(value) or TEST_STATUS_RE.fullmatch(value))
 
-    applicable, candidates, reason = _validated_foundry_boolean_candidates(
-        prompt,
-        main_tf_evidence,
-    )
-    if not applicable or not candidates:
-        # Still make target main.tf the primary evidence for the agent, but do
-        # not invent a Boolean workflow when Foundry says the request is not
-        # controlled by a literal flag.
-        context["matched_files"] = main_tf_evidence
-        context["matched_file_paths"] = [item.get("path") for item in main_tf_evidence if item.get("path")]
-        context["selection_state"] = "selected"
-        context["selected_path"] = main_tf_evidence[0].get("path") if len(main_tf_evidence) == 1 else ""
-        context["target_environment_main_tf_first"] = True
-        context["agent_resolves_target"] = True
-        context["boolean_control_classification"] = {
-            "applicable": False,
-            "reason": reason,
-        }
-        context["instructions"] = list(context.get("instructions") or []) + [
-            "The target environment main.tf is already an authorized modification target. Never ask the user for permission to modify it or for an alternative repository path.",
-            "If repository semantics are genuinely ambiguous, ask only which resource/module the user means; never ask which file/path to use when the target environment has already been resolved.",
+
+def _parse_command(prompt: str) -> tuple[str, int]:
+    value = str(prompt or "").strip()
+    mode_match = TEST_MODE_COMMAND_RE.fullmatch(value)
+    if mode_match:
+        cloud = str(mode_match.group(2) or "all").lower()
+        count = int(mode_match.group(3) or _DEFAULT_CASES)
+        return cloud, max(1, min(count, _MAX_CASES))
+    match = TEST_COMMAND_RE.fullmatch(value)
+    if not match:
+        raise ValueError("Unsupported automated test command.")
+    cloud = str(match.group(1) or "all").lower()
+    count = int(match.group(2) or _DEFAULT_CASES)
+    return cloud, max(1, min(count, _MAX_CASES))
+
+
+def _parse_test_mode(prompt: str) -> str:
+    match = TEST_MODE_COMMAND_RE.fullmatch(str(prompt or "").strip())
+    return str(match.group(1) if match else "regression").lower()
+
+
+def _authorized_aad_ids() -> set[str]:
+    raw = os.getenv("TERRABOT_TEST_RUNNER_ALLOWED_AAD_OBJECT_IDS", "")
+    return {item.strip().lower() for item in raw.split(",") if item.strip()}
+
+
+def _assert_authorized(aad_object_id: str) -> None:
+    enabled = os.getenv("TERRABOT_TEST_RUNNER_ENABLED", "false").strip().lower()
+    if enabled not in {"1", "true", "yes", "on"}:
+        raise PermissionError(
+            "Terrabot automated Teams tests are disabled. Set "
+            "TERRABOT_TEST_RUNNER_ENABLED=true to enable them."
+        )
+    allowed = _authorized_aad_ids()
+    caller = str(aad_object_id or "").strip().lower()
+    if not caller or caller not in allowed:
+        raise PermissionError(
+            "This Teams identity is not authorized to run Terrabot automated tests."
+        )
+
+
+@dataclass(frozen=True)
+class RepositorySpec:
+    cloud: str
+    owner: str
+    repo: str
+    branch: str
+
+
+@dataclass(frozen=True)
+class TestCase:
+    __test__ = False
+
+    case_id: str
+    case_type: str
+    cloud: str
+    owner: str
+    repo: str
+    branch: str
+    commit_sha: str
+    path: str
+    environment: str
+    flag: str
+    alias: str
+    current_value: bool
+    desired_value: bool
+    evidence_line: str
+    phase1_prompt: str
+    phase2_prompt: str
+
+
+@dataclass
+class TestCaseResult:
+    __test__ = False
+
+    case: TestCase
+    phase1_ok: bool = False
+    phase1_clarified: bool = False
+    phase1_freeform_clarification: bool = False
+    phase1_cursor_clarification_used: bool = False
+    expected_target_found: bool = False
+    correct_flag_detected: bool = False
+    phase1_control_mentioned: bool = False
+    phase2_control_mentioned: bool = False
+    phase1_mode: str = ""
+    phase2_mode: str = ""
+    phase1_file_generated: bool = False
+    validation_ok: bool = False
+    validation_error: str = ""
+    branch_pushed: bool = False
+    branch_name: str = ""
+    branch_url: str = ""
+    context_stored: bool = False
+    context_present_before: bool = False
+    production_context_created: bool = False
+    fallback_context_created: bool = False
+    context_gap_detected: bool = False
+    context_candidate_created: bool = False
+    context_candidate_verified: bool = False
+    context_candidate_promoted: bool = False
+    phase2_context_retrieved: bool = False
+    phase2_context_attached: bool = False
+    phase2_context_useful: bool = False
+    phase2_ok: bool = False
+    phase2_clarified: bool = False
+    phase2_freeform_clarification: bool = False
+    phase2_cursor_clarification_used: bool = False
+    phase2_context_backend_defect: bool = False
+    phase2_target_ok: bool = False
+    phase2_file_generated: bool = False
+    phase2_reused_without_clarification: bool = False
+    bot_calls: int = 0
+    duration_ms: int = 0
+    error: str = ""
+    score: int = 0
+    backend_score: int = 0
+    actual_file: str = ""
+    actual_mode: str = ""
+    failure_classification: str = ""
+    cursor_validation_requested: bool = False
+    cursor_validation_completed: bool = False
+    cursor_output_correct: bool = False
+    cursor_context_added: bool = False
+    cursor_context_retrievable: bool = False
+    cursor_context_reused: bool = False
+    cursor_overall_ok: bool = False
+    cursor_validation_reason: str = ""
+    cursor_validation_error: str = ""
+    cursor_agent_url: str = ""
+    cursor_validation_duration_ms: int = 0
+    cursor_verdict_evidence: list[str] = field(default_factory=list)
+    cursor_evidence: dict[str, Any] = field(default_factory=dict, repr=False)
+
+
+@dataclass
+class TestRunResult:
+    __test__ = False
+
+    run_id: str
+    requested_cases: int
+    cases: list[TestCaseResult] = field(default_factory=list)
+    discovery_errors: list[str] = field(default_factory=list)
+    duration_ms: int = 0
+
+
+def _calculate_case_score(row: TestCaseResult, *, include_cursor: bool) -> int:
+    if row.case.case_type == "resource_creation":
+        assertions = [
+            row.expected_target_found,
+            row.correct_flag_detected,
+            row.phase1_file_generated,
+            row.validation_ok,
+            row.branch_pushed,
         ]
-        return context
-
-    evidence_by_path = {
-        str(item.get("path") or "").strip().strip("/"): item
-        for item in main_tf_evidence
-        if isinstance(item, dict)
-    }
-    matched: list[dict] = []
-    for candidate in candidates:
-        source = dict(evidence_by_path.get(candidate["path"]) or {})
-        if not source:
-            continue
-        source["feature_flag_match"] = dict(candidate)
-        source["matched_blocks"] = [{
-            "header": f'module "{candidate["module"]}"',
-            "block": "",
-        }]
-        source["reason"] = "Foundry semantic Boolean-control match validated against live target main.tf"
-        matched.append(source)
-
-    if not matched:
-        return context
-
-    context["matched_files"] = matched
-    context["matched_file_paths"] = list(dict.fromkeys(item.get("path") for item in matched if item.get("path")))
-    context["feature_flag_selection"] = True
-    context["target_environment_main_tf_first"] = True
-    context["agent_resolves_target"] = False
-    context["boolean_control_classification"] = {
-        "applicable": True,
-        "reason": reason,
-        "candidate_count": len(matched),
-    }
-    context["instructions"] = [
-        "Foundry already semantically classified the requested operation as an existing Boolean-gated repository change; the backend verified every listed Boolean literally exists in live target main.tf.",
-        "Use only feature_flag_match. Do not change or surface any other parameter merely because its name/content resembles the user's resource wording.",
-        "The target main.tf is already authorized by the resolved environment. Never ask permission to modify it and never ask for an alternative path.",
-        "After one Boolean is selected, change only that exact Boolean assignment to feature_flag_match.new_value and return the COMPLETE final target file.",
-        "Preserve every unrelated byte/line/block/comment in the existing file. Do not reformat, reorder, truncate, summarize, or replace unrelated repository content.",
-    ]
-    if len(matched) == 1:
-        context["selection_state"] = "selected"
-        context["selected_path"] = matched[0].get("path") or ""
     else:
-        context["selection_state"] = "candidate_selection_required"
-        context["selected_path"] = ""
-    return context
-build_backend_existing_infra_modification_context = build_backend_existing_infra_modification_context_stage5
+        assertions = [
+            row.expected_target_found,
+            row.correct_flag_detected,
+            row.phase1_file_generated,
+            row.validation_ok,
+            row.branch_pushed,
+            row.context_stored,
+            row.phase2_context_retrieved,
+            row.phase2_file_generated,
+            row.phase2_target_ok,
+            row.phase2_context_useful,
+        ]
+
+    if include_cursor and row.cursor_validation_requested:
+        assertions.append(row.cursor_validation_completed)
+        if row.cursor_validation_completed:
+            assertions.append(row.cursor_output_correct)
+            if row.case.case_type == "boolean_context":
+                assertions.extend([
+                    row.cursor_context_added,
+                    row.cursor_context_retrievable,
+                    row.cursor_context_reused,
+                ])
+            assertions.append(row.cursor_overall_ok)
+    return round(100 * sum(bool(value) for value in assertions) / max(len(assertions), 1))
 
 
-def select_infra_modification_candidate_from_reply(reply: str, pending_selection: dict) -> int | None:
-    """Allow Boolean picker follow-ups by number OR exact parameter name."""
-    selected = _FINAL_BOOL_PREVIOUS_SELECT_CANDIDATE(reply, pending_selection)
-    if selected is not None:
-        return selected
-    text = str(reply or "").strip().strip("`'\"").lower()
-    candidates = ((pending_selection.get("existing_infra_context") or {}).get("matched_files") or [])
-    for index, candidate in enumerate(candidates):
-        match = (candidate or {}).get("feature_flag_match") or {}
-        flag = str(match.get("flag") or "").strip().lower()
-        module_name = str(match.get("module") or "").strip().lower()
-        if flag and text == flag:
-            return index
-        if module_name and text in {module_name, f'module {module_name}'}:
-            return index
+def _humanize_flag(flag: str) -> str:
+    value = str(flag or "").strip().lower()
+    match = _FEATURE_NAME_RE.match(value)
+    if match:
+        value = match.group(1) or match.group(2) or value
+    value = re.sub(r"_+", " ", value).strip()
+    return value
+
+
+def _infer_environment(path: str, cloud: str = "") -> str:
+    normalized = str(path or "").replace("\\", "/").strip("/")
+    cloud = str(cloud or "").strip().lower()
+    if cloud == "aws":
+        match = re.search(r"(?:^|/)terraform/(?:dev_aws|prod_aws|dev_services_aws)/([^/]+)(?:/|$)", normalized)
+        if match:
+            return match.group(1)
+    if cloud == "azure":
+        match = re.search(r"(?:^|/)vars/(?:npr|sbx|prd)/([^/]+)(?:/|$)", normalized)
+        if match:
+            return match.group(1)
+    parts = [part for part in normalized.split("/") if part]
+    return parts[-2] if len(parts) >= 2 else "repository"
+
+
+def _prompt_alias(alias: str, cloud: str) -> str:
+    """Keep generated language cloud-safe without changing the expected flag."""
+    words = [word for word in re.split(r"\s+", str(alias or "").strip().lower()) if word]
+    opposite = "azure" if str(cloud or "").lower() == "aws" else "aws"
+    cleaned = [word for word in words if word != opposite]
+    return " ".join(cleaned).strip() or str(alias or "").strip()
+
+
+def _vague_alias(alias: str) -> str:
+    """Make repository-derived feature wording less identifier-like.
+
+    The test should exercise semantic resolution rather than merely copying the
+    Terraform identifier into the prompt.  Replacements are intentionally
+    generic infrastructure vocabulary, not repository/resource allow-lists.
+    """
+    words = [word for word in re.findall(r"[a-z0-9]+", str(alias or "").lower()) if word]
+    replacements = {
+        "lb": ["load", "balancer"],
+        "alb": ["load", "balancer"],
+        "metrics": ["monitoring"],
+        "metric": ["monitoring"],
+        "enabled": ["active"],
+        "enable": ["active"],
+        "premerge": ["before", "merge"],
+        "oom": ["out", "of", "memory"],
+        "ecs": ["container", "service"],
+        "replication": ["copying"],
+        "elastic": ["scalable"],
+        "pool": ["capacity"],
+        "handler": ["handling"],
+    }
+    rewritten: list[str] = []
+    changed = False
+    for word in words:
+        replacement = replacements.get(word)
+        if replacement:
+            rewritten.extend(replacement)
+            changed = True
+        else:
+            rewritten.append(word)
+    if not changed and len(rewritten) >= 3:
+        # Remove one low-information middle token so the prompt is not a
+        # verbatim humanization of the flag while retaining enough semantics.
+        rewritten.pop(len(rewritten) // 2)
+    return " ".join(rewritten).strip() or str(alias or "").strip()
+
+
+def _candidate_environment_is_valid(core: Any, spec: RepositorySpec, path: str, environment: str) -> bool:
+    """Use Terrabot's own authoritative environment resolver before creating a prompt."""
+    resolver = getattr(core, "resolve_teams_environment_targets", None)
+    if not callable(resolver):
+        return True
+    probe = f"change terraform setting in {environment}"
+    try:
+        resolution = resolver(probe, cloud_hint=spec.cloud) or {}
+    except TypeError:
+        resolution = resolver(probe, spec.cloud) or {}
+    except Exception:
+        return False
+    if resolution.get("error") or str(resolution.get("cloud") or "").lower() != spec.cloud:
+        return False
+    targets = [item for item in (resolution.get("targets") or []) if isinstance(item, dict)]
+    if not targets:
+        return False
+    candidate_path = str(path or "").strip("/")
+    for target in targets:
+        if str(target.get("environment") or "").lower() != str(environment or "").lower():
+            continue
+        target_path = str(target.get("path") or "").strip("/")
+        if not target_path or candidate_path == target_path or candidate_path.startswith(target_path + "/"):
+            return True
+    return False
+
+
+def _path_priority(path: str) -> tuple[int, int, str]:
+    normalized = str(path or "").lower()
+    basename = normalized.rsplit("/", 1)[-1]
+    score = 0
+    if basename == "main.tf":
+        score += 7
+    if basename.endswith(".tfvars"):
+        score += 6
+    if basename in {"hub.tfvars", "terraform.tfvars"}:
+        score += 3
+    if "/modules/" in f"/{normalized}/" or "/module/" in f"/{normalized}/":
+        score -= 8
+    if "/test" in f"/{normalized}" or "/examples/" in f"/{normalized}/":
+        score -= 7
+    score += min(normalized.count("/"), 5)
+    return (-score, len(normalized), normalized)
+
+
+def _flag_priority(flag: str) -> int:
+    lower = str(flag or "").lower()
+    score = 0
+    if lower.startswith(("create_", "enable_", "deploy_")):
+        score += 6
+    if lower.endswith("_enabled"):
+        score += 5
+    if lower.startswith(("is_", "has_", "use_")):
+        score += 2
+    if len(_humanize_flag(lower).split()) >= 2:
+        score += 2
+    return score
+
+
+def _extract_boolean_candidates(path: str, content: str) -> list[dict[str, Any]]:
+    """Return deterministic feature-like Boolean assignments from one file."""
+    results: list[dict[str, Any]] = []
+    for match in _BOOLEAN_ASSIGNMENT_RE.finditer(str(content or "")):
+        flag = match.group(1)
+        alias = _humanize_flag(flag)
+        if not alias or alias == flag.lower() or len(alias) < 3:
+            # Exact technical booleans are still valid, but the automated
+            # learning test needs a semantic alias distinct from the identifier.
+            continue
+        line = match.group(0).strip()
+        results.append(
+            {
+                "path": path,
+                "environment": _infer_environment(path),
+                "flag": flag,
+                "alias": alias,
+                "current_value": match.group(2).lower() == "true",
+                "evidence_line": line,
+                "priority": _flag_priority(flag),
+            }
+        )
+    results.sort(key=lambda item: (-int(item["priority"]), item["flag"]))
+    return results
+
+
+def _github_recursive_tree(core: Any, spec: RepositorySpec) -> tuple[str, list[str]]:
+    commit_sha = core.github_get_base_branch_sha_by_repo(spec.owner, spec.repo, spec.branch)
+    commit_url = f"{core.GITHUB_API}/repos/{spec.owner}/{spec.repo}/git/commits/{commit_sha}"
+    commit_response = core.requests.get(commit_url, headers=core.github_headers(), timeout=30)
+    commit_response.raise_for_status()
+    tree_sha = str(((commit_response.json() or {}).get("tree") or {}).get("sha") or "").strip()
+    if not tree_sha:
+        raise RuntimeError(f"GitHub did not return a tree SHA for {spec.owner}/{spec.repo}@{spec.branch}.")
+
+    tree_url = f"{core.GITHUB_API}/repos/{spec.owner}/{spec.repo}/git/trees/{tree_sha}"
+    tree_response = core.requests.get(
+        tree_url,
+        headers=core.github_headers(),
+        params={"recursive": "1"},
+        timeout=60,
+    )
+    tree_response.raise_for_status()
+    payload = tree_response.json() or {}
+    if payload.get("truncated"):
+        _diag(
+            "repository_tree_truncated",
+            level="warning",
+            repo=f"{spec.owner}/{spec.repo}",
+            branch=spec.branch,
+        )
+    paths = [
+        str(item.get("path") or "")
+        for item in (payload.get("tree") or [])[:_TREE_PATH_LIMIT]
+        if isinstance(item, dict)
+        and item.get("type") == "blob"
+        and str(item.get("path") or "").lower().endswith((".tf", ".tfvars"))
+    ]
+    return commit_sha, paths
+
+
+def _build_prompt(alias: str, environment: str, desired_value: bool, *, phase: int) -> str:
+    env = str(environment or "repository").strip()
+    action = "enable" if desired_value else "disable"
+    vague = _vague_alias(alias)
+    if phase == 1:
+        templates = [
+            "please {action} the {vague} setup in {env}",
+            "can you switch the {vague} capability {direction} for {env}",
+            "for {env}, make the {vague} behavior {state}",
+            "I need the {vague} integration {state} around {env}",
+            "change {env} so the {vague} piece is {state}",
+        ]
+    else:
+        templates = [
+            "can we have the {vague} part {state} in {env}",
+            "please switch the {vague} behavior {direction} for {env}",
+            "{env} should have the {vague} capability {state}",
+            "turn the {vague} setup {direction} around {env}",
+            "make that {vague} integration {state} for {env}",
+        ]
+    template = secrets.choice(templates)
+    return template.format(
+        action=action,
+        alias=alias,
+        vague=vague,
+        env=env,
+        state="on" if desired_value else "off",
+        direction="on" if desired_value else "off",
+    )
+
+
+def _derive_cases_for_repository(
+    core: Any,
+    spec: RepositorySpec,
+    *,
+    wanted: int,
+    run_id: str,
+    semantic_generation: bool = False,
+) -> list[TestCase]:
+    commit_sha, paths = _github_recursive_tree(core, spec)
+    ranked_paths = sorted(paths, key=_path_priority)
+    candidates: list[dict[str, Any]] = []
+    files_read = 0
+
+    # Read a wider pool than the final sample, then randomize. This prevents
+    # every invocation from repeatedly choosing the same top-ranked controls.
+    candidate_goal = max(wanted * 12, wanted + 12)
+    for path in ranked_paths:
+        if files_read >= _SCAN_FILE_LIMIT or len(candidates) >= candidate_goal:
+            break
+        environment = _infer_environment(path, spec.cloud)
+        if environment == "repository" or not _candidate_environment_is_valid(core, spec, path, environment):
+            continue
+        content = core.github_get_file_content_by_repo(spec.owner, spec.repo, path, ref=spec.branch)
+        files_read += 1
+        if not content:
+            continue
+        for candidate in _extract_boolean_candidates(path, content):
+            candidate["environment"] = environment
+            candidate["alias"] = _prompt_alias(str(candidate.get("alias") or ""), spec.cloud)
+            if candidate["alias"]:
+                candidates.append(candidate)
+
+    # Feature priority still removes weak noise, but selection is randomized
+    # within the strong candidate pool on every run.
+    candidates.sort(key=lambda item: -int(item.get("priority") or 0))
+    strong = candidates[: max(wanted * 8, wanted)]
+    secrets.SystemRandom().shuffle(strong)
+
+    selected: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in strong:
+        key = (str(item["environment"]).lower(), str(item["alias"]).lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        selected.append(item)
+        if len(selected) >= wanted:
+            break
+
+    cases: list[TestCase] = []
+    used_prompts: set[str] = set()
+    for index, item in enumerate(selected, start=1):
+        desired = not bool(item["current_value"])
+        semantic = (
+            terrabot_semantic_engine.generate_semantic_variants(
+                cloud=spec.cloud,
+                environment=str(item["environment"]),
+                alias=str(item["alias"]),
+                desired_value=desired,
+                path=str(item["path"]),
+                flag=str(item["flag"]),
+                count=2,
+                workspace=os.getenv("TERRABOT_TEST_CURSOR_WORKSPACE", "").strip(),
+            )
+            if semantic_generation
+            else []
+        )
+        phase1 = semantic[0] if semantic else _build_prompt(str(item["alias"]), str(item["environment"]), desired, phase=1)
+        phase2 = semantic[1] if len(semantic) > 1 else _build_prompt(str(item["alias"]), str(item["environment"]), desired, phase=2)
+        # Within one run prompts must be unique; regenerate wording if a random
+        # template happened to collide.
+        for _ in range(8):
+            if phase1.lower() not in used_prompts and phase2.lower() not in used_prompts and phase1.lower() != phase2.lower():
+                break
+            phase1 = _build_prompt(str(item["alias"]), str(item["environment"]), desired, phase=1)
+            phase2 = _build_prompt(str(item["alias"]), str(item["environment"]), desired, phase=2)
+        used_prompts.update({phase1.lower(), phase2.lower()})
+        case_id = f"{spec.cloud}-{index:02d}-{hashlib.sha1((item['path'] + item['flag'] + run_id).encode()).hexdigest()[:6]}"
+        cases.append(
+            TestCase(
+                case_id=case_id,
+                case_type="boolean_context",
+                cloud=spec.cloud,
+                owner=spec.owner,
+                repo=spec.repo,
+                branch=spec.branch,
+                commit_sha=commit_sha,
+                path=str(item["path"]),
+                environment=str(item["environment"]),
+                flag=str(item["flag"]),
+                alias=str(item["alias"]),
+                current_value=bool(item["current_value"]),
+                desired_value=desired,
+                evidence_line=str(item["evidence_line"]),
+                phase1_prompt=phase1,
+                phase2_prompt=phase2,
+            )
+        )
+
+    _diag(
+        "repository_cases_derived",
+        run_id=run_id,
+        repo=f"{spec.owner}/{spec.repo}",
+        cloud=spec.cloud,
+        tree_paths=len(paths),
+        files_read=files_read,
+        boolean_candidates=len(candidates),
+        selected=len(cases),
+        environments=",".join(sorted({case.environment for case in cases})),
+    )
+    return cases
+
+
+def _build_creation_prompt(alias: str, environment: str, *, phase: int, nonce: str) -> str:
+    vague = _vague_alias(alias)
+    env = str(environment or "repository").strip()
+    name = f"tb-{nonce}"
+    templates = (
+        [
+            "could you add a fresh {vague} setup in {env} named {name}",
+            "we need another {vague} service around {env}; call it {name}",
+            "please provision one more {vague} thing for {env} as {name}",
+        ]
+        if phase == 1
+        else [
+            "set up a new {vague} piece in {env} named {name}",
+            "can {env} get another {vague} instance called {name}",
+            "create a fresh {vague} workload for {env}; use {name}",
+        ]
+    )
+    return secrets.choice(templates).format(vague=vague, env=env, name=name)
+
+
+def _derive_creation_case_for_repository(
+    core: Any,
+    spec: RepositorySpec,
+    *,
+    run_id: str,
+    index: int,
+) -> TestCase | None:
+    """Derive one repository-backed resource-creation case without hardcoding a resource.
+
+    AWS uses an existing module that is not already consumed by the selected
+    environment. Azure uses a live root module family together with an actual
+    environment hub.tfvars. The assertions for these cases intentionally test
+    generation/validation/branch transport rather than an exact Boolean flag.
+    """
+    commit_sha, paths = _github_recursive_tree(core, spec)
+    rng = secrets.SystemRandom()
+    nonce = hashlib.sha1(f"{run_id}:{spec.cloud}:creation:{index}".encode()).hexdigest()[:6]
+
+    if spec.cloud == "aws":
+        environment_paths = [
+            path for path in paths
+            if re.search(r"^terraform/(?:dev_aws|prod_aws|dev_services_aws)/[^/]+/main\.tf$", path)
+        ]
+        module_names = sorted({
+            match.group(1)
+            for path in paths
+            for match in [re.match(r"^terraform/modules/([^/]+)/.+\.tf$", path)]
+            if match
+        })
+        rng.shuffle(environment_paths)
+        rng.shuffle(module_names)
+        for env_path in environment_paths[:12]:
+            environment = _infer_environment(env_path, "aws")
+            if not _candidate_environment_is_valid(core, spec, env_path, environment):
+                continue
+            content = core.github_get_file_content_by_repo(spec.owner, spec.repo, env_path, ref=spec.branch) or ""
+            if not content:
+                continue
+            for module_name in module_names[:30]:
+                # Select a real reusable module that is not already consumed in
+                # this environment, avoiding an already-exists false failure.
+                if re.search(rf"modules/{re.escape(module_name)}(?:\b|\")", content, re.IGNORECASE):
+                    continue
+                alias = _humanize_flag(module_name) or module_name.replace("_", " ")
+                phase1 = _build_creation_prompt(alias, environment, phase=1, nonce=nonce)
+                phase2 = _build_creation_prompt(alias, environment, phase=2, nonce=nonce)
+                return TestCase(
+                    case_id=f"aws-create-{index:02d}-{nonce}",
+                    case_type="resource_creation",
+                    cloud=spec.cloud,
+                    owner=spec.owner,
+                    repo=spec.repo,
+                    branch=spec.branch,
+                    commit_sha=commit_sha,
+                    path=env_path,
+                    environment=environment,
+                    flag="",
+                    alias=alias,
+                    current_value=False,
+                    desired_value=True,
+                    evidence_line=f"terraform/modules/{module_name}",
+                    phase1_prompt=phase1,
+                    phase2_prompt=phase2,
+                )
+
+    if spec.cloud == "azure":
+        hub_paths = [
+            path for path in paths
+            if re.search(r"^vars/(?:npr|sbx|prd)/[^/]+/hub\.tfvars$", path)
+        ]
+        root_tf_paths = [path for path in paths if "/" not in path and path.endswith(".tf")]
+        rng.shuffle(hub_paths)
+        rng.shuffle(root_tf_paths)
+        module_families: list[str] = []
+        for tf_path in root_tf_paths[:25]:
+            content = core.github_get_file_content_by_repo(spec.owner, spec.repo, tf_path, ref=spec.branch) or ""
+            for match in re.finditer(r'(?m)^\s*module\s+"([^"]+)"\s*\{', content):
+                label = match.group(1).strip()
+                if label and label not in module_families:
+                    module_families.append(label)
+        rng.shuffle(module_families)
+        for hub_path in hub_paths[:12]:
+            environment = _infer_environment(hub_path, "azure")
+            if not _candidate_environment_is_valid(core, spec, hub_path, environment):
+                continue
+            for module_name in module_families[:30]:
+                alias = _humanize_flag(module_name) or module_name.replace("_", " ").replace("-", " ")
+                if len(alias.strip()) < 3:
+                    continue
+                return TestCase(
+                    case_id=f"azure-create-{index:02d}-{nonce}",
+                    case_type="resource_creation",
+                    cloud=spec.cloud,
+                    owner=spec.owner,
+                    repo=spec.repo,
+                    branch=spec.branch,
+                    commit_sha=commit_sha,
+                    path=hub_path,
+                    environment=environment,
+                    flag="",
+                    alias=alias,
+                    current_value=False,
+                    desired_value=True,
+                    evidence_line=f"root module family: {module_name}",
+                    phase1_prompt=_build_creation_prompt(alias, environment, phase=1, nonce=nonce),
+                    phase2_prompt=_build_creation_prompt(alias, environment, phase=2, nonce=nonce),
+                )
     return None
 
 
-def build_infra_modification_selection_reply(existing_infra_context: dict) -> str:
-    """Render Boolean ambiguity as a parameter question, never a file picker."""
-    candidates = list(existing_infra_context.get("matched_files") or [])
-    flag_items = []
-    for item in candidates:
+def _response_text(result: dict) -> str:
+    parts = [
+        str(result.get("summary") or ""),
+        str(result.get("reply") or ""),
+        str(result.get("analysis") or ""),
+        str(result.get("questions") or ""),
+        str(result.get("files") or ""),
+        str(result.get("candidates") or ""),
+    ]
+    return "\n".join(parts).lower()
+
+
+def _response_file_paths(result: dict) -> list[str]:
+    paths: list[str] = []
+    for item in result.get("files") or []:
+        if isinstance(item, dict):
+            path = item.get("path") or item.get("filename") or ""
+        else:
+            path = item
+        path = str(path or "").strip()
+        if path and path not in paths:
+            paths.append(path)
+    return paths
+
+
+def _response_file_content(result: dict, expected_path: str) -> str:
+    expected = str(expected_path or "").strip().strip("/")
+    for item in result.get("files") or []:
         if not isinstance(item, dict):
             continue
-        match = item.get("feature_flag_match") or {}
-        if str(match.get("flag") or "").strip():
-            flag_items.append((item, match))
-    if flag_items:
-        lines = [
-            "I found multiple repository-backed controls that match this request. Which resource/control should I change?",
-            "",
-        ]
-        for index, (item, match) in enumerate(flag_items, start=1):
-            flag = str(match.get("flag") or "").strip()
-            module_name = str(match.get("module") or "").strip()
-            current = str(match.get("current_value") or "").strip().lower()
-            target = str(match.get("new_value") or "").strip().lower()
-            description = str(match.get("context") or match.get("description") or "").strip()
-            label = description or (f'Boolean control in module {module_name}' if module_name else f'Repository control {flag}')
-            lines.append(f"{index}. **{label}** — current state `{current}` → requested state `{target}`")
-        lines.extend([
-            "",
-            "Reply with the number or the resource/control name shown above. Terrabot already knows the repository file and exact Terraform identifier.",
-        ])
-        return "\n".join(lines)
-    # Preserve every earlier non-Boolean clarification behavior.
-    return _teams_candidate_selection_reply_non_boolean(existing_infra_context)
+        path = str(item.get("path") or item.get("filename") or "").strip().strip("/")
+        if expected and path != expected:
+            continue
+        for key in ("content", "final_content", "text", "terraform"):
+            value = item.get(key)
+            if isinstance(value, str) and value:
+                return value
+    return ""
 
 
-def _teams_candidate_selection_reply_non_boolean(existing_infra_context: dict) -> str:
-    candidates = list(existing_infra_context.get("matched_files") or [])[:6]
-    if not candidates:
-        return (
-            "I couldn't find a repository-backed Terraform target for that resource wording. "
-            "Reply with a more specific resource/module name; you do not need to provide a file path."
-        )
-    lines = [
-        "I found a few similar repository resources. Which resource should I modify?",
-        "",
+def _cursor_file_evidence(case: TestCase, result: dict) -> list[dict[str, Any]]:
+    """Return bounded generated-file evidence for the final Cursor review."""
+    evidence: list[dict[str, Any]] = []
+    try:
+        configured_files = int(os.getenv("TERRABOT_TEST_CURSOR_VALIDATION_MAX_FILES_PER_PHASE", "5"))
+    except (TypeError, ValueError):
+        configured_files = 5
+    try:
+        configured_chars = int(os.getenv("TERRABOT_TEST_CURSOR_VALIDATION_FILE_EXCERPT_CHARS", "9000"))
+    except (TypeError, ValueError):
+        configured_chars = 9000
+    max_files = max(1, min(configured_files, 12))
+    max_chars = max(1000, min(configured_chars, 30000))
+    for item in (result.get("files") or [])[:max_files]:
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("path") or item.get("filename") or "").strip().strip("/")
+        content = ""
+        for key in ("content", "final_content", "text", "terraform"):
+            value = item.get(key)
+            if isinstance(value, str) and value:
+                content = value
+                break
+        if not path:
+            continue
+        excerpt = content
+        if content and case.flag:
+            lines = content.splitlines()
+            index = next(
+                (i for i, line in enumerate(lines) if re.search(rf"\b{re.escape(case.flag)}\b", line, re.IGNORECASE)),
+                -1,
+            )
+            if index >= 0:
+                excerpt = "\n".join(lines[max(0, index - 24) : min(len(lines), index + 25)])
+        if len(excerpt) > max_chars:
+            excerpt = excerpt[: max_chars // 2] + "\n...<excerpt truncated>...\n" + excerpt[-max_chars // 2 :]
+        evidence.append({
+            "path": path,
+            "content_length": len(content),
+            "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest() if content else "",
+            "excerpt": excerpt,
+        })
+    return evidence
+
+
+def _cursor_context_evidence(record: dict | None) -> dict[str, Any]:
+    if not isinstance(record, dict):
+        return {}
+    return {
+        "id": str(record.get("id") or ""),
+        "category": str(record.get("category") or ""),
+        "subject": str(record.get("subject") or ""),
+        "scope": str(record.get("scope") or ""),
+        "statement": str(record.get("statement") or "")[:4000],
+        "evidence_paths": [str(value) for value in (record.get("evidence_paths") or [])[:12]],
+        "confidence": record.get("confidence"),
+        "stale": bool(record.get("stale")),
+    }
+
+
+def _control_mentioned(case: TestCase, result: dict) -> bool:
+    """Diagnostic-only signal that Terrabot named the expected Boolean control.
+
+    This intentionally excludes generated file bodies and never contributes to
+    pass/fail scoring. Boolean correctness requires the exact requested literal
+    assignment in the generated expected file.
+    """
+    if case.case_type != "boolean_context" or not case.flag:
+        return False
+    parts = [
+        str(result.get("summary") or ""),
+        str(result.get("reply") or ""),
+        str(result.get("analysis") or ""),
+        str(result.get("questions") or ""),
+        str(result.get("candidates") or ""),
     ]
-    for index, item in enumerate(candidates, start=1):
-        label = _teams_candidate_friendly_label(item)
-        lines.append(f"{index}. **{label}**")
+    return case.flag.lower() in "\n".join(parts).lower()
+
+
+def _target_detection(case: TestCase, result: dict) -> tuple[bool, bool, bool, str]:
+    paths = [path.strip().strip("/") for path in _response_file_paths(result)]
+    text = _response_text(result)
+    expected_path = str(case.path or "").strip().strip("/")
+    expected_target_found = expected_path in paths or expected_path.lower() in text
+    if case.case_type == "resource_creation":
+        alias_tokens = {
+            token for token in re.findall(r"[a-z0-9]+", case.alias.lower())
+            if len(token) > 2
+        }
+        semantic_text = text + "\n" + "\n".join(paths).lower()
+        correct_flag_detected = bool(alias_tokens) and any(token in semantic_text for token in alias_tokens)
+        # Creation may legitimately modify a repository consumer file other
+        # than the environment value file used to derive the test. Any file in
+        # the correct repo is a generated target; exact-path correctness is a
+        # Boolean-context assertion, not a creation assertion.
+        expected_target_found = bool(paths)
+    else:
+        content = _response_file_content(result, expected_path)
+        expected_value = "true" if case.desired_value else "false"
+        assignment = re.search(
+            rf"(?m)^\s*{re.escape(case.flag)}\s*=\s*{expected_value}\s*(?:#.*)?$",
+            content,
+            re.IGNORECASE,
+        ) if content and case.flag else None
+        # Boolean correctness is an output assertion, not a prose/analysis assertion.
+        # Mentioning the expected control elsewhere is tracked separately by
+        # ``_control_mentioned`` and must never make this assertion pass.
+        correct_flag_detected = bool(assignment)
+    file_generated = bool(paths)
+    actual_file = next((path for path in paths if path == expected_path), paths[0] if paths else "")
+    return expected_target_found, correct_flag_detected, file_generated, actual_file
+
+
+def _target_matches(case: TestCase, result: dict) -> tuple[bool, str]:
+    target, flag, _file, actual = _target_detection(case, result)
+    return bool(target and flag), actual
+
+
+def _repo_matches(case: TestCase, result: dict) -> bool:
+    repo_target = str(result.get("repo_target") or "").strip().lower()
+    cloud = str(result.get("cloud") or "").strip().lower()
+    if repo_target and (repo_target == case.repo.lower() or case.repo.lower() in repo_target):
+        return True
+    return cloud == case.cloud
+
+
+def _pick_expected_candidate(case: TestCase, result: dict) -> str:
+    best: tuple[int, str] = (0, "")
+    for fallback_index, item in enumerate(result.get("candidates") or [], start=1):
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("path") or "").strip()
+        flag = str(item.get("flag") or "").strip()
+        text = str(item).lower()
+        score = 0
+        if path == case.path:
+            score += 6
+        if case.flag.lower() == flag.lower():
+            score += 8
+        elif case.flag.lower() in text:
+            score += 4
+        if case.alias.lower() in text:
+            score += 1
+        selection = str(item.get("index") or flag or path or fallback_index).strip()
+        if score > best[0]:
+            best = (score, selection)
+    return best[1] if best[0] > 0 else ""
+
+
+def _pick_automated_candidate_reply(case: TestCase, result: dict) -> str:
+    """Return a numeric clarification reply suitable for unattended tests.
+
+    Boolean-context cases prefer the repository-derived expected candidate.
+    Resource-creation cases deliberately choose a random valid option because
+    module/resource selection is itself part of the workflow being exercised.
+    Clarification is therefore not a failed assertion when generation proceeds.
+    """
+    candidates = [item for item in (result.get("candidates") or []) if isinstance(item, dict)]
+    if case.case_type != "resource_creation":
+        expected = _pick_expected_candidate(case, result)
+        if expected:
+            # Convert an exact flag/path selection to the displayed numeric
+            # index when possible so production numeric-reply handling is tested.
+            for fallback_index, item in enumerate(candidates, start=1):
+                item_index = str(item.get("index") or fallback_index).strip()
+                if expected == item_index:
+                    return item_index
+                if expected in {
+                    str(item.get("flag") or "").strip(),
+                    str(item.get("path") or "").strip(),
+                }:
+                    return item_index
+            return expected
+    if candidates:
+        chosen = secrets.choice(list(enumerate(candidates, start=1)))
+        fallback_index, item = chosen
+        return str(item.get("index") or fallback_index).strip() or str(fallback_index)
+    # Zero structured candidates is a free-form clarification, not a numeric
+    # target picker. Never synthesize option 1 because no such option exists.
+    return ""
+
+
+def _search_context(case: TestCase) -> dict:
+    return repository_context.search_repository_context(
+        repo_owner=case.owner,
+        repo_name=case.repo,
+        query=f"{case.alias} {case.flag} {case.environment}",
+        current_commit_sha=case.commit_sha,
+        top_k=8,
+    )
+
+
+def _matching_context_record(case: TestCase, search_result: dict) -> dict | None:
+    for item in search_result.get("results") or []:
+        if not isinstance(item, dict):
+            continue
+        text = " ".join(
+            [
+                str(item.get("subject") or ""),
+                str(item.get("statement") or ""),
+                " ".join(str(value) for value in (item.get("evidence_paths") or [])),
+            ]
+        ).lower()
+        if case.flag.lower() in text and case.path.lower() in text:
+            return item
+    return None
+
+
+def _ensure_context_mapping(
+    core: Any,
+    case: TestCase,
+    run_id: str,
+    *,
+    evidence_branch: str = "",
+    evidence_commit_sha: str = "",
+) -> bool:
+    try:
+        existing = _search_context(case)
+    except Exception as exc:
+        _diag(
+            "context_mapping_search_failed",
+            level="error",
+            run_id=run_id,
+            test_case_id=case.case_id,
+            repo=f"{case.owner}/{case.repo}",
+            path=case.path,
+            flag=case.flag,
+            error=exc,
+        )
+        raise
+    if _matching_context_record(case, existing):
+        _diag(
+            "context_mapping_already_present",
+            run_id=run_id,
+            test_case_id=case.case_id,
+            repo=f"{case.owner}/{case.repo}",
+            path=case.path,
+            flag=case.flag,
+        )
+        return True
+
+    ref = str(evidence_branch or case.branch).strip()
+    commit_sha = str(evidence_commit_sha or case.commit_sha).strip()
+    try:
+        live_content = core.github_get_file_content_by_repo(case.owner, case.repo, case.path, ref=ref) or ""
+    except Exception as exc:
+        _diag(
+            "context_mapping_evidence_read_failed",
+            level="error",
+            run_id=run_id,
+            test_case_id=case.case_id,
+            repo=f"{case.owner}/{case.repo}",
+            ref=ref,
+            path=case.path,
+            flag=case.flag,
+            error=exc,
+        )
+        raise
+    if not live_content:
+        _diag(
+            "context_mapping_evidence_missing",
+            level="warning",
+            run_id=run_id,
+            test_case_id=case.case_id,
+            repo=f"{case.owner}/{case.repo}",
+            ref=ref,
+            commit_sha=commit_sha,
+            path=case.path,
+            flag=case.flag,
+        )
+    evidence_line = case.evidence_line
+    assignment = re.search(
+        rf"(?m)^\s*{re.escape(case.flag)}\s*=\s*(?:true|false)\s*(?:#.*)?$",
+        str(live_content),
+        re.IGNORECASE,
+    )
+    if assignment:
+        evidence_line = assignment.group(0).strip()
+    else:
+        _diag(
+            "context_mapping_assignment_not_found",
+            level="warning",
+            run_id=run_id,
+            test_case_id=case.case_id,
+            repo=f"{case.owner}/{case.repo}",
+            ref=ref,
+            path=case.path,
+            flag=case.flag,
+            live_content_chars=len(live_content),
+            fallback_evidence_line=evidence_line,
+        )
+
+    statement = (
+        f"In {case.repo}, {case.alias} maps to Boolean control {case.flag} "
+        f"in {case.path} for environment {case.environment}."
+    )
+    candidate = {
+        "category": "resolved_clarification",
+        "subject": case.alias,
+        "scope": case.environment,
+        "statement": statement,
+        "confidence": 0.99,
+        "validation_summary": (
+            "Automated repository-derived Terrabot test verified this mapping "
+            "against the live GitHub file before indexing it."
+        ),
+        "evidence": [
+            {
+                "path": case.path,
+                "excerpt": evidence_line,
+                "reason": f"The live assignment proves the Boolean control {case.flag}.",
+            }
+        ],
+    }
+
+    def evidence_fetcher(owner: str, repo: str, path: str, ref_value: str) -> str | None:
+        return core.github_get_file_content_by_repo(owner, repo, path, ref=ref_value)
+
+    try:
+        action = repository_context.add_repository_context(
+            repo_owner=case.owner,
+            repo_name=case.repo,
+            evidence_commit_sha=commit_sha,
+            evidence_branch=ref,
+            source_task_hash=hashlib.sha256(f"{run_id}:{case.case_id}:{ref}".encode()).hexdigest(),
+            candidate=candidate,
+            evidence_fetcher=evidence_fetcher,
+        )
+    except Exception as exc:
+        _diag(
+            "context_mapping_add_failed",
+            level="error",
+            run_id=run_id,
+            test_case_id=case.case_id,
+            repo=f"{case.owner}/{case.repo}",
+            ref=ref,
+            commit_sha=commit_sha,
+            path=case.path,
+            flag=case.flag,
+            error=exc,
+        )
+        raise
+    stored = bool(action.get("stored"))
+    _diag(
+        "context_mapping_add_result",
+        level="info" if stored else "warning",
+        run_id=run_id,
+        test_case_id=case.case_id,
+        repo=f"{case.owner}/{case.repo}",
+        ref=ref,
+        commit_sha=commit_sha,
+        path=case.path,
+        flag=case.flag,
+        stored=stored,
+        action=str(action.get("action") or action.get("status") or ""),
+        reason=str(action.get("reason") or action.get("error") or ""),
+        validation_errors=action.get("validation_errors") or action.get("errors") or [],
+        context_id=str(action.get("id") or action.get("context_id") or ""),
+    )
+    return stored
+
+
+def _branch_head_sha(core: Any, case: TestCase, branch: str) -> str:
+    if not branch:
+        return ""
+    try:
+        return str(core.github_get_base_branch_sha_by_repo(case.owner, case.repo, branch) or "").strip()
+    except Exception:
+        return ""
+
+
+def _commit_preview_to_test_branch(
+    core: Any,
+    case: TestCase,
+    run_id: str,
+    preview: dict,
+    original_request: dict,
+) -> tuple[dict, int]:
+    helper = getattr(core, "_teams_auto_commit_preview", None)
+    if not callable(helper):
+        return {"ok": False, "mode": "test_commit_unavailable", "reply": "_teams_auto_commit_preview is unavailable."}, 500
+    commit_request = dict(original_request or {})
+    commit_request.update({
+        "pending_branch_choice_resolved": True,
+        "branch_choice": "new",
+        "force_new_branch": True,
+        "reuse_branch": False,
+        "existing_branch": "",
+        "teams_requester": f"terrabot-test-{run_id[-6:]}-{case.case_id}",
+        "test_mode": False,
+        "automated_test_phase": 1,
+    })
+    return helper(commit_request, preview, 200)
+
+
+def _invoke_backend(core: Any, request: dict, result: TestCaseResult) -> tuple[dict, int]:
+    result.bot_calls += 1
+    return core.handle_teams_chat_request(request)
+
+
+def _phase_request(case: TestCase, prompt: str, conversation_id: str, *, phase: int) -> dict:
+    return {
+        "prompt": prompt,
+        "original_prompt": prompt,
+        "thread_id": "",
+        "teams_conversation_id": conversation_id,
+        "memory_conversation_id": f"{conversation_id}::memory::{uuid.uuid4().hex}",
+        "teams_requester": "terrabot-automated-test",
+        "source": "teams",
+        # Repository-context E2E cases are infrastructure tests by construction.
+        # Bypass only the generic chat-vs-infra routing decision; Terrabot must
+        # still resolve the environment, repository target, live Boolean, and
+        # generate repository-aligned Terraform itself.
+        "mode": "infra",
+        "test_mode": True,
+        "automated_test_phase": phase,
+        "automated_test_case_id": case.case_id,
+        "fresh_infra_generation": True,
+        "cloud": case.cloud,
+        "requested_cloud": case.cloud,
+        # Test runs never reuse a user's existing Terrabot branch. Resolve the
+        # branch decision up front so generation cannot stop at the production
+        # branch-choice UX. Phase 1 later commits the validated preview to its
+        # isolated test branch; Phase 2 remains test_mode and never commits.
+        "pending_branch_choice_resolved": True,
+        "branch_choice": "new",
+        "force_new_branch": True,
+        "reuse_branch": False,
+        "existing_branch": "",
+    }
+
+
+def _validate_preview(core: Any, backend_result: dict, prompt: str, thread_id: str) -> tuple[bool, str]:
+    if str(backend_result.get("mode") or "").lower() != "infra_preview":
+        return False, f"Expected infra_preview, received {backend_result.get('mode') or '<none>'}."
+    if not backend_result.get("files"):
+        return False, "No generated files were returned for dry-run validation."
+    try:
+        core._run_parallel_precommit_validations(backend_result, prompt, thread_id)
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _safe_reset(core: Any, conversation_id: str, result: dict) -> None:
+    try:
+        thread_id = str(result.get("thread_id") or "").strip()
+        core.reset_teams_chat_session(conversation_id, thread_id)
+    except Exception as exc:
+        _diag("synthetic_session_reset_failed", level="warning", error=exc)
+
+
+def _resolve_automated_clarifications(
+    core: Any,
+    case: TestCase,
+    row: TestCaseResult,
+    result: dict,
+    status: int,
+    *,
+    phase: int,
+    conversation_id: str,
+    phase_request: dict,
+    run_id: str,
+    max_rounds: int = 3,
+) -> tuple[dict, int, bool]:
+    """Resolve clarification without inventing a target-selection protocol.
+
+    Structured pickers may be answered as target-selection replies. A free-form
+    clarification (zero structured candidates) is never answered with synthetic
+    option ``1``. In automated tests Cursor inspects the exact pinned repository
+    and supplies the clarification answer; that answer is sent as a normal
+    continuation so the production resolver bug remains visible in scoring.
+    """
+    clarified = False
+    current = dict(result or {})
+    current_status = status
+    for round_no in range(1, max_rounds + 1):
+        if str(current.get("mode") or "").lower() != "clarification":
+            break
+        clarified = True
+        candidates = [item for item in (current.get("candidates") or []) if isinstance(item, dict)]
+        clarification_text = str(current.get("reply") or current.get("question") or "").strip()
+        _diag(
+            "cursor_clarification_requested",
+            run_id=run_id,
+            test_case_id=case.case_id,
+            phase=phase,
+            round=round_no,
+            candidate_count=len(candidates),
+            clarification=clarification_text[:500],
+        )
+        cursor_resolution = cursor_prompt_provider.resolve_repository_clarification(
+            owner=case.owner,
+            repo=case.repo,
+            commit_sha=case.commit_sha,
+            original_prompt=case.phase1_prompt if phase == 1 else case.phase2_prompt,
+            clarification_text=clarification_text,
+            candidates=candidates,
+            run_id=run_id,
+            case_id=case.case_id,
+            log_event=_diag,
+        )
+
+        resolution_type = str(cursor_resolution.get("resolution_type") or "").strip().lower()
+        structured_picker = bool(candidates) and bool(cursor_resolution.get("use_structured_picker"))
+        selection = str(cursor_resolution.get("answer") or "").strip()
+
+        if not cursor_resolution or resolution_type == "unresolved" or not selection:
+            # For Boolean-context tests, never silently fall back to the hidden
+            # expected target. The purpose of this continuation is to prove that
+            # Cursor can independently resolve Terrabot's clarification from the
+            # pinned repository. Resource-creation pickers retain their existing
+            # random valid-option fallback because no exact Boolean truth exists.
+            if case.case_type == "resource_creation" and candidates:
+                selection = _pick_automated_candidate_reply(case, current)
+                structured_picker = bool(selection)
+            if not selection:
+                _diag(
+                    "automated_clarification_unresolved",
+                    level="warning",
+                    run_id=run_id,
+                    test_case_id=case.case_id,
+                    phase=phase,
+                    round=round_no,
+                    candidate_count=len(candidates),
+                    cursor_resolution_type=resolution_type or "<none>",
+                    cursor_used=bool(cursor_resolution),
+                )
+                break
+
+        if not structured_picker:
+            if phase == 1:
+                row.phase1_freeform_clarification = True
+            else:
+                row.phase2_freeform_clarification = True
+
+        if cursor_resolution:
+            if phase == 1:
+                row.phase1_cursor_clarification_used = True
+            else:
+                row.phase2_cursor_clarification_used = True
+            selected_path = str(cursor_resolution.get("selected_path") or "").strip().strip("/")
+            selected_flag = str(cursor_resolution.get("selected_flag") or "").strip()
+            if (
+                case.case_type == "boolean_context"
+                and selected_path == case.path.strip("/")
+                and selected_flag == case.flag
+            ):
+                stored = _ensure_context_mapping(
+                    core, case, run_id, evidence_branch=case.branch, evidence_commit_sha=case.commit_sha
+                )
+                row.context_stored = row.context_stored or stored
+                _diag(
+                    "cursor_clarification_context_promoted",
+                    test_case_id=case.case_id,
+                    phase=phase,
+                    stored=stored,
+                    path=selected_path,
+                    flag=selected_flag,
+                )
+
+        _diag(
+            "automated_clarification_selected",
+            test_case_id=case.case_id,
+            phase=phase,
+            round=round_no,
+            selection=selection,
+            candidate_count=len(candidates),
+            structured_picker=structured_picker,
+            cursor_used=bool(cursor_resolution),
+            cursor_resolution_type=resolution_type or "<none>",
+            cursor_candidates_relevant=cursor_resolution.get("candidates_relevant") if cursor_resolution else "",
+            cursor_selected_path=cursor_resolution.get("selected_path") if cursor_resolution else "",
+            cursor_selected_flag=cursor_resolution.get("selected_flag") if cursor_resolution else "",
+        )
+        followup = {
+            "prompt": selection,
+            "original_prompt": case.phase1_prompt if phase == 1 else case.phase2_prompt,
+            "thread_id": str(current.get("thread_id") or ""),
+            "teams_conversation_id": conversation_id,
+            "memory_conversation_id": phase_request["memory_conversation_id"],
+            "teams_requester": phase_request["teams_requester"],
+            "source": "teams",
+            "mode": "infra",
+            "test_mode": True,
+            "automated_test_phase": phase,
+            "automated_test_case_id": case.case_id,
+            "fresh_infra_generation": True,
+            # Keep the already-resolved test branch strategy across target or
+            # free-form clarification continuations. A clarification must not
+            # reopen the normal user branch-choice stage.
+            "pending_branch_choice_resolved": True,
+            "branch_choice": "new",
+            "force_new_branch": True,
+            "reuse_branch": False,
+            "existing_branch": "",
+            "cloud": case.cloud,
+            "requested_cloud": case.cloud,
+            "required_repository_context_ids": list(phase_request.get("required_repository_context_ids") or []),
+        }
+        if structured_picker:
+            followup["pending_target_selection_reply"] = True
+            followup["pending_target_selection_thread_id"] = str(current.get("thread_id") or "")
+        current, current_status = _invoke_backend(core, followup, row)
+    return current, current_status, clarified
+
+
+def _run_case(core: Any, case: TestCase, run_id: str, requester_id: str) -> TestCaseResult:
+    started = time.monotonic()
+    row = TestCaseResult(case=case)
+    p1_conversation = f"terrabot-test::{requester_id}::{run_id}::{case.case_id}::p1"
+    p2_conversation = f"terrabot-test::{requester_id}::{run_id}::{case.case_id}::p2"
+    phase1_result: dict = {}
+    phase2_result: dict = {}
+
+    _diag(
+        "test_case_started",
+        run_id=run_id,
+        test_case_id=case.case_id,
+        repo=f"{case.owner}/{case.repo}",
+        cloud=case.cloud,
+        environment=case.environment,
+        phase1_prompt=case.phase1_prompt,
+        phase2_prompt=case.phase2_prompt,
+        expected_path=case.path,
+        expected_flag=case.flag,
+    )
+
+    try:
+        if case.case_type == "boolean_context":
+            baseline_context = _search_context(case)
+            row.context_present_before = _matching_context_record(case, baseline_context) is not None
+        phase1_request = _phase_request(case, case.phase1_prompt, p1_conversation, phase=1)
+        phase1_request["teams_requester"] = f"terrabot-test-{run_id[-6:]}-{case.case_id}"
+        phase1_result, status = _invoke_backend(core, phase1_request, row)
+        row.phase1_mode = str(phase1_result.get("mode") or "").lower()
+        row.actual_mode = str(phase1_result.get("mode") or "")
+        row.phase1_control_mentioned = _control_mentioned(case, phase1_result)
+        _diag(
+            "phase1_initial_backend_result",
+            run_id=run_id,
+            test_case_id=case.case_id,
+            status=status,
+            mode=row.phase1_mode or "<none>",
+            ok=phase1_result.get("ok"),
+            file_count=len(phase1_result.get("files") or []),
+            candidate_count=len(phase1_result.get("candidates") or []),
+            control_mentioned=row.phase1_control_mentioned,
+            decision_state=phase1_result.get("decision_state") or "",
+            reply=str(phase1_result.get("reply") or "")[:500],
+        )
+        row.phase1_ok = status < 500 and bool(phase1_result.get("ok", True))
+
+        phase1_result, status, row.phase1_clarified = _resolve_automated_clarifications(
+            core,
+            case,
+            row,
+            phase1_result,
+            status,
+            phase=1,
+            conversation_id=p1_conversation,
+            phase_request=phase1_request,
+            run_id=run_id,
+        )
+        row.actual_mode = str(phase1_result.get("mode") or "")
+        row.phase1_control_mentioned = row.phase1_control_mentioned or _control_mentioned(case, phase1_result)
+        row.phase1_ok = status < 500 and bool(phase1_result.get("ok", True))
+
+        (
+            row.expected_target_found,
+            row.correct_flag_detected,
+            row.phase1_file_generated,
+            row.actual_file,
+        ) = _target_detection(case, phase1_result)
+        row.expected_target_found = row.expected_target_found and _repo_matches(case, phase1_result)
+        row.cursor_evidence["phase1"] = {
+            "mode": str(phase1_result.get("mode") or ""),
+            "status": status,
+            "generated_files": _cursor_file_evidence(case, phase1_result),
+            "backend_target_found": row.expected_target_found,
+            "backend_control_detected": row.correct_flag_detected,
+        }
+
+        validation_thread = str(phase1_result.get("thread_id") or p1_conversation)
+        if str(phase1_result.get("mode") or "").lower() == "infra_preview":
+            row.validation_ok, row.validation_error = _validate_preview(
+                core, phase1_result, case.phase1_prompt, validation_thread
+            )
+        elif str(phase1_result.get("mode") or "").lower() == "branch_created":
+            # Branch creation is downstream of the production validation gate.
+            row.validation_ok = bool(phase1_result.get("ok", True))
+        else:
+            row.validation_ok = False
+            row.validation_error = f"Expected infra_preview before branch push, received {phase1_result.get('mode') or '<none>'}."
+
+        branch_result = phase1_result
+        branch_status = status
+        if row.validation_ok and str(phase1_result.get("mode") or "").lower() == "infra_preview":
+            branch_result, branch_status = _commit_preview_to_test_branch(
+                core, case, run_id, phase1_result, phase1_request
+            )
+            row.bot_calls += 1
+
+        row.branch_name = str(branch_result.get("branch") or "").strip()
+        row.branch_url = str(branch_result.get("branch_url") or "").strip()
+        row.branch_pushed = (
+            branch_status < 400
+            and bool(branch_result.get("ok", True))
+            and str(branch_result.get("mode") or "").lower() == "branch_created"
+            and bool(row.branch_name or row.branch_url)
+        )
+        row.cursor_evidence["phase1"].update({
+            "backend_validation_ok": row.validation_ok,
+            "backend_validation_error": row.validation_error,
+            "branch_pushed": row.branch_pushed,
+            "branch_name": row.branch_name,
+            "branch_url": row.branch_url,
+        })
+        _diag(
+            "phase1_branch_result",
+            run_id=run_id,
+            test_case_id=case.case_id,
+            branch_pushed=row.branch_pushed,
+            branch=row.branch_name,
+            mode=branch_result.get("mode"),
+        )
+
+        if case.case_type == "resource_creation":
+            # Creation is a separate workflow test. It intentionally allows
+            # one or more repository/module pickers and does not require a
+            # Phase 2 repository-context reuse assertion.
+            row.score = _calculate_case_score(row, include_cursor=False)
+            row.backend_score = row.score
+            _diag(
+                "resource_creation_case_completed",
+                run_id=run_id,
+                test_case_id=case.case_id,
+                clarified=row.phase1_clarified,
+                file_generated=row.phase1_file_generated,
+                validation_ok=row.validation_ok,
+                branch_pushed=row.branch_pushed,
+                score=row.score,
+            )
+            return row
+
+        # Let the normal post-commit context workflow run first. If it did not
+        # create this deterministic mapping, the isolated test harness adds the
+        # verified mapping itself so the same run can still exercise Phase 2.
+        context_search = _search_context(case)
+        row.context_stored = _matching_context_record(case, context_search) is not None
+        row.production_context_created = row.context_stored and not row.context_present_before
+        row.context_gap_detected = terrabot_test_analysis.is_context_gap(
+            case, row, context_present_before=row.context_present_before
+        )
+        if not row.context_stored and row.branch_pushed and row.context_gap_detected:
+            evidence_branch = row.branch_name or case.branch
+            branch_sha = _branch_head_sha(core, case, row.branch_name)
+            live_content = core.github_get_file_content_by_repo(
+                case.owner, case.repo, case.path, ref=evidence_branch
+            ) or ""
+            assignment = re.search(
+                rf"(?m)^\s*{re.escape(case.flag)}\s*=\s*(?:true|false)\s*(?:#.*)?$",
+                str(live_content),
+                re.IGNORECASE,
+            )
+            candidate = terrabot_test_analysis.build_boolean_context_candidate(
+                case,
+                run_id=run_id,
+                evidence_line=assignment.group(0).strip() if assignment else case.evidence_line,
+            )
+            row.context_candidate_created = True
+            owner_hash = terrabot_test_state.requester_hash(requester_id)
+            try:
+                terrabot_test_state.save_context_candidate(owner_hash, run_id, candidate)
+            except Exception as exc:
+                _diag("context_candidate_state_save_failed", level="warning", run_id=run_id, test_case_id=case.case_id, error=exc)
+
+            def candidate_fetcher(owner: str, repo: str, path: str, ref_value: str) -> str | None:
+                return core.github_get_file_content_by_repo(owner, repo, path, ref=ref_value)
+
+            validation = repository_context.validate_repository_context_candidate(
+                candidate,
+                repo_owner=case.owner,
+                repo_name=case.repo,
+                evidence_ref=branch_sha or evidence_branch,
+                evidence_fetcher=candidate_fetcher,
+            )
+            row.context_candidate_verified = bool(validation.get("valid"))
+            try:
+                terrabot_test_state.update_context_candidate_status(
+                    owner_hash, run_id, candidate["candidate_id"],
+                    "verified" if row.context_candidate_verified else "rejected",
+                    validation_errors=validation.get("errors") or [],
+                    verified=row.context_candidate_verified,
+                )
+            except Exception as exc:
+                _diag("context_candidate_verification_state_failed", level="warning", run_id=run_id, test_case_id=case.case_id, error=exc)
+
+            if row.context_candidate_verified:
+                row.fallback_context_created = _ensure_context_mapping(
+                    core,
+                    case,
+                    run_id,
+                    evidence_branch=evidence_branch,
+                    evidence_commit_sha=branch_sha or case.commit_sha,
+                )
+                row.context_candidate_promoted = row.fallback_context_created
+                row.context_stored = row.context_stored or row.fallback_context_created
+                try:
+                    terrabot_test_state.update_context_candidate_status(
+                        owner_hash, run_id, candidate["candidate_id"],
+                        "promoted" if row.context_candidate_promoted else "promotion_failed",
+                        promoted=row.context_candidate_promoted,
+                    )
+                except Exception as exc:
+                    _diag("context_candidate_state_update_failed", level="warning", run_id=run_id, test_case_id=case.case_id, error=exc)
+
+        # The Boolean target itself was deterministically derived from the pinned
+        # live repository before execution. Persist that verified mapping even
+        # when generation fails, so repeated tests monotonically populate the
+        # shared repository context instead of discarding useful repo knowledge.
+        if not row.context_stored:
+            row.fallback_context_created = _ensure_context_mapping(
+                core, case, run_id, evidence_branch=case.branch, evidence_commit_sha=case.commit_sha
+            )
+            row.context_candidate_promoted = row.context_candidate_promoted or row.fallback_context_created
+            row.context_stored = row.context_stored or row.fallback_context_created
+            if row.fallback_context_created:
+                _diag(
+                    "repository_derived_context_persisted",
+                    run_id=run_id,
+                    test_case_id=case.case_id,
+                    path=case.path,
+                    flag=case.flag,
+                )
+
+        # Capture the actual indexed record after production learning or the
+        # verified harness promotion. Cursor later checks its semantics and
+        # correlates it with the independent Phase 2 search result.
+        final_context_search = _search_context(case) if row.context_stored else context_search
+        final_context_match = _matching_context_record(case, final_context_search)
+        row.cursor_evidence["context_after_phase1"] = {
+            "stored": row.context_stored,
+            "present_before": row.context_present_before,
+            "production_created": row.production_context_created,
+            "fallback_created": row.fallback_context_created,
+            "record": _cursor_context_evidence(final_context_match),
+        }
+
+        # Phase 2 retrieval is checked with the actual randomized paraphrase and
+        # then exercised through a completely fresh Teams conversation.
+        phase2_search = repository_context.search_repository_context(
+            repo_owner=case.owner,
+            repo_name=case.repo,
+            query=case.phase2_prompt,
+            current_commit_sha="",
+            top_k=8,
+        )
+        phase2_match = _matching_context_record(case, phase2_search)
+        row.phase2_context_retrieved = phase2_match is not None
+
+        phase2_request = _phase_request(case, case.phase2_prompt, p2_conversation, phase=2)
+        phase2_request["teams_requester"] = f"terrabot-test-phase2-{run_id[-6:]}-{case.case_id}"
+        if phase2_match and str(phase2_match.get("id") or "").strip():
+            phase2_request["required_repository_context_ids"] = [str(phase2_match.get("id"))]
+        phase2_result, status = _invoke_backend(core, phase2_request, row)
+        row.phase2_mode = str(phase2_result.get("mode") or "").lower()
+        row.phase2_control_mentioned = _control_mentioned(case, phase2_result)
+        _diag(
+            "phase2_initial_backend_result",
+            run_id=run_id,
+            test_case_id=case.case_id,
+            status=status,
+            mode=row.phase2_mode or "<none>",
+            ok=phase2_result.get("ok"),
+            file_count=len(phase2_result.get("files") or []),
+            candidate_count=len(phase2_result.get("candidates") or []),
+            control_mentioned=row.phase2_control_mentioned,
+            decision_state=phase2_result.get("decision_state") or "",
+            repository_context_attached=bool(((phase2_result.get("test_diagnostics") or {}).get("repository_context") or {}).get("attached")),
+            reply=str(phase2_result.get("reply") or "")[:500],
+        )
+        row.phase2_ok = status < 500 and bool(phase2_result.get("ok", True))
+        first_phase2_mode = row.phase2_mode
+        diagnostics = ((phase2_result.get("test_diagnostics") or {}).get("repository_context") or {})
+        attached_ids = {str(value) for value in (diagnostics.get("context_ids") or []) if str(value)}
+        expected_context_id = str((phase2_match or {}).get("id") or "")
+        row.phase2_context_attached = bool(
+            diagnostics.get("attached")
+            and (not expected_context_id or expected_context_id in attached_ids)
+        )
+        row.phase2_context_backend_defect = bool(
+            row.phase2_context_retrieved and not row.phase2_context_attached
+        )
+        if row.phase2_context_backend_defect:
+            _diag(
+                "phase2_context_attachment_backend_defect",
+                level="error",
+                run_id=run_id,
+                test_case_id=case.case_id,
+                expected_context_id=expected_context_id,
+                attached_context_ids=sorted(attached_ids),
+            )
+        row.phase2_reused_without_clarification = row.phase2_context_retrieved and first_phase2_mode != "clarification"
+
+        # Still continue a Phase 2 clarification so file-generation accuracy is
+        # measured independently from context retrieval accuracy.
+        phase2_result, status, row.phase2_clarified = _resolve_automated_clarifications(
+            core,
+            case,
+            row,
+            phase2_result,
+            status,
+            phase=2,
+            conversation_id=p2_conversation,
+            phase_request=phase2_request,
+            run_id=run_id,
+        )
+        row.phase2_ok = status < 500 and bool(phase2_result.get("ok", True))
+        row.phase2_control_mentioned = row.phase2_control_mentioned or _control_mentioned(case, phase2_result)
+
+        p2_target, p2_flag, row.phase2_file_generated, _ = _target_detection(case, phase2_result)
+        row.phase2_target_ok = p2_target and p2_flag and _repo_matches(case, phase2_result)
+        row.phase2_context_useful = bool(
+            row.phase2_context_retrieved
+            and row.phase2_context_attached
+            and row.phase2_target_ok
+            and row.phase2_reused_without_clarification
+        )
+        row.cursor_evidence["phase2"] = {
+            "first_mode": first_phase2_mode,
+            "final_mode": str(phase2_result.get("mode") or ""),
+            "context_retrieved": row.phase2_context_retrieved,
+            "retrieved_record": _cursor_context_evidence(phase2_match),
+            "context_attached": row.phase2_context_attached,
+            "attached_context_ids": sorted(attached_ids),
+            "expected_context_id": expected_context_id,
+            "reused_without_clarification": row.phase2_reused_without_clarification,
+            "target_ok": row.phase2_target_ok,
+            "generated_files": _cursor_file_evidence(case, phase2_result),
+        }
+
+        row.score = _calculate_case_score(row, include_cursor=False)
+        row.backend_score = row.score
+    except Exception as exc:
+        row.error = str(exc)
+        _diag(
+            "test_case_failed",
+            level="error",
+            run_id=run_id,
+            test_case_id=case.case_id,
+            error=exc,
+        )
+    finally:
+        _safe_reset(core, p1_conversation, phase1_result)
+        _safe_reset(core, p2_conversation, phase2_result)
+        row.duration_ms = int((time.monotonic() - started) * 1000)
+        row.failure_classification = terrabot_test_analysis.classify_result(case, row)
+
+    _diag(
+        "test_case_completed",
+        run_id=run_id,
+        test_case_id=case.case_id,
+        expected_target_found=row.expected_target_found,
+        correct_flag_detected=row.correct_flag_detected,
+        phase1_control_mentioned=row.phase1_control_mentioned,
+        phase2_control_mentioned=row.phase2_control_mentioned,
+        phase1_mode=row.phase1_mode,
+        phase2_mode=row.phase2_mode,
+        phase1_file_generated=row.phase1_file_generated,
+        validation_ok=row.validation_ok,
+        branch_pushed=row.branch_pushed,
+        context_stored=row.context_stored,
+        phase2_context_retrieved=row.phase2_context_retrieved,
+        phase2_file_generated=row.phase2_file_generated,
+        phase2_target_ok=row.phase2_target_ok,
+        context_reuse=row.phase2_reused_without_clarification,
+        calls=row.bot_calls,
+        duration_ms=row.duration_ms,
+        score=row.score,
+    )
+    return row
+
+
+def _repo_specs(core: Any, cloud_filter: str) -> list[RepositorySpec]:
+    owner = str(getattr(core, "GITHUB_OWNER", "") or "").strip()
+    specs: list[RepositorySpec] = []
+    if cloud_filter in {"all", "aws"}:
+        repo = str(getattr(core, "GITHUB_AWS_REPO", "") or "").strip()
+        branch = str(getattr(core, "GITHUB_AWS_BASE_BRANCH", "") or "main").strip() or "main"
+        if owner and repo:
+            specs.append(RepositorySpec("aws", owner, repo, branch))
+    if cloud_filter in {"all", "azure"}:
+        repo = str(getattr(core, "GITHUB_AZURE_REPO", "") or "").strip()
+        branch = str(getattr(core, "GITHUB_AZURE_BASE_BRANCH", "") or "main").strip() or "main"
+        if owner and repo:
+            specs.append(RepositorySpec("azure", owner, repo, branch))
+    return specs
+
+
+def _derive_test_cases(core: Any, cloud_filter: str, count: int, run_id: str, run_mode: str = "regression") -> tuple[list[TestCase], list[str]]:
+    specs = _repo_specs(core, cloud_filter)
+    if not specs:
+        return [], ["No configured GitHub repositories matched the requested cloud filter."]
+
+    # `run tests` defaults to six cases: exactly three AWS + three Azure.
+    # Explicit larger all-cloud counts remain balanced as closely as possible.
+    wanted_by_cloud: dict[str, int] = {}
+    if cloud_filter == "all" and len(specs) >= 2:
+        aws_count = count // 2
+        azure_count = count - aws_count
+        wanted_by_cloud = {"aws": aws_count, "azure": azure_count}
+    else:
+        wanted_by_cloud = {spec.cloud: count for spec in specs}
+
+    cases: list[TestCase] = []
+    errors: list[str] = []
+    for spec in specs:
+        wanted = max(0, wanted_by_cloud.get(spec.cloud, 0))
+        if wanted <= 0:
+            continue
+        try:
+            creation_slots = 0 if run_mode == "context-regression" else (1 if wanted >= 2 else 0)
+            boolean_wanted = max(0, wanted - creation_slots)
+            pool_size = boolean_wanted * 3 if run_mode in {"exploration", "mixed"} else boolean_wanted
+            derived = _derive_cases_for_repository(
+                core,
+                spec,
+                wanted=max(boolean_wanted, pool_size),
+                run_id=run_id,
+                semantic_generation=run_mode in {"exploration", "mixed"},
+            )
+            if run_mode == "context-regression" and derived:
+                context_backed: list[TestCase] = []
+                for candidate_case in derived:
+                    try:
+                        if _matching_context_record(candidate_case, _search_context(candidate_case)) is not None:
+                            context_backed.append(candidate_case)
+                    except Exception as exc:
+                        _diag("context_regression_selection_failed", level="warning", run_id=run_id, test_case_id=candidate_case.case_id, error=exc)
+                derived = context_backed[:boolean_wanted]
+            elif run_mode in {"exploration", "mixed"} and derived:
+                try:
+                    coverage = terrabot_test_state.load_coverage(f"{spec.owner}/{spec.repo}")
+                    derived = terrabot_test_coverage.select_cases(derived, coverage, boolean_wanted)
+                except Exception as exc:
+                    _diag("coverage_selection_failed", level="warning", run_id=run_id, repo=f"{spec.owner}/{spec.repo}", error=exc)
+                    derived = derived[:boolean_wanted]
+            else:
+                derived = derived[:boolean_wanted]
+            if creation_slots:
+                creation_case = _derive_creation_case_for_repository(
+                    core,
+                    spec,
+                    run_id=run_id,
+                    index=1,
+                )
+                if creation_case is not None:
+                    derived.append(creation_case)
+                else:
+                    errors.append(f"{spec.cloud}:{spec.repo}: no safe live resource-creation case could be derived.")
+            cases.extend(derived)
+            if len(derived) < wanted:
+                errors.append(f"{spec.cloud}:{spec.repo}: only {len(derived)}/{wanted} valid environment-scoped cases could be derived.")
+        except Exception as exc:
+            message = f"{spec.cloud}:{spec.owner}/{spec.repo}: {exc}"
+            errors.append(message)
+            _diag("repository_case_generation_failed", level="error", run_id=run_id, error=message)
+    return cases[:count], errors
+
+
+def _cursor_validation_case_payload(item: TestCaseResult) -> dict[str, Any]:
+    case = item.case
+    return {
+        "case_id": case.case_id,
+        "case_type": case.case_type,
+        "owner": case.owner,
+        "repo": case.repo,
+        "cloud": case.cloud,
+        "environment": case.environment,
+        "commit_sha": case.commit_sha,
+        "base_branch": case.branch,
+        "test_branch": item.branch_name,
+        "test_branch_url": item.branch_url,
+        "phase1_prompt": case.phase1_prompt,
+        "phase2_prompt": case.phase2_prompt if case.case_type == "boolean_context" else "",
+        "expected": {
+            "path": case.path,
+            "flag": case.flag,
+            "alias": case.alias,
+            "current_value": case.current_value,
+            "desired_value": case.desired_value,
+            "evidence_line": case.evidence_line,
+        },
+        "backend_assertions": {
+            "target_found": item.expected_target_found,
+            "control_detected": item.correct_flag_detected,
+            "phase1_control_mentioned": item.phase1_control_mentioned,
+            "phase2_control_mentioned": item.phase2_control_mentioned,
+            "phase1_mode": item.phase1_mode,
+            "phase2_mode": item.phase2_mode,
+            "phase1_file_generated": item.phase1_file_generated,
+            "precommit_validation_ok": item.validation_ok,
+            "branch_pushed": item.branch_pushed,
+            "context_stored": item.context_stored,
+            "phase2_context_retrieved": item.phase2_context_retrieved,
+            "phase2_context_attached": item.phase2_context_attached,
+            "phase2_context_backend_defect": item.phase2_context_backend_defect,
+            "phase1_freeform_clarification": item.phase1_freeform_clarification,
+            "phase2_freeform_clarification": item.phase2_freeform_clarification,
+            "phase1_cursor_clarification_used": item.phase1_cursor_clarification_used,
+            "phase2_cursor_clarification_used": item.phase2_cursor_clarification_used,
+            "phase2_target_ok": item.phase2_target_ok,
+            "phase2_reused_without_clarification": item.phase2_reused_without_clarification,
+            "backend_score": item.score,
+        },
+        "evidence": item.cursor_evidence,
+    }
+
+
+def _apply_cursor_validation_result(
+    run_id: str,
+    cases: list[TestCaseResult],
+    validation: dict[str, Any],
+) -> None:
+    requested = bool(validation.get("enabled"))
+    if not requested:
+        return
+    completed = bool(validation.get("completed"))
+    verdicts = validation.get("case_results") or {}
+    shared_error = str(validation.get("error") or "").strip()
+    agent_url = str(validation.get("agent_url") or "").strip()
+    duration_ms = int(validation.get("duration_ms") or 0)
+
+    for item in cases:
+        item.cursor_validation_requested = True
+        item.cursor_agent_url = agent_url
+        item.cursor_validation_duration_ms = duration_ms
+        item.backend_score = item.score
+        verdict = verdicts.get(item.case.case_id) if isinstance(verdicts, dict) else None
+        if completed and isinstance(verdict, dict):
+            item.cursor_validation_completed = True
+            item.cursor_output_correct = bool(verdict.get("output_correct"))
+            if item.case.case_type == "boolean_context":
+                item.cursor_context_added = bool(verdict.get("context_added"))
+                item.cursor_context_retrievable = bool(verdict.get("context_retrievable"))
+                item.cursor_context_reused = bool(verdict.get("context_reused"))
+                applicable_ok = bool(
+                    item.cursor_output_correct
+                    and item.cursor_context_added
+                    and item.cursor_context_retrievable
+                    and item.cursor_context_reused
+                )
+            else:
+                applicable_ok = item.cursor_output_correct
+            item.cursor_overall_ok = bool(verdict.get("overall_ok")) and applicable_ok
+            item.cursor_validation_reason = str(verdict.get("reason") or "").strip()
+            item.cursor_verdict_evidence = [
+                str(value).strip()[:500]
+                for value in (verdict.get("evidence") or [])[:8]
+                if str(value).strip()
+            ]
+        else:
+            item.cursor_validation_error = shared_error or "Cursor validation did not return a verdict for this case."
+
+        item.score = _calculate_case_score(item, include_cursor=True)
+        item.failure_classification = terrabot_test_analysis.classify_result(item.case, item)
+        _diag(
+            "cursor_validation_applied",
+            run_id=run_id,
+            test_case_id=item.case.case_id,
+            completed=item.cursor_validation_completed,
+            output_correct=item.cursor_output_correct,
+            context_added=item.cursor_context_added if item.case.case_type == "boolean_context" else "n/a",
+            context_retrievable=item.cursor_context_retrievable if item.case.case_type == "boolean_context" else "n/a",
+            context_reused=item.cursor_context_reused if item.case.case_type == "boolean_context" else "n/a",
+            overall_ok=item.cursor_overall_ok,
+            backend_score=item.backend_score,
+            final_score=item.score,
+            error=item.cursor_validation_error,
+        )
+
+
+def _escape_table(value: Any, limit: int = 56) -> str:
+    text = re.sub(r"\s+", " ", str(value if value is not None else "")).strip()
+    text = text.replace("|", "\\|")
+    if len(text) > limit:
+        text = text[: limit - 1] + "…"
+    return text
+
+
+def _status(value: bool) -> str:
+    return "PASS" if value else "FAIL"
+
+
+def _cursor_status(item: TestCaseResult, attribute: str) -> str:
+    if not item.cursor_validation_requested:
+        return "N/A"
+    if not item.cursor_validation_completed:
+        return "ERROR"
+    return _status(bool(getattr(item, attribute, False)))
+
+
+def _cursor_context_status(item: TestCaseResult) -> str:
+    if item.case.case_type != "boolean_context" or not item.cursor_validation_requested:
+        return "N/A"
+    if not item.cursor_validation_completed:
+        return "ERROR"
+    return (
+        f"ADD:{_status(item.cursor_context_added)} "
+        f"GET:{_status(item.cursor_context_retrievable)} "
+        f"USE:{_status(item.cursor_context_reused)}"
+    )
+
+
+def format_test_run_report(run: TestRunResult) -> str:
+    completed = len(run.cases)
+    passed = sum(1 for item in run.cases if item.score == 100)
+    average_score = round(sum(item.score for item in run.cases) / completed, 1) if completed else 0.0
+    average_backend_score = round(
+        sum((item.backend_score or item.score) for item in run.cases) / completed, 1
+    ) if completed else 0.0
+    branches = sum(1 for item in run.cases if item.branch_pushed)
+    p1_files = sum(1 for item in run.cases if item.phase1_file_generated)
+    context_cases = [item for item in run.cases if item.case.case_type == "boolean_context"]
+    creation_cases = [item for item in run.cases if item.case.case_type == "resource_creation"]
+    contexts = sum(1 for item in context_cases if item.context_stored)
+    p2_context = sum(1 for item in context_cases if item.phase2_context_retrieved)
+    p2_attached = sum(1 for item in context_cases if item.phase2_context_attached)
+    p2_useful = sum(1 for item in context_cases if item.phase2_context_useful)
+    production_context = sum(1 for item in context_cases if item.production_context_created)
+    fallback_context = sum(1 for item in context_cases if item.fallback_context_created)
+    p2_files = sum(1 for item in context_cases if item.phase2_file_generated)
+    avg_calls = round(sum(item.bot_calls for item in run.cases) / completed, 1) if completed else 0.0
+    avg_seconds = round(sum(item.duration_ms for item in run.cases) / max(completed, 1) / 1000.0, 1)
+    cursor_cases = [item for item in run.cases if item.cursor_validation_requested]
+    cursor_reviewed = sum(1 for item in cursor_cases if item.cursor_validation_completed)
+    cursor_output = sum(1 for item in cursor_cases if item.cursor_validation_completed and item.cursor_output_correct)
+    cursor_context_cases = [item for item in context_cases if item.cursor_validation_requested]
+    cursor_context_added = sum(1 for item in cursor_context_cases if item.cursor_validation_completed and item.cursor_context_added)
+    cursor_context_get = sum(1 for item in cursor_context_cases if item.cursor_validation_completed and item.cursor_context_retrievable)
+    cursor_context_use = sum(1 for item in cursor_context_cases if item.cursor_validation_completed and item.cursor_context_reused)
+    cursor_overall = sum(1 for item in cursor_cases if item.cursor_validation_completed and item.cursor_overall_ok)
+    freeform_p1 = sum(1 for item in run.cases if item.phase1_freeform_clarification)
+    freeform_p2 = sum(1 for item in context_cases if item.phase2_freeform_clarification)
+    context_attach_defects = sum(1 for item in context_cases if item.phase2_context_backend_defect)
+    cursor_clarifications = sum(1 for item in run.cases if item.phase1_cursor_clarification_used or item.phase2_cursor_clarification_used)
+
+    lines = [
+        "**Terrabot automated repository-context test results**",
+        f"Run ID: `{run.run_id}`",
+        f"Cases: **{completed}/{run.requested_cases}** | Full passes: **{passed}** | Average accuracy: **{average_score}%**",
+        f"Phase 1 files generated: **{p1_files}/{completed}** | Branches pushed: **{branches}/{completed}** | Creation cases: **{len(creation_cases)}**",
+        f"Boolean-context cases: **{len(context_cases)}** | Context available: **{contexts}/{len(context_cases) or 1}** | Production learned: **{production_context}** | Harness promoted: **{fallback_context}**",
+        f"Phase 2 context retrieved: **{p2_context}/{len(context_cases) or 1}** | Attached to Foundry: **{p2_attached}/{len(context_cases) or 1}** | Useful: **{p2_useful}/{len(context_cases) or 1}** | Phase 2 files: **{p2_files}/{len(context_cases) or 1}**",
+        f"Unexpected free-form clarifications: **P1 {freeform_p1} / P2 {freeform_p2}** | Cursor clarification assists: **{cursor_clarifications}** | Context-attachment backend defects: **{context_attach_defects}**",
+        f"Average backend calls/case: **{avg_calls}** | Average case time: **{avg_seconds}s** | Total: **{round(run.duration_ms / 1000.0, 1)}s**",
+    ]
+    if cursor_cases:
+        lines.append(
+            f"Cursor independent review: **{cursor_reviewed}/{len(cursor_cases)}** completed | "
+            f"Output correct: **{cursor_output}/{len(cursor_cases)}** | "
+            f"Context added: **{cursor_context_added}/{len(cursor_context_cases) or 1}** | "
+            f"Retrievable: **{cursor_context_get}/{len(cursor_context_cases) or 1}** | "
+            f"Reused: **{cursor_context_use}/{len(cursor_context_cases) or 1}** | "
+            f"Overall accepted: **{cursor_overall}/{len(cursor_cases)}**"
+        )
+        lines.append(
+            f"Backend-only accuracy: **{average_backend_score}%** | "
+            f"Final accuracy after Cursor: **{average_score}%**"
+        )
     lines.extend([
         "",
-        "Reply with the number or resource/component name shown above. Terrabot will use the already resolved repository path internally.",
+        "| Test | Type | Cloud/Env | Phase 1 prompt | Expected target | P1 mode | P2 mode | Target found | Control/output | Control mentioned | P1 file | Validation | Branch pushed | Context | P2 retrieved | P2 attached | P2 useful | Cursor output | Cursor context | Cursor overall | Classification | Score |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---:|",
+    ])
+    for item in run.cases:
+        case = item.case
+        target = f"{case.path} :: {case.flag}" if case.flag else f"repository creation near {case.path}"
+        context_status = _status(item.context_stored) if case.case_type == "boolean_context" else "N/A"
+        p2_context_status = _status(item.phase2_context_retrieved) if case.case_type == "boolean_context" else "N/A"
+        lines.append(
+            "| "
+            + " | ".join(
+                [
+                    _escape_table(case.case_id, 22),
+                    _escape_table(case.case_type.replace("_", " "), 20),
+                    _escape_table(f"{case.cloud}/{case.environment}", 22),
+                    _escape_table(case.phase1_prompt, 38),
+                    _escape_table(target, 50),
+                    _escape_table(item.phase1_mode or "<none>", 20),
+                    _escape_table(item.phase2_mode or "<none>", 20) if case.case_type == "boolean_context" else "N/A",
+                    _status(item.expected_target_found),
+                    _status(item.correct_flag_detected),
+                    (
+                        f"P1:{_status(item.phase1_control_mentioned)} P2:{_status(item.phase2_control_mentioned)}"
+                        if case.case_type == "boolean_context"
+                        else "N/A"
+                    ),
+                    _status(item.phase1_file_generated),
+                    _status(item.validation_ok),
+                    _status(item.branch_pushed),
+                    context_status,
+                    p2_context_status,
+                    _status(item.phase2_context_attached) if case.case_type == "boolean_context" else "N/A",
+                    _status(item.phase2_context_useful) if case.case_type == "boolean_context" else "N/A",
+                    _cursor_status(item, "cursor_output_correct"),
+                    _escape_table(_cursor_context_status(item), 42),
+                    _cursor_status(item, "cursor_overall_ok"),
+                    _escape_table(item.failure_classification or "", 36),
+                    f"{item.score}%",
+                ]
+            )
+            + " |"
+        )
+
+    if cursor_cases:
+        lines.extend([
+            "",
+            "**Cursor independent validation**",
+            "| Test | Output correct | Context added | Context retrievable | Context reused | Overall | Reason |",
+            "|---|---|---|---|---|---|---|",
+        ])
+        for item in cursor_cases:
+            context_added_status = (
+                _cursor_status(item, "cursor_context_added")
+                if item.case.case_type == "boolean_context"
+                else "N/A"
+            )
+            context_retrievable_status = (
+                _cursor_status(item, "cursor_context_retrievable")
+                if item.case.case_type == "boolean_context"
+                else "N/A"
+            )
+            context_reused_status = (
+                _cursor_status(item, "cursor_context_reused")
+                if item.case.case_type == "boolean_context"
+                else "N/A"
+            )
+            reason = item.cursor_validation_reason or item.cursor_validation_error or "No Cursor reason returned."
+            lines.append(
+                "| "
+                + " | ".join([
+                    _escape_table(item.case.case_id, 24),
+                    _cursor_status(item, "cursor_output_correct"),
+                    context_added_status,
+                    context_retrievable_status,
+                    context_reused_status,
+                    _cursor_status(item, "cursor_overall_ok"),
+                    _escape_table(reason, 100),
+                ])
+                + " |"
+            )
+
+    failures = [item for item in run.cases if item.score < 100]
+    if failures:
+        lines.extend(["", "**Failed assertions**"])
+        for item in failures[:12]:
+            reasons: list[str] = []
+            if not item.expected_target_found:
+                reasons.append("expected target not detected")
+            if not item.correct_flag_detected:
+                reasons.append("correct flag not detected")
+            if not item.phase1_file_generated:
+                reasons.append("Phase 1 file not generated")
+            if not item.validation_ok:
+                reasons.append("validation failed")
+            if not item.branch_pushed:
+                reasons.append("branch not pushed")
+            if item.case.case_type == "boolean_context" and not item.context_stored:
+                reasons.append("context not added")
+            if item.case.case_type == "boolean_context" and not item.phase2_context_retrieved:
+                reasons.append("Phase 2 context not retrieved")
+            if item.case.case_type == "boolean_context" and not item.phase2_context_attached:
+                reasons.append("Phase 2 context not attached to Foundry")
+            if item.case.case_type == "boolean_context" and item.phase2_context_backend_defect:
+                reasons.append("backend defect: retrieved Phase 2 context was not attached")
+            if item.phase1_freeform_clarification:
+                reasons.append("Phase 1 unexpected free-form clarification")
+            if item.phase2_freeform_clarification:
+                reasons.append("Phase 2 unexpected free-form clarification")
+            if item.case.case_type == "boolean_context" and not item.phase2_context_useful:
+                reasons.append("Phase 2 context not useful")
+            if item.case.case_type == "boolean_context" and not item.phase2_file_generated:
+                reasons.append("Phase 2 file not generated")
+            if item.case.case_type == "boolean_context" and not item.phase2_target_ok:
+                reasons.append("Phase 2 target mismatch")
+            if item.case.case_type == "boolean_context" and not item.phase2_reused_without_clarification:
+                reasons.append("Phase 2 required clarification")
+            if item.cursor_validation_requested and not item.cursor_validation_completed:
+                reasons.append("Cursor validation unavailable")
+            if item.cursor_validation_completed and not item.cursor_output_correct:
+                reasons.append("Cursor rejected generated output")
+            if item.case.case_type == "boolean_context" and item.cursor_validation_completed:
+                if not item.cursor_context_added:
+                    reasons.append("Cursor did not verify context addition")
+                if not item.cursor_context_retrievable:
+                    reasons.append("Cursor did not verify context retrieval")
+                if not item.cursor_context_reused:
+                    reasons.append("Cursor did not verify context reuse")
+            if item.cursor_validation_reason and not item.cursor_overall_ok:
+                reasons.append("Cursor: " + item.cursor_validation_reason)
+            if item.cursor_validation_error:
+                reasons.append("Cursor error: " + item.cursor_validation_error)
+            if item.error:
+                reasons.append(item.error)
+            elif item.validation_error and not item.validation_ok:
+                reasons.append(item.validation_error)
+            branch_note = f" branch={item.branch_name}" if item.branch_name else ""
+            lines.append(f"- `{item.case.case_id}`:{branch_note} {_escape_table('; '.join(reasons), 360)}")
+
+    if run.discovery_errors:
+        lines.extend(["", "**Repository discovery warnings**"])
+        lines.extend(f"- {_escape_table(value, 300)}" for value in run.discovery_errors)
+
+    lines.extend([
+        "",
+        "Phase 1 pushes each backend-validated test change to its own Terrabot test branch; no pull request is created. Phase 2 applies only to Boolean-context cases, uses a fresh synthetic Teams conversation, and does not push another branch. After all cases finish, one read-only Cursor review independently checks generated output plus context addition, retrieval, attachment, and reuse evidence. Cursor verdicts are included in full-pass scoring when the feature is enabled.",
+        f"Search Function App logs with `run_id={run.run_id}` for `[TerrabotTest]` and `[TerrabotCursorValidation]` traces.",
     ])
     return "\n".join(lines)
 
 
-def _teams_is_path_request_question(text: str) -> bool:
-    """Treat repo-answerable permission/path/flag questions as internal.
+def _case_state_payload(item: TestCaseResult) -> dict[str, Any]:
+    return {
+        "test_case_id": item.case.case_id,
+        "case_type": item.case.case_type,
+        "cloud": item.case.cloud,
+        "environment": item.case.environment,
+        "repo": item.case.repo,
+        "prompt": item.case.phase1_prompt,
+        "phase2_prompt": item.case.phase2_prompt,
+        "expected_path": item.case.path,
+        "expected_flag": item.case.flag,
+        "expected_target_found": item.expected_target_found,
+        "correct_flag_detected": item.correct_flag_detected,
+        "phase1_control_mentioned": item.phase1_control_mentioned,
+        "phase2_control_mentioned": item.phase2_control_mentioned,
+        "phase1_mode": item.phase1_mode,
+        "phase2_mode": item.phase2_mode,
+        "phase1_file_generated": item.phase1_file_generated,
+        "validation_ok": item.validation_ok,
+        "branch_pushed": item.branch_pushed,
+        "branch": item.branch_name,
+        "branch_url": item.branch_url,
+        "context_stored": item.context_stored,
+        "context_present_before": item.context_present_before,
+        "production_context_created": item.production_context_created,
+        "fallback_context_created": item.fallback_context_created,
+        "context_gap_detected": item.context_gap_detected,
+        "context_candidate_created": item.context_candidate_created,
+        "context_candidate_verified": item.context_candidate_verified,
+        "context_candidate_promoted": item.context_candidate_promoted,
+        "phase2_context_retrieved": item.phase2_context_retrieved,
+        "phase2_context_attached": item.phase2_context_attached,
+        "phase2_context_useful": item.phase2_context_useful,
+        "phase2_file_generated": item.phase2_file_generated,
+        "phase2_target_ok": item.phase2_target_ok,
+        "phase2_reused_without_clarification": item.phase2_reused_without_clarification,
+        "bot_calls": item.bot_calls,
+        "duration_ms": item.duration_ms,
+        "backend_score": item.backend_score,
+        "score": item.score,
+        "cursor_validation_requested": item.cursor_validation_requested,
+        "cursor_validation_completed": item.cursor_validation_completed,
+        "cursor_output_correct": item.cursor_output_correct,
+        "cursor_context_added": item.cursor_context_added,
+        "cursor_context_retrievable": item.cursor_context_retrievable,
+        "cursor_context_reused": item.cursor_context_reused,
+        "cursor_overall_ok": item.cursor_overall_ok,
+        "cursor_validation_reason": item.cursor_validation_reason,
+        "cursor_validation_error": item.cursor_validation_error,
+        "cursor_agent_url": item.cursor_agent_url,
+        "cursor_validation_duration_ms": item.cursor_validation_duration_ms,
+        "cursor_verdict_evidence": list(item.cursor_verdict_evidence),
+        "failure_classification": item.failure_classification,
+        "error": item.error or item.validation_error or item.cursor_validation_error,
+    }
 
-    Generic proceed/confirmation wording is included so a direct infrastructure
-    command cannot leak an unnecessary approval roundtrip. Genuine ambiguity
-    cards (multiple flags/modules/resources) do not match.
-    """
-    value = re.sub(r"\s+", " ", str(text or "").strip().lower())
-    if _FINAL_BOOL_PREVIOUS_PATH_QUESTION(value):
-        return True
-    forbidden = (
-        "path restriction", "allow modifying", "allow modification",
-        "alternative repo-approved path", "alternative repository-approved path",
-        "provide an alternative", "confirm how you want to proceed given the path",
-        "specify the exact file", "which file should i modify",
-        "which path should i modify", "permission to modify",
-        "do you want me to proceed", "would you like me to proceed",
-        "should i proceed", "reply yes to proceed", "before i proceed",
-        "confirm the exact target", "confirm the target", "confirm the file",
-        "confirm the file path", "do you want me to disable",
-        "exact terraform variable", "terraform variable name",
-        "point me to the exact", "paste the snippet that defines",
-        "flag name and location", "where the flag resides",
-        "would you like me to disable", "should i disable",
-        "do you want me to enable", "would you like me to enable",
-        "should i enable", "turning off the repository flag",
-        "turning on the repository flag",
+
+def _new_run_id() -> str:
+    return "ctx-" + time.strftime("%Y%m%d-%H%M%S", time.gmtime()) + "-" + uuid.uuid4().hex[:6]
+
+
+def _status_report(aad_object_id: str, requested_run_id: str = "") -> tuple[dict, int]:
+    owner_hash = terrabot_test_state.requester_hash(aad_object_id)
+    state = (
+        terrabot_test_state.load_run(owner_hash, requested_run_id)
+        if requested_run_id
+        else terrabot_test_state.latest_run(owner_hash)
     )
-    return any(marker in value for marker in forbidden)
+    if not state:
+        return {
+            "ok": False,
+            "mode": "automated_test_status",
+            "reply": "No automated Terrabot test run was found for this Teams identity.",
+        }, 404
+    run_id = str(state.get("run_id") or "")
+    status = str(state.get("status") or "unknown")
+    requested = int(state.get("requested_cases") or 0)
+    completed = int(state.get("completed_cases") or 0)
+    report = str(state.get("report") or "").strip()
+    if status == "completed" and report:
+        return {"ok": True, "mode": "automated_test_status", "run_id": run_id, "reply": report}, 200
+    lines = [
+        "**Terrabot automated test status**",
+        f"Run ID: `{run_id}`",
+        f"Status: **{status}**",
+        f"Completed: **{completed}/{requested}**",
+    ]
+    if state.get("started_at"):
+        lines.append(f"Started: `{state.get('started_at')}`")
+    if state.get("error"):
+        lines.extend(["", f"Error: `{str(state.get('error'))[:1000]}`"])
+    return {"ok": status != "failed", "mode": "automated_test_status", "run_id": run_id, "reply": "\n".join(lines)}, 200
 
 
-def _selected_feature_flag_match_from_active_context(path: str = "") -> dict:
-    active = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
-    wanted_path = str(path or "").strip().strip("/")
-    for ctx in active.get("retrieved_value_context") or []:
-        if not isinstance(ctx, dict) or ctx.get("source") != "backend_existing_infra_code_match":
-            continue
-        for item in ctx.get("matched_files") or []:
-            if not isinstance(item, dict):
-                continue
-            match = item.get("feature_flag_match") or {}
-            item_path = str(item.get("path") or "").strip().strip("/")
-            if match and (not wanted_path or item_path == wanted_path):
-                return dict(match)
-    return {}
+def start_automated_test_run(core: Any, data: dict) -> tuple[dict, int]:
+    """Authorize, persist and enqueue a run; never execute Foundry work inline."""
+    del core
+    prompt = str((data or {}).get("prompt") or "").strip()
+    aad_object_id = str((data or {}).get("aad_object_id") or "").strip()
+    _assert_authorized(aad_object_id)
 
+    status_match = TEST_STATUS_RE.fullmatch(prompt)
+    if status_match:
+        return _status_report(aad_object_id, str(status_match.group(1) or "").strip())
 
-class UnsafeGeneratedChangeError(ValueError):
-    """Generated Terraform is unsafe to write and must not be auto-repaired.
-
-    These failures indicate semantic drift, unrelated edits, or destructive
-    preservation violations. Retrying the same draft through Foundry can turn
-    a blocked bad diff into a different bad diff, so the branch write stops.
-    """
-
-
-def _validate_selected_boolean_is_only_file_change_stage1(
-    existing_content: str,
-    generated_content: str,
-    path: str,
-) -> None:
-    """For a selected Boolean change, require exact preservation otherwise.
-
-    This is a validator only. It never constructs/merges Terraform. The model's
-    final file must differ from live repository truth by exactly one replacement
-    line: the selected literal Boolean assignment.
-    """
-    match = _selected_feature_flag_match_from_active_context(path)
-    if not match:
-        return
-    flag = str(match.get("flag") or "").strip()
-    current = str(match.get("current_value") or "").strip().lower()
-    target = str(match.get("new_value") or "").strip().lower()
-    if not flag or current not in {"true", "false"} or target not in {"true", "false"} or current == target:
-        raise UnsafeGeneratedChangeError("Selected Boolean modification context is incomplete or invalid.")
-
-    existing_lines = (existing_content or "").replace("\r\n", "\n").splitlines()
-    generated_lines = (generated_content or "").replace("\r\n", "\n").splitlines()
-    if len(existing_lines) != len(generated_lines):
-        raise UnsafeGeneratedChangeError(
-            f"Generated Boolean modification for {path} added/removed lines. "
-            "Only the selected Boolean assignment may change; all other repository content must remain exactly preserved."
-        )
-
-    assignment = re.compile(
-        rf'^(\s*){re.escape(flag)}(\s*=\s*)(true|false)(\s*(?:#.*)?)$',
-        re.IGNORECASE,
-    )
-    changed = 0
-    for old_line, new_line in zip(existing_lines, generated_lines):
-        if old_line == new_line:
-            continue
-        old_match = assignment.match(old_line)
-        new_match = assignment.match(new_line)
-        if not old_match or not new_match:
-            raise UnsafeGeneratedChangeError(
-                f"Generated Boolean modification for {path} changed unrelated repository content. "
-                f"Only `{flag} = {current}` may become `{flag} = {target}`."
-            )
-        if old_match.group(3).lower() != current or new_match.group(3).lower() != target:
-            raise UnsafeGeneratedChangeError(
-                f"Generated Boolean modification for {path} changed `{flag}` with unexpected values. "
-                f"Expected {current} -> {target}."
-            )
-        # Preserve indentation, spacing around '=', and any inline comment too.
-        if old_match.group(1) != new_match.group(1) or old_match.group(2) != new_match.group(2) or old_match.group(4) != new_match.group(4):
-            raise UnsafeGeneratedChangeError(
-                f"Generated Boolean modification for {path} reformatted the selected line. "
-                "Only the literal Boolean value may change."
-            )
-        changed += 1
-    if changed != 1:
-        raise UnsafeGeneratedChangeError(
-            f"Generated Boolean modification for {path} must change exactly one `{flag}` assignment; observed {changed}."
-        )
-_validate_selected_boolean_is_only_file_change = _validate_selected_boolean_is_only_file_change_stage1
-
-
-def github_put_file_if_changed(
-    cloud: str,
-    path: str,
-    content: str,
-    branch: str,
-    commit_message: str,
-    repo_target: Optional[str] = None,
-    workflow: Optional[str] = None,
-):
-    """Add exact selected-Boolean preservation validation, then use prior writer."""
-    existing_content = github_get_file_content(
-        cloud,
-        path,
-        branch,
-        repo_target=repo_target,
-        workflow=workflow,
-    )
-    if existing_content is not None:
-        _validate_selected_boolean_is_only_file_change(
-            existing_content,
-            str(content or ""),
-            path,
-        )
-    return _FINAL_BOOL_PREVIOUS_GITHUB_PUT(
-        cloud=cloud,
-        path=path,
-        content=content,
-        branch=branch,
-        commit_message=commit_message,
-        repo_target=repo_target,
-        workflow=workflow,
-    )
-
-
-
-# =============================================================================
-# 2026-08-18 VALIDATED AGENT-OWNED MODIFICATION/CREATION CONTRACT — FINAL OVERRIDE
-# =============================================================================
-# Teams backend responsibilities are limited to repository retrieval, literal
-# repository validation, preservation validation, state, and transport. Foundry
-# owns semantic target selection and every Terraform/HCL edit.
-
-_VALIDATED_PREVIOUS_BUILD_EXISTING_CONTEXT = build_backend_existing_infra_modification_context
-_VALIDATED_PREVIOUS_CONTEXT_SELECTED = _backend_existing_infra_context_is_selected
-_VALIDATED_PREVIOUS_ENFORCE_MOD_PATHS = enforce_modification_uses_backend_matched_files
-_VALIDATED_PREVIOUS_ENFORCE_REAL_INPUTS = enforce_real_module_inputs
-_VALIDATED_PREVIOUS_ENSURE_AZURE_VARIABLES = ensure_azure_consumer_variables_tf_file
-_VALIDATED_PREVIOUS_REPAIR_AZURE_VARIABLES = _repair_azure_consumer_variables_tf_files_in_agent_result
-_VALIDATED_PREVIOUS_AWS_MATERIALIZER = _teams_aws_materialize_repo_aligned_consumer
-_VALIDATED_PREVIOUS_AZURE_OBJECT_MATERIALIZER = _teams_materialize_azure_object_backed_creation
-_VALIDATED_PREVIOUS_COMMIT_FLAG_GUARANTEE = _teams_commit_side_flag_guarantee
-_VALIDATED_PREVIOUS_ENSURE_FLAG_VALUES = _teams_ensure_flag_enable_in_env_values
-
-
-def _teams_context_file_identity(item: dict) -> str:
-    return str((item or {}).get("path") or (item or {}).get("filename") or "").strip().strip("/")
-
-
-def _teams_merge_repository_evidence(primary: list[dict], extra: list[dict]) -> list[dict]:
-    """Deduplicate live evidence without ranking/choosing a semantic target."""
-    result: list[dict] = []
-    seen: set[str] = set()
-    for item in list(primary or []) + list(extra or []):
-        if not isinstance(item, dict):
-            continue
-        path = _teams_context_file_identity(item)
-        content = str(item.get("content") or "")
-        if not path or not content or path in seen:
-            continue
-        result.append(dict(item))
-        seen.add(path)
-    return result
-
-
-def _teams_rehydrate_repository_evidence_full_contents(
-    evidence: list[dict],
-    cloud: str,
-    repo_target: str,
-    workflow: str,
-    branch: str,
-) -> list[dict]:
-    """Refresh Terraform evidence from live GitHub without snippet truncation.
-
-    Environment discovery intentionally bounds snippets for general Foundry
-    context. Boolean targeting cannot use those bounded snippets as its literal
-    inventory, because a valid flag can appear after the per-file character
-    cutoff (large hub/tier tfvars files are a common example). Re-read only the
-    already-discovered Terraform paths from the same resolved branch. This is
-    repository retrieval, not semantic selection or Terraform generation.
-    """
-    result: list[dict] = []
-    for item in evidence or []:
-        if not isinstance(item, dict):
-            continue
-        refreshed = dict(item)
-        path = _teams_context_file_identity(refreshed)
-        if not path or not path.endswith((".tf", ".tfvars")):
-            result.append(refreshed)
-            continue
-        try:
-            live_content = github_get_file_content(
-                cloud,
-                path,
-                branch,
-                repo_target=repo_target,
-                workflow=workflow,
-            )
-        except Exception as exc:
-            LOGGER.debug(
-                "Full Teams repository evidence refresh failed path=%s branch=%s: %s",
-                path,
-                branch,
-                exc,
-            )
-            live_content = None
-        if live_content is not None:
-            refreshed["content"] = live_content
-            refreshed["full_live_content"] = True
-        result.append(refreshed)
-    return result
-
-
-def build_backend_existing_infra_modification_context_stage6(
-    prompt: str,
-    thread_id: str,
-    cloud: str,
-    workflow: str,
-    retrieved_value_context: list | None = None,
-) -> dict:
-    """Final Teams modification retrieval contract.
-
-    The backend may resolve an environment and collect repository files. It must
-    not make the semantic resource/module decision for non-Boolean ambiguity.
-    Boolean candidates remain Foundry-classified and literal-repository-validated.
-    All other environment/repository candidates become hidden evidence supplied
-    to Foundry, not a user-facing file picker.
-    """
-    context = _VALIDATED_PREVIOUS_BUILD_EXISTING_CONTEXT(
-        prompt,
-        thread_id,
-        cloud,
-        workflow,
-        retrieved_value_context=retrieved_value_context,
-    )
-    active = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
-    if not active.get("active"):
-        return context
+    cloud_filter, count = _parse_command(prompt)
+    run_mode = _parse_test_mode(prompt)
+    run_id = _new_run_id()
+    owner_hash = terrabot_test_state.requester_hash(aad_object_id)
+    conversation_reference = (data or {}).get("conversation_reference") or {}
+    state = {
+        "run_id": run_id,
+        "requester_hash": owner_hash,
+        "status": "queued",
+        "requested_cases": count,
+        "completed_cases": 0,
+        "cloud_filter": cloud_filter,
+        "run_mode": run_mode,
+        "created_at": terrabot_test_state.utc_now(),
+        "conversation_reference": conversation_reference,
+    }
+    terrabot_test_state.save_run(state)
+    job = {
+        "run_id": run_id,
+        "prompt": prompt,
+        "aad_object_id": aad_object_id,
+        "requester_hash": owner_hash,
+        "cloud_filter": cloud_filter,
+        "run_mode": run_mode,
+        "requested_cases": count,
+        "conversation_reference": conversation_reference,
+        "created_at": state["created_at"],
+    }
     try:
-        normalized_cloud = normalize_cloud(cloud)
-    except Exception:
-        return context
-    if str(workflow or "").strip() not in INFRA_MODIFICATION_WORKFLOWS:
-        return context
+        terrabot_test_state.enqueue_run(job)
+    except Exception as exc:
+        state.update({"status": "failed", "error": str(exc), "completed_at": terrabot_test_state.utc_now()})
+        terrabot_test_state.save_run(state)
+        raise
 
-    context = dict(context or {})
-    matched = list(context.get("matched_files") or [])
-
-    # Preserve the validated Boolean ambiguity protocol: multiple literal
-    # Foundry-selected Boolean controls are intentionally user choices.
-    if context.get("feature_flag_selection"):
-        return context
-
-    branch = str(context.get("context_ref") or "").strip()
-    repo_target = normalize_repo_target(normalized_cloud, workflow=workflow)
-    if not branch:
-        try:
-            branch = _teams_remote_context_branch(normalized_cloud, repo_target, workflow)
-        except Exception:
-            branch = ""
-
-    # Read the complete environment folder when it can be resolved. These are
-    # evidence files only; Foundry decides which resource/module/file implements
-    # the request. No file list is surfaced to the user.
-    env_entries: list[dict] = []
-    env_write_paths: list[str] = []
-    env_debug: dict = {}
-    if branch:
-        try:
-            env_entries, env_write_paths, env_debug = _teams_environment_folder_evidence(
-                prompt,
-                normalized_cloud,
-                repo_target,
-                workflow,
-                branch,
-            )
-        except Exception as exc:
-            env_debug = {"error": str(exc)}
-
-    combined = _teams_merge_repository_evidence(matched, env_entries)
-    if combined:
-        context["matched_files"] = combined
-        context["matched_file_paths"] = [_teams_context_file_identity(item) for item in combined]
-        context["selection_state"] = "selected"
-        context["selected_path"] = ""
-        context["agent_resolves_target"] = True
-        context["environment_files"] = list(env_entries or [])
-        context["environment_evidence_summary"] = env_debug
-        if env_write_paths:
-            existing_companions = list(context.get("companion_write_paths") or [])
-            for path in env_write_paths:
-                if path and path not in existing_companions:
-                    existing_companions.append(path)
-            context["companion_write_paths"] = existing_companions
-        context["instructions"] = list(context.get("instructions") or []) + [
-            "Repository file discovery is backend evidence only. Do not ask the user which Terraform file to edit.",
-            "Inspect all supplied environment/repository evidence and infer the exact resource/module/file required by the user's request from repository semantics and existing patterns.",
-            "If multiple genuinely distinct resource/module targets remain after semantic analysis, ask the user which RESOURCE/MODULE they mean; list only relevant semantic choices with concise repository-derived descriptions.",
-            "For a Boolean-gated behavior, prefer the literal Boolean control inside the semantically matched resource/module and do not surface unrelated parameters or files.",
-            "Generate complete final changed files yourself. The backend will validate but will not merge, append, toggle, repair, or synthesize Terraform.",
-        ]
-    return context
-build_backend_existing_infra_modification_context = build_backend_existing_infra_modification_context_stage6
+    _diag(
+        "test_run_queued",
+        run_id=run_id,
+        requester_hash=owner_hash,
+        cloud=cloud_filter,
+        requested_cases=count,
+        max_parallel_cases=_MAX_PARALLEL_CASES,
+    )
+    return {
+        "ok": True,
+        "mode": "automated_test_queued",
+        "run_id": run_id,
+        "reply": (
+            "**Terrabot automated test run queued**\n"
+            f"Run ID: `{run_id}`\n"
+            f"Cases: **{count}** | Cloud scope: **{cloud_filter}** | Mode: **{run_mode}** | Parallel cases: **{_MAX_PARALLEL_CASES}**\n\n"
+            "The Teams request has completed; the queue worker will run the tests in the background "
+            "and post the final table back to this conversation. Use `run tests status` to check progress."
+        ),
+    }, 202
 
 
-def _backend_existing_infra_context_is_selected(context: dict | None) -> bool:
-    """Agent-resolved multi-file evidence counts as ready for Foundry generation.
+def execute_automated_test_job(core: Any, job: dict) -> str:
+    """Run one queued test job with durable progress and bounded parallelism."""
+    run_id = str((job or {}).get("run_id") or "").strip()
+    aad_object_id = str((job or {}).get("aad_object_id") or "").strip()
+    owner_hash = str((job or {}).get("requester_hash") or terrabot_test_state.requester_hash(aad_object_id)).strip()
+    prompt = str((job or {}).get("prompt") or "run tests").strip()
+    if not run_id:
+        raise ValueError("Queued automated-test job is missing run_id.")
+    _assert_authorized(aad_object_id)
+    cloud_filter, count = _parse_command(prompt)
+    run_mode = str((job or {}).get("run_mode") or _parse_test_mode(prompt)).lower()
+    started = time.monotonic()
+    run_state = {
+        "run_id": run_id,
+        "requester_hash": owner_hash,
+        "status": "running",
+        "requested_cases": count,
+        "completed_cases": 0,
+        "cloud_filter": cloud_filter,
+        "run_mode": run_mode,
+        "created_at": str((job or {}).get("created_at") or terrabot_test_state.utc_now()),
+        "started_at": terrabot_test_state.utc_now(),
+        "conversation_reference": (job or {}).get("conversation_reference") or {},
+    }
+    terrabot_test_state.save_run(run_state)
+    _diag(
+        "test_run_worker_started",
+        run_id=run_id,
+        cloud=cloud_filter,
+        requested_cases=count,
+        max_parallel_cases=_MAX_PARALLEL_CASES,
+    )
 
-    A validated multi-Boolean choice remains unresolved until the user selects
-    one candidate. Everything else may be passed to Foundry as repository
-    evidence without asking the user to choose a file.
-    """
-    if isinstance(context, dict):
-        if context.get("feature_flag_selection") and context.get("selection_state") == "candidate_selection_required":
-            return False
-        if context.get("agent_resolves_target") and context.get("matched_files"):
-            return True
-    return _VALIDATED_PREVIOUS_CONTEXT_SELECTED(context)
+    try:
+        if run_mode in {"context-regression", "mixed"}:
+            for spec in _repo_specs(core, cloud_filter):
+                try:
+                    current_sha, _ = _github_recursive_tree(core, spec)
+                    stats = terrabot_context_revalidation.revalidate_repository_context(
+                        core,
+                        repo_owner=spec.owner,
+                        repo_name=spec.repo,
+                        branch=spec.branch,
+                        current_commit_sha=current_sha,
+                    )
+                    _diag("repository_context_revalidation_completed", run_id=run_id, repo=f"{spec.owner}/{spec.repo}", **stats)
+                except Exception as exc:
+                    _diag("repository_context_revalidation_failed", level="warning", run_id=run_id, repo=f"{spec.owner}/{spec.repo}", error=exc)
+        cases, discovery_errors = _derive_test_cases(core, cloud_filter, count, run_id, run_mode=run_mode)
+        result = TestRunResult(run_id=run_id, requested_cases=count, discovery_errors=discovery_errors)
+        indexed_cases = list(enumerate(cases, start=1))
+        completed_by_index: dict[int, TestCaseResult] = {}
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(_MAX_PARALLEL_CASES, max(1, len(indexed_cases))),
+            thread_name_prefix="terrabot-test-case",
+        ) as pool:
+            future_map = {
+                pool.submit(_run_case, core, case, run_id, aad_object_id): index
+                for index, case in indexed_cases
+            }
+            for future in concurrent.futures.as_completed(future_map):
+                index = future_map[future]
+                try:
+                    case_result = future.result()
+                except Exception as exc:
+                    # _run_case normally absorbs case-local errors. Keep the run
+                    # alive even if a worker future itself escapes unexpectedly.
+                    case = indexed_cases[index - 1][1]
+                    case_result = TestCaseResult(case=case, error=str(exc), duration_ms=0)
+                    _diag("test_case_future_failed", level="error", run_id=run_id, test_case_id=case.case_id, error=exc)
+                completed_by_index[index] = case_result
+                terrabot_test_state.save_case_result(owner_hash, run_id, index, _case_state_payload(case_result))
+                run_state["completed_cases"] = len(completed_by_index)
+                run_state["discovery_errors"] = discovery_errors
+                terrabot_test_state.save_run(run_state)
+                _diag(
+                    "test_run_progress_saved",
+                    run_id=run_id,
+                    completed_cases=len(completed_by_index),
+                    requested_cases=count,
+                )
 
+        result.cases = [completed_by_index[index] for index in sorted(completed_by_index)]
 
-def _teams_validate_agent_preserved_existing_file(path: str, generated: str, context: dict) -> None:
-    path = str(path or "").strip().strip("/")
-    if not path:
-        return
-    for item in list(context.get("matched_files") or []) + list(context.get("environment_files") or []):
-        if not isinstance(item, dict) or _teams_context_file_identity(item) != path:
-            continue
-        existing = str(item.get("content") or "")
-        if not existing:
-            return
-        _validate_agent_full_file_preservation_for_write(
-            existing,
-            generated,
-            path,
-            str(context.get("workflow") or ""),
+        # Deterministic backend checks have already completed and gated every
+        # branch push. Run one independent read-only Cursor review across the
+        # complete run, then include its verdicts in durable state and Teams.
+        cursor_validation = terrabot_cursor_result_validator.validate_test_run_with_cursor(
+            run_id=run_id,
+            cases=[_cursor_validation_case_payload(item) for item in result.cases],
         )
-        return
-
-
-def enforce_modification_uses_backend_matched_files(agent_result: dict, retrieved_value_context: list | None) -> dict:
-    """Validate agent-chosen paths and aggregate independent deterministic failures.
-
-    For agent_resolves_target contexts every supplied live evidence path is an
-    allowed candidate. All returned files are checked before raising so Foundry
-    receives one repair package containing every known path/preservation/companion
-    failure instead of discovering them across sequential repair rounds.
-    """
-    context = _get_backend_existing_infra_context(retrieved_value_context)
-    validation_errors: list[str] = []
-
-    if not isinstance(context, dict) or not context.get("agent_resolves_target"):
-        try:
-            result = _VALIDATED_PREVIOUS_ENFORCE_MOD_PATHS(agent_result, retrieved_value_context)
-        except ValueError as exc:
-            validation_errors.append(str(exc))
-            result = agent_result
-    else:
-        allowed = {
-            _teams_context_file_identity(item)
-            for item in list(context.get("matched_files") or []) + list(context.get("environment_files") or [])
-            if isinstance(item, dict) and _teams_context_file_identity(item)
-        }
-        allowed |= {
-            str(path or "").strip().strip("/")
-            for path in context.get("companion_write_paths") or []
-            if str(path or "").strip()
-        }
-        for file_data in agent_result.get("files") or []:
-            if not isinstance(file_data, dict):
-                continue
-            raw = str(file_data.get("filename") or file_data.get("path") or "").strip()
+        _apply_cursor_validation_result(run_id, result.cases, cursor_validation)
+        for index, case_result in enumerate(result.cases, start=1):
+            terrabot_test_state.save_case_result(
+                owner_hash, run_id, index, _case_state_payload(case_result)
+            )
             try:
-                normalized = normalize_iac_relative_path(raw, allow_tfvars=True).strip("/")
+                key = terrabot_test_coverage.coverage_key(case_result.case)
+                repository_key = f"{case_result.case.owner}/{case_result.case.repo}"
+                existing = terrabot_test_state.load_coverage(repository_key).get(key) or {}
+                test_count = int(existing.get("test_count") or 0) + 1
+                failure_count = int(existing.get("failure_count") or 0) + (0 if case_result.score == 100 else 1)
+                terrabot_test_state.save_coverage(
+                    repository_key,
+                    key,
+                    {
+                        "test_count": test_count,
+                        "failure_count": failure_count,
+                        "last_score": case_result.score,
+                        "last_backend_score": case_result.backend_score,
+                        "last_cursor_overall_ok": (
+                            case_result.cursor_overall_ok
+                            if case_result.cursor_validation_requested
+                            else None
+                        ),
+                        "last_run_id": run_id,
+                        "last_commit_sha": case_result.case.commit_sha,
+                        "last_classification": case_result.failure_classification,
+                        "updated_at": terrabot_test_state.utc_now(),
+                    },
+                )
             except Exception as exc:
-                validation_errors.append(f"Invalid generated path `{raw}`: {exc}")
-                continue
-            if allowed and normalized not in allowed:
-                validation_errors.append(
-                    f"Generated modification path `{normalized}` is not present in the live repository evidence for this request. "
-                    "Foundry must choose only repository-grounded target files supplied by the backend."
+                _diag(
+                    "coverage_state_save_failed",
+                    level="warning",
+                    run_id=run_id,
+                    test_case_id=case_result.case.case_id,
+                    error=exc,
                 )
-                continue
-            try:
-                _teams_validate_agent_preserved_existing_file(
-                    normalized,
-                    str(file_data.get("content") or ""),
-                    context,
-                )
-            except ValueError as exc:
-                validation_errors.append(str(exc))
-        result = agent_result
 
-    # Creation companion completeness is part of the same deterministic batch.
-    active = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
-    effective_prompt = str(active.get("effective_prompt") or agent_result.get("user_prompt") or "")
-    if active.get("active") and _teams_is_existing_invocation_creation(effective_prompt):
-        creation_context = _get_backend_existing_infra_context(retrieved_value_context)
-        creation_context = creation_context if isinstance(creation_context, dict) else {}
-        companions = {
-            str(path or "").strip().strip("/")
-            for path in (creation_context.get("companion_write_paths") or [])
-            if str(path or "").strip()
-        }
-        returned = set()
-        for item in result.get("files") or []:
-            if not isinstance(item, dict):
-                continue
-            raw = str(item.get("filename") or item.get("path") or "")
-            try:
-                returned.add(normalize_iac_relative_path(raw, allow_tfvars=True).strip("/"))
-            except Exception:
-                continue
-        required_tfvars = sorted(path for path in companions if path.endswith((".tfvars", ".tfvars.json")))
-        if required_tfvars and not (returned & set(required_tfvars)):
-            validation_errors.append(
-                "Creation output is missing the repository companion tfvars values file. "
-                f"Foundry must return the complete updated content for one of: {', '.join(required_tfvars)}."
-            )
-
-    if validation_errors:
-        # Stable de-duplication keeps the repair prompt concise when two guards
-        # report the same underlying preservation problem.
-        unique_errors = list(dict.fromkeys(error for error in validation_errors if error))
-        raise ValueError(
-            "BACKEND_MODIFICATION_VALIDATION_FAILED_MULTIPLE: "
-            + " | ".join(unique_errors)
-        )
-    return result
-
-
-def _teams_validate_azure_consumer_agent_output(
-    agent_result: dict,
-    retrieved_module_context: list,
-    retrieved_value_context: list | None,
-) -> dict:
-    """Validator-only Azure consumer contract; never builds/merges HCL."""
-    routing = _get_azure_consumer_routing_context(retrieved_value_context or [])
-    if not routing:
-        raise ValueError("Azure consumer generation requires live backend routing evidence before generation.")
-    target_consumer = normalize_agent_relative_tf_path(routing.get("target_consumer_filename") or "", "azure")
-    target_tfvars = normalize_agent_relative_tf_path(routing.get("target_tfvars_filename") or "", "azure")
-    files = [item for item in (agent_result.get("files") or []) if isinstance(item, dict)]
-    by_name = {
-        normalize_agent_relative_tf_path(str(item.get("filename") or item.get("path") or ""), "azure"): item
-        for item in files
-    }
-    if target_consumer not in by_name:
-        raise ValueError(f"Azure creation output is missing the repository consumer file `{target_consumer}`.")
-    if target_tfvars not in by_name:
-        raise ValueError(f"Azure creation output is missing the repository tfvars values file `{target_tfvars}`.")
-
-    module_source = _get_verified_azure_module_source_url(retrieved_module_context)
-    if module_source and module_source not in str(by_name[target_consumer].get("content") or ""):
-        raise ValueError("Azure consumer output does not use the verified selected module source.")
-
-    existing_consumer = str(routing.get("existing_consumer_file_content") or "")
-    if existing_consumer:
-        _validate_agent_full_file_preservation_for_write(
-            existing_consumer,
-            str(by_name[target_consumer].get("content") or ""),
-            target_consumer,
-            "azure_consumer_generation",
-        )
-    existing_tfvars = str(routing.get("existing_tfvars_file_content") or "")
-    if existing_tfvars:
-        _validate_agent_full_file_preservation_for_write(
-            existing_tfvars,
-            str(by_name[target_tfvars].get("content") or ""),
-            target_tfvars,
-            "azure_consumer_generation",
-        )
-
-    generated_tfvars = str(by_name[target_tfvars].get("content") or "")
-    existing_roots = set(_extract_top_level_hcl_assignment_names(existing_tfvars))
-    generated_roots = set(_extract_top_level_hcl_assignment_names(generated_tfvars))
-    new_roots = sorted(generated_roots - existing_roots)
-    if new_roots:
-        variables_name = "variables.tf"
-        existing_variables = str(routing.get("variables_tf_file_content") or "")
-        declared_existing = set(_extract_root_variable_names(existing_variables))
-        missing_declarations = [name for name in new_roots if name not in declared_existing]
-        if missing_declarations:
-            variables_file = by_name.get(variables_name)
-            if not variables_file:
-                raise ValueError(
-                    "Azure creation added new tfvars root variable(s) but did not return `variables.tf`. "
-                    f"Foundry must append declarations for: {', '.join(missing_declarations)} while preserving the complete existing file."
-                )
-            generated_variables = str(variables_file.get("content") or "")
-            _validate_agent_full_file_preservation_for_write(
-                existing_variables,
-                generated_variables,
-                variables_name,
-                "azure_consumer_generation",
-            )
-            declared_generated = set(_extract_root_variable_names(generated_variables))
-            still_missing = [name for name in missing_declarations if name not in declared_generated]
-            if still_missing:
-                raise ValueError(
-                    "Azure `variables.tf` is missing declaration(s) required by the new tfvars values: "
-                    + ", ".join(still_missing)
-                )
-    return agent_result
-
-
-def enforce_real_module_inputs(agent_result: dict, retrieved_module_context: list) -> dict:
-    active = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
-    if not active.get("active"):
-        return _VALIDATED_PREVIOUS_ENFORCE_REAL_INPUTS(agent_result, retrieved_module_context)
-    if not isinstance(agent_result, dict) or str(agent_result.get("workflow") or "") != "azure_consumer_generation":
-        return _VALIDATED_PREVIOUS_ENFORCE_REAL_INPUTS(agent_result, retrieved_module_context)
-    value_context = list(getattr(enforce_real_module_inputs, "_active_retrieved_value_context", []) or [])
-    return _teams_validate_azure_consumer_agent_output(agent_result, retrieved_module_context, value_context)
-
-
-def ensure_azure_consumer_variables_tf_file(agent_result: dict, retrieved_value_context: list | None = None) -> dict:
-    """Teams: validate only; never append variables.tf in backend."""
-    if (_ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}).get("active"):
-        return agent_result
-    return _VALIDATED_PREVIOUS_ENSURE_AZURE_VARIABLES(agent_result, retrieved_value_context)
-
-
-def _repair_azure_consumer_variables_tf_files_in_agent_result(agent_result: dict) -> dict:
-    """Teams: malformed HCL is a Foundry repair-loop error, not backend repair."""
-    if (_ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}).get("active"):
-        for item in agent_result.get("files") or []:
-            if not isinstance(item, dict):
-                continue
-            name = str(item.get("filename") or item.get("path") or "")
-            if name.endswith((".tf", ".tfvars")):
-                _validate_hcl_content_complete(name, str(item.get("content") or ""))
-        return agent_result
-    return _VALIDATED_PREVIOUS_REPAIR_AZURE_VARIABLES(agent_result)
-
-
-def _teams_aws_materialize_repo_aligned_consumer(
-    agent_result: dict,
-    proposed_module_path: str,
-    environment_path: str,
-    context_pack: dict,
-) -> dict:
-    """Validator-only Teams AWS consumer step; Foundry returns the full file."""
-    if not (_ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}).get("active"):
-        return _VALIDATED_PREVIOUS_AWS_MATERIALIZER(agent_result, proposed_module_path, environment_path, context_pack)
-    updated = dict(agent_result or {})
-    module_path = _sanitize_aws_module_rel_path(proposed_module_path)
-    consumer_files = _aws_consumer_files_from_agent_result(updated.get("files") or [])
-    if not consumer_files:
-        raise ValueError("AWS module creation must return the repository consumer file generated by Foundry.")
-    found_reference = False
-    for file_data in consumer_files:
-        filename = normalize_tf_relative_path(file_data.get("filename") or "")
-        if not filename.startswith(str(environment_path or "").strip().strip("/") + "/"):
-            continue
-        content = str(file_data.get("content") or "")
-        for ref in _extract_aws_module_source_refs_from_text(content):
-            if ref.get("module_path") == module_path:
-                found_reference = True
-        branch = str(((context_pack or {}).get("repo_profile") or {}).get("source_branch") or "").strip()
-        if branch:
-            try:
-                existing = github_get_file_content(
-                    "aws", filename, branch, repo_target="tf-devops", workflow="aws_module_creation"
-                )
-            except Exception:
-                existing = None
-            if existing:
-                _validate_agent_full_file_preservation_for_write(existing, content, filename, "aws_module_creation")
-    if not found_reference:
-        raise ValueError(f"AWS creation consumer output does not reference `{AWS_MODULES_ROOT}/{module_path}`.")
-    return updated
-
-
-def _teams_materialize_azure_object_backed_creation(*args, **kwargs):
-    """Disabled for Teams: backend must never synthesize Azure Terraform."""
-    if (_ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}).get("active"):
-        return None
-    return _VALIDATED_PREVIOUS_AZURE_OBJECT_MATERIALIZER(*args, **kwargs)
-
-
-def _teams_commit_side_flag_guarantee(*args, **kwargs):
-    """Disabled for Teams: missing flags must be repaired by Foundry, not patched."""
-    if (_ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}).get("active"):
-        return None
-    return _VALIDATED_PREVIOUS_COMMIT_FLAG_GUARANTEE(*args, **kwargs)
-
-
-def _teams_ensure_flag_enable_in_env_values(
-    agent_result: dict,
-    prompt: str,
-    retrieved_value_context: list,
-    cloud: str = "",
-    workflow: str = "",
-) -> dict:
-    """Teams backend does not create/toggle flags; it validates agent output later."""
-    if (_ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}).get("active"):
-        return agent_result
-    return _VALIDATED_PREVIOUS_ENSURE_FLAG_VALUES(
-        agent_result,
-        prompt,
-        retrieved_value_context,
-        cloud=cloud,
-        workflow=workflow,
-    )
-
-# =============================================================================
-# 2026-08-19 GENERIC REPOSITORY-DRIVEN CHANGE STRATEGY — FINAL OVERRIDE
-# =============================================================================
-# Foundry owns every semantic infrastructure decision and every Terraform/HCL
-# edit. The backend only retrieves live repository evidence, validates literal
-# repository facts/preservation, and transports Foundry's complete final files.
-# No resource, environment, flag, module, or repository-specific mapping is
-# encoded in this override.
-
-_GENERIC_STRATEGY_PREVIOUS_BUILD_CONTEXT = build_backend_existing_infra_modification_context
-_GENERIC_STRATEGY_PREVIOUS_BOOL_VALIDATOR = _validate_selected_boolean_is_only_file_change
-_GENERIC_STRATEGY_PREVIOUS_NORMALIZE_MODULE_VARIABLES = normalize_module_variables_tf_content
-_GENERIC_STRATEGY_PREVIOUS_AZURE_COMMIT_VALIDATOR = validate_azure_consumer_two_file_payload_for_commit
-
-
-def _repository_boolean_scope_ranges(content: str) -> list[dict]:
-    """Return balanced top-level HCL block ranges for descriptive validation.
-
-    This is structural parsing only. It does not infer what any block or Boolean
-    means and it never mutates repository content.
-    """
-    text = str(content or "")
-    ranges: list[dict] = []
-    for match in _top_level_tf_block_matches(text):
-        brace_start = text.find("{", match.end() - 1)
-        block_end = _find_balanced_curly_end(text, brace_start)
-        if brace_start < 0 or block_end < 0:
-            continue
-        header = text[match.start():brace_start].strip()
-        ranges.append({
-            "start": match.start(),
-            "end": block_end,
-            "header": re.sub(r"\s+", " ", header),
+        result.duration_ms = int((time.monotonic() - started) * 1000)
+        report = format_test_run_report(result)
+        run_state.update({
+            "status": "completed",
+            "completed_cases": len(result.cases),
+            "completed_at": terrabot_test_state.utc_now(),
+            "duration_ms": result.duration_ms,
+            "discovery_errors": discovery_errors,
+            "cursor_validation": {
+                "enabled": bool(cursor_validation.get("enabled")),
+                "completed": bool(cursor_validation.get("completed")),
+                "agent_id": str(cursor_validation.get("agent_id") or ""),
+                "agent_url": str(cursor_validation.get("agent_url") or ""),
+                "duration_ms": int(cursor_validation.get("duration_ms") or 0),
+                "requested_cases": sum(1 for item in result.cases if item.cursor_validation_requested),
+                "completed_cases": sum(1 for item in result.cases if item.cursor_validation_completed),
+                "output_correct_cases": sum(1 for item in result.cases if item.cursor_output_correct),
+                "overall_accepted_cases": sum(1 for item in result.cases if item.cursor_overall_ok),
+                "context_added_cases": sum(1 for item in result.cases if item.cursor_context_added),
+                "context_retrievable_cases": sum(1 for item in result.cases if item.cursor_context_retrievable),
+                "context_reused_cases": sum(1 for item in result.cases if item.cursor_context_reused),
+                "error": str(cursor_validation.get("error") or ""),
+            },
+            "report": report,
         })
-    return ranges
-
-
-def _repository_literal_boolean_inventory(repository_evidence: list[dict]) -> list[dict]:
-    """Index literal Boolean assignments from any supplied Terraform evidence.
-
-    The inventory is intentionally resource-agnostic. It includes literal
-    assignments in .tf and .tfvars files and records their exact line number and
-    enclosing top-level block, when one exists. Foundry decides which (if any)
-    implements the user's requested behavior.
-    """
-    inventory: list[dict] = []
-    for item in repository_evidence or []:
-        if not isinstance(item, dict):
-            continue
-        path = _teams_context_file_identity(item)
-        content = str(item.get("content") or "")
-        if not path or not content or not path.endswith((".tf", ".tfvars")):
-            continue
-
-        ranges = _repository_boolean_scope_ranges(content)
-        offset = 0
-        for line_number, line in enumerate(content.replace("\r\n", "\n").splitlines(), start=1):
-            match = re.match(
-                r'^(\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*=\s*)(true|false)(\s*(?:#.*)?)$',
-                line,
-                re.IGNORECASE,
-            )
-            line_start = offset
-            offset += len(line) + 1
-            if not match:
-                continue
-
-            containing = [entry for entry in ranges if entry["start"] <= line_start < entry["end"]]
-            scope = max(containing, key=lambda entry: entry["start"]) if containing else None
-            inventory.append({
-                "path": path,
-                "line_number": line_number,
-                "flag": match.group(2),
-                "current_value": match.group(4).lower(),
-                "scope": str((scope or {}).get("header") or "top-level assignment"),
-                "exact_line": line,
-            })
-    return inventory
-
-
-def _teams_shared_context_for_repository_decision(prompt: str) -> tuple[str, list[dict], dict]:
-    """Retrieve durable context plus CURRENT live evidence for target selection.
-
-    Semantic flag/module selection happens before the ordinary generation
-    ``call_agent`` path, so relying only on call_agent's context injection meant
-    stored resource mappings were invisible during the decision that chooses a
-    Boolean/module. This helper makes the same repository context available to
-    the semantic decision call and re-reads every referenced evidence path from
-    the current repository branch.
-    """
-    active = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
-    cloud = str(active.get("cloud") or "").strip()
-    repo_target = str(active.get("repo_target") or "").strip()
-    workflow = str(active.get("workflow") or "").strip()
-    owner, repo = _repository_context_repo_identity(cloud, repo_target, workflow, str(active.get("repo_name") or ""))
-    if not owner or not repo:
-        return "", [], {}
-    preferred_branch = str(active.get("context_branch") or active.get("existing_branch") or active.get("source_branch") or "").strip()
-    branch, current_sha = _repository_context_branch_and_sha(owner, repo, preferred_branch)
-    try:
-        search_result = shared_repository_context.search_repository_context(
-            repo_owner=owner,
-            repo_name=repo,
-            query=str(prompt or "").strip(),
-            current_commit_sha=current_sha,
-            top_k=8,
+        terrabot_test_state.save_run(run_state)
+        _diag(
+            "test_run_worker_completed",
+            run_id=run_id,
+            requested_cases=count,
+            completed_cases=len(result.cases),
+            full_passes=sum(1 for item in result.cases if item.score == 100),
+            duration_ms=result.duration_ms,
         )
-        required_ids = [
-            str(value).strip()
-            for value in (active.get("required_repository_context_ids") or [])
-            if str(value).strip()
-        ]
-        if required_ids:
-            merged = [dict(item) for item in (search_result.get("results") or []) if isinstance(item, dict)]
-            present = {str(item.get("id") or "").strip() for item in merged}
-            for context_id in required_ids:
-                if context_id in present:
-                    continue
-                record = shared_repository_context.get_repository_context_by_id(context_id)
-                if record is None or str(record.repo_full_name or "").lower() != f"{owner}/{repo}".lower():
-                    continue
-                merged.insert(0, {
-                    "id": record.id, "category": record.category, "subject": record.subject,
-                    "scope": record.scope, "statement": record.statement,
-                    "evidence_paths": list(record.evidence_paths or []),
-                    "evidence_commit_sha": record.evidence_commit_sha,
-                    "evidence_branch": record.evidence_branch, "status": record.status,
-                    "confidence": record.confidence,
-                    "conflict_with_ids": list(record.conflict_with_ids or []), "stale": False,
-                })
-                present.add(context_id)
-            search_result = dict(search_result or {})
-            search_result["results"] = merged
-        block = shared_repository_context.format_repository_context_for_agent(search_result)
-        LOGGER.info(
-            "[TerrabotDiag] event=repository_context_semantic_selection_complete repo=%s/%s results=%s ids=%s",
-            owner, repo, len(search_result.get("results") or []),
-            ",".join(str(item.get("id") or "") for item in (search_result.get("results") or []) if isinstance(item, dict))[:800],
-        )
+        return report
     except Exception as exc:
-        LOGGER.warning(
-            "[TerrabotDiag] event=repository_context_semantic_decision_search_failed repo=%s/%s error=%s",
-            owner, repo, exc,
-        )
-        return "", [], {}
-    live_files = _teams_repository_context_live_files(owner, repo, branch, search_result)
-    metadata = {
-        "repository": f"{owner}/{repo}",
-        "branch": branch,
-        "current_commit_sha": current_sha,
-        "result_count": len(search_result.get("results") or []),
-        "stale_count": int(search_result.get("stale_count") or 0),
-        "conflicted_count": int(search_result.get("conflicted_count") or 0),
-        "context_ids": [
-            str(item.get("id") or "") for item in (search_result.get("results") or [])
-            if isinstance(item, dict) and str(item.get("id") or "").strip()
-        ],
-    }
-    return block, live_files, metadata
-
-
-def _foundry_repository_change_strategy(
-    prompt: str,
-    repository_evidence: list[dict],
-) -> dict:
-    """Ask Foundry whether the request uses an existing Boolean repository gate.
-
-    This semantic classification is deliberately action- and resource-agnostic.
-    It covers creation, enablement, disablement, modification, and deletion
-    without a Python keyword table. Foundry may choose a Boolean only when live
-    repository semantics prove that the Boolean is the repository's mechanism
-    for the requested operation.
-    """
-    evidence = [
-        {"path": _teams_context_file_identity(item), "content": str(item.get("content") or "")}
-        for item in repository_evidence or []
-        if isinstance(item, dict) and _teams_context_file_identity(item) and str(item.get("content") or "")
-    ]
-    inventory = _repository_literal_boolean_inventory(repository_evidence)
-    if not evidence:
-        return {"operation": "unknown", "boolean_applicable": False, "candidates": [], "inventory": inventory}
-
-    shared_context_block, shared_context_live_files, shared_context_metadata = (
-        _teams_shared_context_for_repository_decision(prompt)
-    )
-
-    request = {
-        "task": (
-            "Infer the repository implementation strategy for the CURRENT infrastructure request from live evidence. "
-            "Decide whether an existing literal Boolean assignment is the repository-proven mechanism for this request. "
-            "This is semantic analysis only; do not generate or rewrite Terraform."
-        ),
-        "user_request": str(prompt or "").strip(),
-        "repository_evidence": evidence,
-        "literal_boolean_inventory": inventory,
-        "shared_repository_context": shared_context_block,
-        "shared_repository_context_live_files": shared_context_live_files,
-        "shared_repository_context_metadata": shared_context_metadata,
-        "required_output": {
-            "operation": "create|enable|disable|modify|delete|unknown",
-            "boolean_applicable": "boolean",
-            "reason": "short repository-grounded explanation",
-            "candidates": [{
-                "path": "exact path from literal_boolean_inventory",
-                "line_number": 1,
-                "flag": "exact flag from literal_boolean_inventory",
-                "current_value": "true|false",
-                "new_value": "true|false",
-                "confidence": 0.0,
-                "description": "what this Boolean controls in repository terms",
-            }],
-        },
-        "rules": [
-            "Return JSON only with operation, boolean_applicable, reason, candidates.",
-            "Infer operation from the user's meaning; the backend does not provide an action-keyword mapping.",
-            "Choose only entries that literally exist in literal_boolean_inventory; never invent a path, line, flag, module, resource, or value.",
-            "Set boolean_applicable=true only when repository evidence proves that changing an existing Boolean is the minimal correct implementation of the CURRENT request.",
-            "A create request may use an existing Boolean only when the resource/consumer definition already exists and the repository uses that Boolean to materialize/activate it.",
-            "A delete request may use an existing Boolean only when repository evidence proves that changing the Boolean is the established decommission/removal mechanism; otherwise deletion must remain a normal code-generation request.",
-            "For ordinary modifications, use a Boolean only when that Boolean directly implements the requested behavior; do not convert arbitrary setting changes into feature-flag changes.",
-            "Include only candidates whose literal value must change. current_value and new_value must differ.",
-            "Do not return unrelated Booleans merely because their names share words with the user request.",
-            "The user may use colloquial wording, synonyms, abbreviations, or a phrase that does not literally occur in the flag name. Resolve meaning from the surrounding module/resource wiring, comments, variable names, and shared repository context rather than requiring token overlap with the identifier.",
-            "When a colloquial request maps to one live repository control after reading the complete relevant file, prefer that single control even when the prompt contains none of the exact underscore-separated words from the flag.",
-            "When shared_repository_context contains a prior resource/alias mapping, treat it only as a semantic hint and verify it against shared_repository_context_live_files plus repository_evidence. If the current live file still proves the mapping, use that concrete control without asking the user for a file/path/flag/module name.",
-            "If a stored mapping is stale, conflicted, missing from the current live file, or contradicted by repository_evidence, ignore it and resolve from current live repository evidence instead.",
-            "When one candidate is materially strongest, return only that candidate. Return multiple candidates only for genuine semantic ambiguity.",
-            "Prefer boolean_applicable=false over a weak or speculative Boolean match.",
-        ],
-    }
-    try:
-        raw = call_named_agent(json.dumps(request, ensure_ascii=False), AGENT_NAME)
-        parsed = extract_json_from_text(raw)
-        if not isinstance(parsed, dict):
-            parsed = {}
-    except Exception as exc:
-        LOGGER.warning("Generic repository strategy classification failed: %s", exc)
-        parsed = {"operation": "unknown", "boolean_applicable": False, "reason": str(exc), "candidates": []}
-    parsed["inventory"] = inventory
-    return parsed
-
-
-def _validated_repository_boolean_strategy_stage1(
-    prompt: str,
-    repository_evidence: list[dict],
-) -> tuple[dict, list[dict]]:
-    """Validate Foundry-selected Boolean candidates against literal live evidence."""
-    strategy = _foundry_repository_change_strategy(prompt, repository_evidence)
-    if not strategy.get("boolean_applicable"):
-        return strategy, []
-
-    inventory = strategy.get("inventory") or []
-    literal_index = {
-        (
-            str(item.get("path") or "").strip().strip("/"),
-            int(item.get("line_number") or 0),
-            str(item.get("flag") or "").strip(),
-        ): item
-        for item in inventory
-        if isinstance(item, dict)
-    }
-    validated: list[dict] = []
-    seen: set[tuple[str, int, str]] = set()
-    for candidate in strategy.get("candidates") or []:
-        if not isinstance(candidate, dict):
-            continue
-        path = str(candidate.get("path") or "").strip().strip("/")
-        flag = str(candidate.get("flag") or "").strip()
-        try:
-            line_number = int(candidate.get("line_number") or 0)
-        except (TypeError, ValueError):
-            line_number = 0
-        key = (path, line_number, flag)
-        literal = literal_index.get(key)
-        if not literal or key in seen:
-            continue
-        current = str(candidate.get("current_value") or "").strip().lower()
-        target = str(candidate.get("new_value") or "").strip().lower()
-        if current not in {"true", "false"} or target not in {"true", "false"}:
-            continue
-        if current == target or current != literal.get("current_value"):
-            continue
-        try:
-            confidence = max(0.0, min(float(candidate.get("confidence") or 0.0), 1.0))
-        except (TypeError, ValueError):
-            confidence = 0.0
-        seen.add(key)
-        validated.append({
-            **literal,
-            "new_value": target,
-            "confidence": confidence,
-            "context": str(candidate.get("description") or "").strip(),
-            "description": str(candidate.get("description") or "").strip(),
-            "classification_reason": str(strategy.get("reason") or "").strip(),
-            "operation": str(strategy.get("operation") or "unknown").strip().lower(),
+        run_state.update({
+            "status": "failed",
+            "completed_at": terrabot_test_state.utc_now(),
+            "duration_ms": int((time.monotonic() - started) * 1000),
+            "error": str(exc),
         })
-
-    ranked = sorted(validated, key=lambda item: float(item.get("confidence") or 0.0), reverse=True)
-    if len(ranked) > 1:
-        top = float(ranked[0].get("confidence") or 0.0)
-        second = float(ranked[1].get("confidence") or 0.0)
-        if top >= 0.80 and top - second >= 0.15:
-            ranked = [ranked[0]]
-    return strategy, ranked
-_validated_repository_boolean_strategy = _validated_repository_boolean_strategy_stage1
-
-
-def _teams_azure_boolean_resolution_phases(
-    prompt: str,
-    repository_evidence: list[dict],
-    scope_root: str = "",
-) -> list[list[dict]]:
-    """Return ordered evidence phases for Azure enable/disable resolution.
-
-    A normal hub request must never let a sibling ``dr.tfvars`` compete with
-    ``hub.tfvars``.  Foundry still owns the semantic mapping from user wording
-    to a repository Boolean, but it receives the value files in repository
-    precedence order: hub -> tier -> common.  For an explicit DR/failover
-    request, dr.tfvars is the leaf value file instead.
-
-    Non-tfvars Terraform evidence is included in every phase so Foundry can
-    infer what a Boolean controls from module/resource wiring without asking
-    the user for a flag or file name.
-    """
-    intent = _teams_feature_flag_intent(prompt)
-    if intent not in {"enable", "disable"}:
-        return [list(repository_evidence or [])]
-
-    evidence = [item for item in (repository_evidence or []) if isinstance(item, dict)]
-    non_values = [
-        item for item in evidence
-        if not _teams_context_file_identity(item).lower().endswith((".tfvars", ".tfvars.json"))
-    ]
-    value_items = [
-        item for item in evidence
-        if _teams_context_file_identity(item).lower().endswith((".tfvars", ".tfvars.json"))
-    ]
-    if not value_items:
-        return [evidence]
-
-    text = normalize_yes_no_reply(prompt)
-    dr_requested = bool(re.search(
-        r"(?<![a-z0-9])(dr|disaster recovery|failover|secondary)(?![a-z0-9])",
-        text,
-    ))
-    preferred_basenames = (
-        ("dr.tfvars", "tier.tfvars", "common.tfvars")
-        if dr_requested
-        else _TEAMS_FLAG_VALUES_BASENAME_PRIORITY
-    )
-
-    normalized_scope = str(scope_root or "").strip().strip("/")
-    phases: list[list[dict]] = []
-    used_paths: set[str] = set()
-
-    for basename in preferred_basenames:
-        matches: list[dict] = []
-        for item in value_items:
-            path = _teams_context_file_identity(item).strip().strip("/")
-            if not path or path in used_paths:
-                continue
-            if path.rsplit("/", 1)[-1].lower() != basename:
-                continue
-            if normalized_scope:
-                # Leaf hub/dr files belong to the exact environment folder.
-                # tier/common may be inherited from a direct parent/root and
-                # are therefore allowed outside the leaf scope.
-                if basename in {"hub.tfvars", "dr.tfvars"} and not path.startswith(normalized_scope.rstrip("/") + "/"):
-                    continue
-            matches.append(item)
-        if not matches:
-            continue
-        for item in matches:
-            used_paths.add(_teams_context_file_identity(item).strip().strip("/"))
-        phases.append(_teams_merge_repository_evidence(non_values, matches))
-
-    # Never reintroduce dr.tfvars into a normal environment request. If none of
-    # the preferred files were present, keep non-DR value evidence only.
-    if not phases:
-        allowed_values = []
-        for item in value_items:
-            path = _teams_context_file_identity(item).lower()
-            if not dr_requested and path.endswith("/dr.tfvars"):
-                continue
-            allowed_values.append(item)
-        phases.append(_teams_merge_repository_evidence(non_values, allowed_values))
-
-    return [phase for phase in phases if phase] or [evidence]
-
-
-def _teams_resolve_repository_boolean_strategy(
-    prompt: str,
-    repository_evidence: list[dict],
-    scope_root: str = "",
-) -> tuple[dict, list[dict], list[dict]]:
-    """Run semantic Boolean resolution in repository precedence order.
-
-    Returns ``(strategy, candidates, evidence_used)``.  The first phase that
-    yields a backend-validated literal Boolean wins.  If no phase yields a
-    Boolean, the final strategy result is returned so ordinary non-Boolean
-    modification generation can continue unchanged.
-    """
-    phases = _teams_azure_boolean_resolution_phases(prompt, repository_evidence, scope_root)
-    last_strategy: dict = {}
-    last_phase: list[dict] = list(repository_evidence or [])
-    for phase in phases:
-        strategy, candidates = _validated_repository_boolean_strategy(prompt, phase)
-        last_strategy = strategy
-        last_phase = phase
-        if candidates:
-            return strategy, candidates, phase
-
-        # Foundry semantic classification is primary. If it declines a Boolean
-        # even though the preferred repository value file contains one unique,
-        # high-confidence prompt/identifier match, use the existing generic
-        # backend selector as a safety fallback. This selector is resource-
-        # agnostic, tie-safe, and operates only on literal live-repository
-        # assignments; it never invents a flag or path. The fallback prevents
-        # "tell me the exact variable/file" questions for self-answerable
-        # requests such as disabling a homepage application whose repo flag is
-        # named aca_app_homepage_bff_enabled.
-        fallback_context = {
-            "matched_files": list(phase),
-            "environment_files": list(phase),
-            "selection_state": "candidate_selection_required",
-        }
-        selected = _teams_auto_select_feature_flag_context_stage1(
-            fallback_context,
-            prompt,
+        terrabot_test_state.save_run(run_state)
+        _diag("test_run_worker_failed", level="error", run_id=run_id, error=exc)
+        return (
+            "**Terrabot automated test run failed**\n"
+            f"Run ID: `{run_id}`\n"
+            f"Completed cases: **{run_state.get('completed_cases', 0)}/{count}**\n"
+            f"Error: `{str(exc)[:1500]}`\n\n"
+            f"Search Function App logs with `run_id={run_id}` for the complete trace."
         )
-        selected_files = list((selected or {}).get("matched_files") or [])
-        if (selected or {}).get("feature_flag_selection") and len(selected_files) == 1:
-            selected_item = selected_files[0]
-            match = dict(selected_item.get("feature_flag_match") or {})
-            path = _teams_context_file_identity(selected_item)
-            flag = str(match.get("flag") or "").strip()
-            current = str(match.get("current_value") or "").strip().lower()
-            target = str(match.get("new_value") or "").strip().lower()
-            try:
-                line_number = int(match.get("line") or 0)
-            except (TypeError, ValueError):
-                line_number = 0
-            if path and flag and line_number > 0 and current in {"true", "false"} and target in {"true", "false"} and current != target:
-                candidate = {
-                    "path": path,
-                    "line_number": line_number,
-                    "flag": flag,
-                    "current_value": current,
-                    "new_value": target,
-                    "confidence": 1.0,
-                    "context": str(match.get("context") or "").strip(),
-                    "description": "Unique live-repository Boolean matched by prompt semantics after Foundry declined a Boolean strategy.",
-                    "classification_reason": "deterministic repository Boolean fallback after semantic classifier returned no candidate",
-                    "operation": _teams_feature_flag_intent(prompt),
-                }
-                fallback_strategy = {
-                    "operation": _teams_feature_flag_intent(prompt),
-                    "boolean_applicable": True,
-                    "reason": (
-                        "Foundry returned no Boolean candidate, but live repository evidence contained one unique "
-                        "high-confidence literal Boolean matching the requested feature in the preferred values file."
-                    ),
-                    "fallback": "unique_literal_boolean_semantic_match",
-                }
-                return fallback_strategy, [candidate], phase
-    return last_strategy, [], last_phase
 
-
-def build_backend_existing_infra_modification_context(
-    prompt: str,
-    thread_id: str,
-    cloud: str,
-    workflow: str,
-    retrieved_value_context: list | None = None,
-) -> dict:
-    """Generic Teams repository strategy with Foundry-owned semantics.
-
-    The prior repository retriever remains intact. This final layer removes any
-    AWS/main.tf/resource-name dependency from feature-flag selection by running
-    the same semantic Boolean strategy over all live Terraform evidence already
-    gathered for the resolved request.
-    """
-    context = _GENERIC_STRATEGY_PREVIOUS_BUILD_CONTEXT(
-        prompt,
-        thread_id,
-        cloud,
-        workflow,
-        retrieved_value_context=retrieved_value_context,
-    )
-    active = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
-    if not active.get("active") or str(workflow or "").strip() not in INFRA_MODIFICATION_WORKFLOWS:
-        return context
-
-    context = dict(context or {})
-
-    # Re-read the resolved environment evidence independently of any earlier
-    # feature-flag shortcut. This prevents a prior AWS/main.tf-only classifier
-    # from narrowing the evidence before the generic strategy runs. Repository
-    # discovery remains structural; Foundry performs all semantic selection.
-    extra_environment_evidence: list[dict] = []
+def handle_teams_automated_test_request(core: Any, data: dict) -> tuple[dict, int]:
+    """Queue a private test run or return durable status; never block Teams."""
+    prompt = str((data or {}).get("prompt") or "").strip()
+    aad_object_id = str((data or {}).get("aad_object_id") or "").strip()
+    if not is_automated_test_command(prompt):
+        return {"ok": False, "reply": "Unsupported automated test command."}, 400
     try:
-        normalized_cloud = normalize_cloud(cloud)
-        repo_target = normalize_repo_target(normalized_cloud, workflow=workflow)
-        branch = str(context.get("context_ref") or "").strip() or _teams_remote_context_branch(
-            normalized_cloud, repo_target, workflow
-        )
-        extra_environment_evidence, _write_paths, _debug = _teams_environment_folder_evidence(
-            prompt, normalized_cloud, repo_target, workflow, branch
-        )
+        return start_automated_test_run(core, data)
+    except PermissionError as exc:
+        _diag("test_run_denied", level="warning", reason=exc)
+        return {"ok": False, "reply": str(exc), "mode": "automated_test"}, 403
     except Exception as exc:
-        LOGGER.debug("Generic strategy environment evidence refresh skipped: %s", exc)
-
-    evidence = _teams_merge_repository_evidence(
-        list(context.get("matched_files") or []) + list(context.get("environment_files") or []),
-        extra_environment_evidence,
-    )
-    if not evidence:
-        return context
-
-    # Critical: environment discovery stores bounded snippets (20k chars per
-    # file). A Boolean near the end of a large hub.tfvars/tier.tfvars therefore
-    # did not enter literal_boolean_inventory and Foundry was incorrectly told
-    # there was no repository-proven control. Rehydrate the already-resolved
-    # Terraform evidence from the same live branch before Boolean inventory and
-    # semantic classification.
-    try:
-        evidence = _teams_rehydrate_repository_evidence_full_contents(
-            evidence, normalized_cloud, repo_target, workflow, branch
-        )
-    except Exception as exc:
-        LOGGER.debug("Full Teams repository evidence rehydration skipped: %s", exc)
-
-    if normalized_cloud == "azure":
-        strategy, candidates, strategy_evidence = _teams_resolve_repository_boolean_strategy(
-            prompt,
-            evidence,
-            scope_root=str(context.get("scope_root") or ""),
-        )
-        # Keep the resolved evidence visible to downstream generation.  For a
-        # normal hub request this deliberately excludes dr.tfvars, preventing
-        # a later agent turn from switching away from the already-resolved hub.
-        evidence = strategy_evidence or evidence
-    else:
-        strategy, candidates = _validated_repository_boolean_strategy(prompt, evidence)
-    context["repository_change_strategy"] = {
-        "operation": str(strategy.get("operation") or "unknown"),
-        "boolean_applicable": bool(candidates),
-        "reason": str(strategy.get("reason") or ""),
-    }
-
-    # A non-Boolean result remains a normal Foundry generation request. The
-    # backend supplies live files but does not select or edit a resource.
-    if not candidates:
-        context.pop("feature_flag_selection", None)
-        context["matched_files"] = evidence
-        context["matched_file_paths"] = [_teams_context_file_identity(item) for item in evidence]
-        context["selection_state"] = "selected"
-        context["selected_path"] = ""
-        context["agent_resolves_target"] = True
-        context["instructions"] = list(context.get("instructions") or []) + [
-            "Foundry classified this request as not safely reducible to an existing literal Boolean gate. Continue with repository-semantic generation for the requested create/modify/delete operation.",
-            "Generate the minimal repository delta from live evidence. The backend validates and transports only; it never constructs, merges, repairs, appends, removes, or toggles Terraform.",
-        ]
-        return context
-
-    evidence_by_path = {
-        _teams_context_file_identity(item): item
-        for item in evidence
-        if isinstance(item, dict) and _teams_context_file_identity(item)
-    }
-    matched: list[dict] = []
-    for candidate in candidates:
-        source = dict(evidence_by_path.get(str(candidate.get("path") or "").strip().strip("/")) or {})
-        if not source:
-            continue
-        source["feature_flag_match"] = dict(candidate)
-        source["reason"] = "Foundry semantic Boolean strategy validated against exact live repository assignment"
-        matched.append(source)
-    if not matched:
-        return context
-
-    context["matched_files"] = matched
-    context["matched_file_paths"] = list(dict.fromkeys(_teams_context_file_identity(item) for item in matched))
-    context["feature_flag_selection"] = True
-    context["agent_resolves_target"] = False
-    context["instructions"] = [
-        "Foundry semantically proved that the CURRENT request is implemented by an existing literal Boolean assignment and the backend verified the exact live path/line/value.",
-        "Use only feature_flag_match. Do not infer another flag or edit any unrelated repository content.",
-        "Return the COMPLETE final selected file with only feature_flag_match.current_value changed to feature_flag_match.new_value on feature_flag_match.line_number.",
-        "Preserve every other line exactly. The backend performs exact-diff validation and will block unrelated changes without synthesizing a repair.",
-    ]
-    if len(matched) == 1:
-        context["selection_state"] = "selected"
-        context["selected_path"] = _teams_context_file_identity(matched[0])
-    else:
-        context["selection_state"] = "candidate_selection_required"
-        context["selected_path"] = ""
-    return context
-
-
-def _validate_selected_boolean_is_only_file_change(
-    existing_content: str,
-    generated_content: str,
-    path: str,
-) -> None:
-    """Require exactly the validated Boolean line to change, independent of resource type."""
-    match = _selected_feature_flag_match_from_active_context(path)
-    if not match:
-        return _GENERIC_STRATEGY_PREVIOUS_BOOL_VALIDATOR(existing_content, generated_content, path)
-
-    flag = str(match.get("flag") or "").strip()
-    current = str(match.get("current_value") or "").strip().lower()
-    target = str(match.get("new_value") or "").strip().lower()
-    try:
-        line_number = int(match.get("line_number") or 0)
-    except (TypeError, ValueError):
-        line_number = 0
-    if not flag or line_number <= 0 or current not in {"true", "false"} or target not in {"true", "false"} or current == target:
-        raise UnsafeGeneratedChangeError("Selected Boolean repository context is incomplete or invalid.")
-
-    existing_lines = (existing_content or "").replace("\r\n", "\n").splitlines()
-    generated_lines = (generated_content or "").replace("\r\n", "\n").splitlines()
-    if len(existing_lines) != len(generated_lines):
-        raise UnsafeGeneratedChangeError(
-            f"Generated Boolean modification for {path} added or removed lines; only the selected literal Boolean may change."
-        )
-    if line_number > len(existing_lines):
-        raise UnsafeGeneratedChangeError("Selected Boolean line no longer exists in the live repository file.")
-
-    assignment = re.compile(
-        rf'^(\s*){re.escape(flag)}(\s*=\s*)(true|false)(\s*(?:#.*)?)$',
-        re.IGNORECASE,
-    )
-    changed_lines = [index for index, pair in enumerate(zip(existing_lines, generated_lines), start=1) if pair[0] != pair[1]]
-    if changed_lines != [line_number]:
-        raise UnsafeGeneratedChangeError(
-            f"Generated Boolean modification for {path} changed unrelated repository content. "
-            f"Only line {line_number} (`{flag}`) may change."
-        )
-    old_match = assignment.match(existing_lines[line_number - 1])
-    new_match = assignment.match(generated_lines[line_number - 1])
-    if not old_match or not new_match:
-        raise UnsafeGeneratedChangeError("The selected Boolean assignment was structurally changed instead of only toggling its literal value.")
-    if old_match.group(3).lower() != current or new_match.group(3).lower() != target:
-        raise UnsafeGeneratedChangeError(
-            f"Generated Boolean modification for {path} has the wrong transition; expected {current} -> {target}."
-        )
-    if old_match.group(1) != new_match.group(1) or old_match.group(2) != new_match.group(2) or old_match.group(4) != new_match.group(4):
-        raise UnsafeGeneratedChangeError("The selected Boolean line was reformatted; only the literal true/false value may change.")
-
-
-def normalize_module_variables_tf_content(
-    content: str,
-    filename: str,
-    workflow: str,
-    user_prompt: str = "",
-) -> tuple[str, list[str]]:
-    """Teams backend is validation/transport only; never rewrite Foundry HCL."""
-    if (_ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}).get("active"):
-        issues: list[str] = []
-        if filename.endswith(("variables.tf", "vars.tf")):
-            for item in _iter_variable_blocks_with_names(content or ""):
-                block = str(item.get("block") or "")
-                name = str(item.get("name") or "")
-                if not _variable_attr_present(block, "description"):
-                    issues.append(f'variable "{name}" is missing description')
-                if not _variable_attr_present(block, "type"):
-                    issues.append(f'variable "{name}" is missing type')
-        return str(content or ""), issues
-    return _GENERIC_STRATEGY_PREVIOUS_NORMALIZE_MODULE_VARIABLES(
-        content,
-        filename,
-        workflow,
-        user_prompt=user_prompt,
-    )
-
-
-def validate_azure_consumer_two_file_payload_for_commit(agent_result: dict) -> None:
-    """Teams commit guard validates Foundry files but never repairs them."""
-    if not (_ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}).get("active"):
-        return _GENERIC_STRATEGY_PREVIOUS_AZURE_COMMIT_VALIDATOR(agent_result)
-    if not isinstance(agent_result, dict):
-        return
-    if safe_normalize_cloud(agent_result.get("cloud")) != "azure":
-        return
-    if str(agent_result.get("workflow") or "").strip() != "azure_consumer_generation":
-        return
-    routing_summary = agent_result.get("routing_summary") or {}
-    files = [item for item in (agent_result.get("files") or []) if isinstance(item, dict)]
-    filenames = {
-        normalize_agent_relative_tf_path(str(item.get("filename") or item.get("path") or ""), "azure")
-        for item in files
-    }
-    required = [
-        normalize_agent_relative_tf_path(str(routing_summary.get(key) or ""), "azure")
-        for key in ("consumer_file", "tfvars_file")
-        if str(routing_summary.get(key) or "").strip()
-    ]
-    missing = [name for name in required if name not in filenames]
-    if missing:
-        raise ValueError("Azure consumer output is missing backend-routed Foundry file(s): " + ", ".join(missing))
-    for item in files:
-        name = normalize_agent_relative_tf_path(str(item.get("filename") or item.get("path") or ""), "azure")
-        if name.endswith((".tf", ".tfvars")):
-            _validate_hcl_content_complete(name, str(item.get("content") or ""))
-
-# =============================================================================
-# 2026-08-19 THREE-MODE FOUNDRY OUTPUT ENFORCEMENT — FINAL OVERRIDE
-# =============================================================================
-# Foundry owns Terraform generation. The backend only retrieves repository
-# truth, classifies the write policy from already-resolved workflow context,
-# validates the returned full file, and transports it. It never edits HCL.
-
-_THREE_MODE_PREVIOUS_FULL_FILE_VALIDATOR = _validate_agent_full_file_preservation_for_write
-
-
-def _teams_active_repository_change_strategy() -> dict:
-    """Return the already-resolved repository strategy for the active Teams turn."""
-    active = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
-    value_context = active.get("retrieved_value_context") or []
-    context = _get_backend_existing_infra_context(value_context)
-    if not isinstance(context, dict):
-        return {}
-    strategy = context.get("repository_change_strategy") or {}
-    return dict(strategy) if isinstance(strategy, dict) else {}
-
-
-def _teams_validation_change_mode(path: str, workflow: str | None) -> str:
-    """Choose validation mode without resource-, repo-, path-, or flag-name maps.
-
-    Semantic resource/flag selection remains Foundry-owned. The backend uses
-    only the validated Boolean evidence and the already-resolved operation.
-    """
-    if _selected_feature_flag_match_from_active_context(path):
-        return "boolean"
-
-    active = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
-    if not active.get("active"):
-        return "legacy"
-
-    strategy = _teams_active_repository_change_strategy()
-    operation = str(strategy.get("operation") or "").strip().lower()
-    if operation in {"create", "creation", "add", "provision", "deploy"}:
-        return "create"
-    if operation in {"modify", "modification", "update", "delete", "deletion", "remove"}:
-        return "modify"
-
-    effective_prompt = str(active.get("effective_prompt") or "").strip()
-    if effective_prompt and _teams_is_existing_invocation_creation(effective_prompt):
-        return "create"
-
-    if str(workflow or "").strip() in INFRA_MODIFICATION_WORKFLOWS:
-        return "modify"
-    return "legacy"
-
-
-def _validate_foundry_append_only_existing_file(
-    existing_content: str,
-    generated_content: str,
-    path: str,
-) -> None:
-    """Creation in an existing file must be exact-prefix + non-empty append."""
-    existing = str(existing_content or "")
-    generated = str(generated_content or "")
-    if not existing:
-        return
-    if not generated.startswith(existing):
-        raise UnsafeGeneratedChangeError(
-            f"Creation output for {path} changed existing repository content. "
-            "For an existing target file, Foundry must copy the live file byte-for-byte "
-            "and append only the newly requested Terraform after the original EOF."
-        )
-    appended = generated[len(existing):]
-    if not appended.strip():
-        raise UnsafeGeneratedChangeError(
-            f"Creation output for {path} did not append any new Terraform after the live file."
-        )
-
-
-def _validate_foundry_targeted_existing_file_delta(
-    existing_content: str,
-    generated_content: str,
-    path: str,
-) -> None:
-    """Reject broad rewrites while allowing a bounded, localized Foundry delta.
-
-    This is deliberately semantic-neutral. It does not decide which resource
-    should change. It only ensures that a modification leaves the overwhelming
-    majority of the live file byte-for-byte unchanged and does not introduce
-    formatting-only churn across unrelated lines.
-    """
-    import difflib
-    import math
-
-    existing = str(existing_content or "")
-    generated = str(generated_content or "")
-    if not existing:
-        return
-    if existing == generated:
-        return
-
-    old_lines = existing.splitlines(keepends=True)
-    new_lines = generated.splitlines(keepends=True)
-    matcher = difflib.SequenceMatcher(a=old_lines, b=new_lines, autojunk=False)
-    changed_existing = 0
-    changed_generated = 0
-    hunks = 0
-
-    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-        if tag == "equal":
-            continue
-        hunks += 1
-        changed_existing += i2 - i1
-        changed_generated += j2 - j1
-
-        if tag == "replace":
-            old_segment = old_lines[i1:i2]
-            new_segment = new_lines[j1:j2]
-            if len(old_segment) == len(new_segment) and all(
-                re.sub(r"\s+", " ", old.rstrip("\r\n").strip())
-                == re.sub(r"\s+", " ", new.rstrip("\r\n").strip())
-                for old, new in zip(old_segment, new_segment)
-            ):
-                raise UnsafeGeneratedChangeError(
-                    f"Modification output for {path} contains formatting-only changes. "
-                    "Foundry must preserve unrelated spacing and formatting exactly."
-                )
-
-    existing_line_count = max(1, len(old_lines))
-    changed_total = changed_existing + changed_generated
-    # Dynamic safety budgets scale with file size; they are not tied to any
-    # repository, environment, resource family, or feature-flag name.
-    line_budget = max(20, int(math.ceil(existing_line_count * 0.20)))
-    hunk_budget = max(3, int(math.ceil(existing_line_count / 250.0)))
-
-    if changed_total > line_budget or hunks > hunk_budget:
-        raise UnsafeGeneratedChangeError(
-            f"Modification output for {path} is not a small targeted delta "
-            f"({changed_total} changed line entries across {hunks} diff regions). "
-            "Foundry must start from the exact live file and alter only the lines required "
-            "for the requested existing resource."
-        )
-
-
-def _validate_agent_full_file_preservation_for_write(
-    existing_content: str,
-    generated_content: str,
-    path: str,
-    workflow: str | None,
-) -> None:
-    """Final Teams write policy: Boolean-only, targeted modify, or append-only create."""
-    if existing_content is None:
-        # A genuinely new file has no pre-existing bytes to preserve. Existing
-        # path/routing/HCL validators still apply before transport.
-        return _THREE_MODE_PREVIOUS_FULL_FILE_VALIDATOR(
-            existing_content,
-            generated_content,
-            path,
-            workflow,
-        )
-
-    if _terrabot_placeholder_content_detected(generated_content):
-        raise UnsafeGeneratedChangeError(
-            f"Generated output for {path} contains a repository-content placeholder. "
-            "Foundry must return the complete final file."
-        )
-
-    mode = _teams_validation_change_mode(path, workflow)
-
-    if mode == "boolean":
-        _validate_selected_boolean_is_only_file_change(
-            existing_content,
-            generated_content,
-            path,
-        )
-        return
-
-    if mode == "create":
-        _validate_foundry_append_only_existing_file(
-            existing_content,
-            generated_content,
-            path,
-        )
-        return
-
-    if mode == "modify":
-        # Keep all existing structural/destructive checks, then add the stricter
-        # minimal-diff boundary. Neither validator modifies generated HCL.
-        _THREE_MODE_PREVIOUS_FULL_FILE_VALIDATOR(
-            existing_content,
-            generated_content,
-            path,
-            workflow,
-        )
-        _validate_foundry_targeted_existing_file_delta(
-            existing_content,
-            generated_content,
-            path,
-        )
-        return
-
-    return _THREE_MODE_PREVIOUS_FULL_FILE_VALIDATOR(
-        existing_content,
-        generated_content,
-        path,
-        workflow,
-    )
-
-# =============================================================================
-# 2026-08-20 FINAL FOLLOW-UP + SEMANTIC FLAG RELEVANCE OVERRIDE
-# =============================================================================
-# Goals:
-#   1. Keep a Foundry blocking clarification attached to the same infrastructure
-#      request so a compact user answer ("2", a flag name, etc.) resumes generation.
-#   2. Before a Boolean picker is shown, make Foundry adjudicate the already
-#      repository-validated Boolean candidates and retain only genuinely relevant
-#      controls. No resource/flag vocabulary is encoded in Python.
-#   3. Leave the existing backend-validation self-correction / repair_edits loop
-#      untouched. These overrides only affect semantic candidate selection and
-#      multi-turn continuation state.
-
-_RELEVANCE_PREVIOUS_VALIDATED_REPOSITORY_BOOLEAN_STRATEGY = _validated_repository_boolean_strategy
-_RELEVANCE_PREVIOUS_PENDING_MAPPINGS = _teams_pending_state_mappings
-_RELEVANCE_PREVIOUS_HANDLE_TEAMS_CHAT_REQUEST = handle_teams_chat_request
-
-PENDING_AGENT_INFRA_CLARIFICATIONS: Dict[str, Dict[str, Any]] = {}
-
-
-def _teams_pending_state_mappings() -> dict[str, dict]:
-    """Include generic Foundry infrastructure clarification state in durable state."""
-    mappings = dict(_RELEVANCE_PREVIOUS_PENDING_MAPPINGS())
-    mappings["pending_agent_infra_clarifications"] = PENDING_AGENT_INFRA_CLARIFICATIONS
-    return mappings
-
-
-def _agent_infra_clarification_key(thread_id: str) -> str:
-    thread = str(thread_id or "").strip()
-    return hashlib.sha1(f"agent-infra-clarification::{thread}".encode("utf-8")).hexdigest()
-
-
-def _store_pending_agent_infra_clarification(
-    thread_id: str,
-    original_prompt: str,
-    cloud: str = "",
-    workflow: str = "",
-    repo_target: str = "",
-    question: str = "",
-) -> None:
-    thread = str(thread_id or "").strip()
-    if not thread:
-        return
-    PENDING_AGENT_INFRA_CLARIFICATIONS[_agent_infra_clarification_key(thread)] = {
-        "thread_id": thread,
-        "original_prompt": str(original_prompt or "").strip(),
-        "cloud": str(cloud or "").strip(),
-        "workflow": str(workflow or "").strip(),
-        "repo_target": str(repo_target or "").strip(),
-        "question": str(question or "").strip(),
-    }
-    try:
-        persist_teams_workflow_state(thread)
-    except Exception:
-        LOGGER.debug("Could not persist pending agent infrastructure clarification", exc_info=True)
-
-
-def _get_pending_agent_infra_clarification(thread_id: str) -> dict:
-    thread = str(thread_id or "").strip()
-    if not thread:
-        return {}
-    return dict(PENDING_AGENT_INFRA_CLARIFICATIONS.get(_agent_infra_clarification_key(thread)) or {})
-
-
-def _clear_pending_agent_infra_clarification(thread_id: str) -> None:
-    thread = str(thread_id or "").strip()
-    if not thread:
-        return
-    PENDING_AGENT_INFRA_CLARIFICATIONS.pop(_agent_infra_clarification_key(thread), None)
-    try:
-        persist_teams_workflow_state(thread)
-    except Exception:
-        LOGGER.debug("Could not persist cleared agent infrastructure clarification", exc_info=True)
-
-
-def _repository_candidate_context_window(
-    repository_evidence: list[dict],
-    candidate: dict,
-    radius: int = 6,
-) -> str:
-    """Return a bounded live-code window around one validated Boolean assignment."""
-    wanted_path = str(candidate.get("path") or "").strip().strip("/")
-    try:
-        line_number = int(candidate.get("line_number") or 0)
-    except (TypeError, ValueError):
-        line_number = 0
-    if not wanted_path or line_number <= 0:
-        return ""
-    for item in repository_evidence or []:
-        if not isinstance(item, dict):
-            continue
-        if _teams_context_file_identity(item) != wanted_path:
-            continue
-        lines = str(item.get("content") or "").replace("\r\n", "\n").splitlines()
-        if not lines:
-            return ""
-        start = max(0, line_number - 1 - radius)
-        end = min(len(lines), line_number + radius)
-        return "\n".join(
-            f"{index + 1}: {lines[index]}"
-            for index in range(start, end)
-        )
-    return ""
-
-
-def _foundry_adjudicate_repository_boolean_candidates(
-    prompt: str,
-    repository_evidence: list[dict],
-    candidates: list[dict],
-) -> list[dict]:
-    """Ask Foundry to prune validated Boolean candidates to prompt-relevant controls.
-
-    Python does not infer which flag implements the request. It only supplies the
-    exact repository-validated candidates and nearby live code, then validates
-    that Foundry's adjudicated selections are a subset of those candidates.
-    """
-    if len(candidates or []) <= 1:
-        return list(candidates or [])
-
-    candidate_payload = []
-    for candidate in candidates or []:
-        if not isinstance(candidate, dict):
-            continue
-        candidate_payload.append({
-            "path": str(candidate.get("path") or "").strip().strip("/"),
-            "line_number": int(candidate.get("line_number") or 0),
-            "flag": str(candidate.get("flag") or "").strip(),
-            "current_value": str(candidate.get("current_value") or "").strip().lower(),
-            "new_value": str(candidate.get("new_value") or "").strip().lower(),
-            "scope": str(candidate.get("scope") or "").strip(),
-            "prior_description": str(candidate.get("description") or candidate.get("context") or "").strip(),
-            "nearby_live_code": _repository_candidate_context_window(repository_evidence, candidate),
-        })
-
-    request = {
-        "task": (
-            "FINAL SEMANTIC BOOLEAN CANDIDATE ADJUDICATION. The backend has already "
-            "proved every candidate below is a real literal Boolean assignment in the live repository. "
-            "Select only the candidate(s) that actually implement the CURRENT user request. "
-            "Do not generate Terraform."
-        ),
-        "user_request": str(prompt or "").strip(),
-        "validated_candidates": candidate_payload,
-        "required_output": {
-            "reason": "short repository-grounded explanation",
-            "selected": [{
-                "path": "exact path from validated_candidates",
-                "line_number": 1,
-                "flag": "exact flag from validated_candidates",
-                "relevance": 0.0,
-                "description": "concise explanation of why this control matches the requested behavior",
-            }],
-        },
-        "rules": [
-            "Return JSON only with keys reason and selected.",
-            "Select only from validated_candidates; never invent or rename a flag/path/line.",
-            "Judge semantic relevance from the user request plus scope, nearby_live_code, and repository naming/context.",
-            "Do not select a Boolean merely because it is in the same file or because of weak generic lexical overlap with the request.",
-            "If exactly one control clearly implements the requested behavior, return exactly one selected item.",
-            "Return multiple selected items only when they are genuinely distinct plausible implementations of the same requested behavior and a user choice is truly required.",
-            "Omit weak, incidental, infrastructure-wide, and unrelated controls.",
-            "Use relevance from 0 to 1. A selected item must be strongly supported by repository semantics, not just lexical overlap.",
-            "If none is strongly supported, return selected=[].",
-        ],
-    }
-
-    try:
-        raw = call_named_agent(json.dumps(request, ensure_ascii=False), AGENT_NAME)
-        parsed = extract_json_from_text(raw)
-    except Exception as exc:
-        LOGGER.warning("Boolean candidate adjudication failed; using bounded validated fallback: %s", exc)
-        parsed = {}
-
-    original_index = {
-        (
-            str(item.get("path") or "").strip().strip("/"),
-            int(item.get("line_number") or 0),
-            str(item.get("flag") or "").strip(),
-        ): item
-        for item in candidates or []
-        if isinstance(item, dict)
-    }
-
-    adjudicated: list[dict] = []
-    if isinstance(parsed, dict):
-        for selected in parsed.get("selected") or []:
-            if not isinstance(selected, dict):
-                continue
-            key = (
-                str(selected.get("path") or "").strip().strip("/"),
-                int(selected.get("line_number") or 0),
-                str(selected.get("flag") or "").strip(),
-            )
-            original = original_index.get(key)
-            if not original:
-                continue
-            try:
-                relevance = max(0.0, min(float(selected.get("relevance") or 0.0), 1.0))
-            except (TypeError, ValueError):
-                relevance = 0.0
-            if relevance < 0.60:
-                continue
-            item = dict(original)
-            item["confidence"] = max(float(item.get("confidence") or 0.0), relevance)
-            item["context"] = str(selected.get("description") or item.get("context") or "").strip()
-            item["description"] = item["context"]
-            adjudicated.append(item)
-
-    if adjudicated:
-        adjudicated.sort(key=lambda item: float(item.get("confidence") or 0.0), reverse=True)
-        top = float(adjudicated[0].get("confidence") or 0.0)
-        # Keep only candidates that remain close to the strongest semantic match.
-        # This is resource-agnostic confidence pruning; no flag/resource names are encoded.
-        adjudicated = [
-            item for item in adjudicated
-            if float(item.get("confidence") or 0.0) >= max(0.60, top - 0.18)
-        ]
-        return adjudicated[:5]
-
-    # If adjudication is unavailable, never expose an unbounded inventory.
-    # Preserve the strongest repository-validated candidates only; ambiguity is
-    # safer than auto-selecting a weak control.
-    fallback = sorted(
-        [dict(item) for item in candidates or [] if isinstance(item, dict)],
-        key=lambda item: float(item.get("confidence") or 0.0),
-        reverse=True,
-    )
-    if not fallback:
-        return []
-    top = float(fallback[0].get("confidence") or 0.0)
-    if top > 0:
-        fallback = [
-            item for item in fallback
-            if float(item.get("confidence") or 0.0) >= max(0.50, top - 0.15)
-        ]
-    return fallback[:5]
-
-
-def _repository_context_unique_boolean_match(
-    prompt: str,
-    inventory: list[dict],
-    operation: str,
-) -> list[dict]:
-    """Resolve an exact durable context mapping against live environment Booleans.
-
-    Repository context is only a semantic index: a record is accepted here only
-    when it names both a live Boolean flag and its current live path. A unique
-    match is therefore safe to auto-select and must not trigger clarification.
-    """
-    active = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
-    owner, repo = _repository_context_repo_identity(
-        str(active.get("cloud") or ""),
-        str(active.get("repo_target") or ""),
-        str(active.get("workflow") or ""),
-        str(active.get("repo_name") or ""),
-    )
-    if not owner or not repo or not inventory:
-        return []
-    try:
-        branch, current_sha = _repository_context_branch_and_sha(
-            owner, repo, str(active.get("context_branch") or active.get("existing_branch") or "")
-        )
-        search = shared_repository_context.search_repository_context(
-            repo_owner=owner, repo_name=repo, query=str(prompt or "").strip(),
-            current_commit_sha=current_sha, top_k=8,
-        )
-    except Exception as exc:
-        LOGGER.warning(
-            "[TerrabotDiag] event=repository_context_boolean_resolution_search_failed repo=%s/%s error=%s",
-            owner, repo, exc,
-        )
-        return []
-
-    wanted_value = {"create": "true", "enable": "true", "disable": "false", "delete": "false"}.get(
-        str(operation or "").strip().lower(), ""
-    )
-    matches: list[dict] = []
-    seen: set[tuple[str, int, str]] = set()
-    for record in search.get("results") or []:
-        if not isinstance(record, dict) or str(record.get("status") or "active").lower() == "conflicted":
-            continue
-        record_text = " ".join([
-            str(record.get("subject") or ""),
-            str(record.get("scope") or ""),
-            str(record.get("statement") or ""),
-            " ".join(str(value) for value in (record.get("evidence_paths") or [])),
-        ]).lower()
-        for item in inventory:
-            if not isinstance(item, dict):
-                continue
-            path = str(item.get("path") or "").strip().strip("/")
-            flag = str(item.get("flag") or "").strip()
-            if not path or not flag or flag.lower() not in record_text or path.lower() not in record_text:
-                continue
-            current = str(item.get("current_value") or "").strip().lower()
-            target = wanted_value or ("false" if current == "true" else "true")
-            if target == current:
-                continue
-            key = (path, int(item.get("line_number") or 0), flag)
-            if key in seen:
-                continue
-            seen.add(key)
-            matches.append({
-                **item,
-                "new_value": target,
-                "confidence": max(float(record.get("confidence") or 0.0), 0.99),
-                "context": str(record.get("statement") or "").strip(),
-                "description": str(record.get("statement") or "").strip(),
-                "repository_context_id": str(record.get("id") or "").strip(),
-                "operation": str(operation or "unknown").strip().lower(),
-            })
-    LOGGER.info(
-        "[TerrabotDiag] event=repository_context_boolean_resolution_complete repo=%s/%s operation=%s matches=%s context_ids=%s",
-        owner, repo, operation, len(matches),
-        ",".join(str(item.get("repository_context_id") or "") for item in matches)[:800],
-    )
-    return matches
-
-
-def _foundry_repository_boolean_inventory_retry(
-    prompt: str,
-    repository_evidence: list[dict],
-    inventory: list[dict],
-    operation_hint: str = "unknown",
-) -> dict:
-    """Second-pass semantic resolver focused only on live environment Booleans.
-
-    This is deliberately invoked before asking the user. It gives Foundry the
-    complete environment files plus a compact literal Boolean inventory so
-    colloquial phrases and synonyms can resolve without file/flag questions.
-    """
-    if not inventory:
-        return {"operation": operation_hint or "unknown", "boolean_applicable": False, "candidates": []}
-    shared_context_block, shared_context_live_files, shared_context_metadata = (
-        _teams_shared_context_for_repository_decision(prompt)
-    )
-    request = {
-        "task": (
-            "SECOND-PASS ENVIRONMENT BOOLEAN RESOLUTION. Before any clarification, determine whether the current "
-            "create/delete/enable/disable infrastructure request is controlled by one existing Boolean in the target "
-            "environment. Resolve colloquial wording semantically; do not generate Terraform."
-        ),
-        "user_request": str(prompt or "").strip(),
-        "operation_hint": str(operation_hint or "unknown"),
-        "literal_boolean_inventory": inventory,
-        "target_environment_files": [
-            {"path": _teams_context_file_identity(item), "content": str(item.get("content") or "")}
-            for item in repository_evidence or []
-            if isinstance(item, dict) and _teams_context_file_identity(item) and str(item.get("content") or "")
-        ],
-        "shared_repository_context": shared_context_block,
-        "shared_repository_context_live_files": shared_context_live_files,
-        "shared_repository_context_metadata": shared_context_metadata,
-        "required_output": {
-            "operation": "create|enable|disable|modify|delete|unknown",
-            "boolean_applicable": "boolean",
-            "reason": "short repository-grounded explanation",
-            "candidates": [{
-                "path": "exact inventory path", "line_number": 1, "flag": "exact inventory flag",
-                "current_value": "true|false", "new_value": "true|false", "confidence": 0.0,
-                "description": "what the control does in this repository",
-            }],
-        },
-        "rules": [
-            "Return JSON only.",
-            "Inspect environment controls first for create/delete/enable/disable requests before considering ordinary code edits.",
-            "Choose only from literal_boolean_inventory and only when the live environment files prove the control exists.",
-            "Use semantic synonyms and surrounding Terraform/module context; exact token overlap with the flag is not required.",
-            "If one control clearly implements the request, return exactly one candidate and do not ask for clarification.",
-            "Return multiple candidates only for genuine repository ambiguity.",
-            "Use shared repository context only after revalidating its mapped flag/path against current live files.",
-        ],
-    }
-    try:
-        raw = call_named_agent(json.dumps(request, ensure_ascii=False), AGENT_NAME)
-        parsed = extract_json_from_text(raw)
-        return parsed if isinstance(parsed, dict) else {}
-    except Exception as exc:
-        LOGGER.warning("Second-pass environment Boolean resolution failed: %s", exc)
-        return {"operation": operation_hint or "unknown", "boolean_applicable": False, "candidates": [], "error": str(exc)}
-
-
-def _validated_repository_boolean_strategy(
-    prompt: str,
-    repository_evidence: list[dict],
-) -> tuple[dict, list[dict]]:
-    """Environment-first Boolean resolution with durable-context reuse.
-
-    A unique repository-proven Boolean is auto-selected. Clarification is
-    reserved for two or more semantically valid live controls.
-    """
-    strategy = _foundry_repository_change_strategy(prompt, repository_evidence)
-    strategy = dict(strategy or {})
-    inventory = strategy.get("inventory") or _repository_literal_boolean_inventory(repository_evidence)
-    operation = str(strategy.get("operation") or "unknown").strip().lower()
-
-    literal_index = {
-        (str(item.get("path") or "").strip().strip("/"), int(item.get("line_number") or 0), str(item.get("flag") or "").strip()): item
-        for item in inventory if isinstance(item, dict)
-    }
-
-    def _validated(parsed: dict) -> list[dict]:
-        values: list[dict] = []
-        seen: set[tuple[str, int, str]] = set()
-        for candidate in (parsed or {}).get("candidates") or []:
-            if not isinstance(candidate, dict):
-                continue
-            try:
-                line_number = int(candidate.get("line_number") or 0)
-            except (TypeError, ValueError):
-                line_number = 0
-            key = (
-                str(candidate.get("path") or "").strip().strip("/"),
-                line_number,
-                str(candidate.get("flag") or "").strip(),
-            )
-            literal = literal_index.get(key)
-            if not literal or key in seen:
-                continue
-            current = str(candidate.get("current_value") or "").strip().lower()
-            target = str(candidate.get("new_value") or "").strip().lower()
-            if current not in {"true", "false"} or target not in {"true", "false"} or current == target:
-                continue
-            if current != str(literal.get("current_value") or "").strip().lower():
-                continue
-            try:
-                confidence = max(0.0, min(float(candidate.get("confidence") or 0.0), 1.0))
-            except (TypeError, ValueError):
-                confidence = 0.0
-            seen.add(key)
-            values.append({
-                **literal,
-                "new_value": target,
-                "confidence": confidence,
-                "context": str(candidate.get("description") or "").strip(),
-                "description": str(candidate.get("description") or "").strip(),
-                "classification_reason": str((parsed or {}).get("reason") or "").strip(),
-                "operation": str((parsed or {}).get("operation") or operation or "unknown").strip().lower(),
-            })
-        return values
-
-    validated = _validated(strategy) if strategy.get("boolean_applicable") else []
-
-    # Durable context gets first chance to resolve a previously learned alias.
-    context_matches = _repository_context_unique_boolean_match(prompt, inventory, operation)
-    if len(context_matches) == 1:
-        strategy["boolean_applicable"] = True
-        strategy["requires_user_choice"] = False
-        strategy["resolution_source"] = "validated_repository_context"
-        strategy["validated_candidate_count"] = 1
-        strategy["adjudicated_candidate_count"] = 1
-        LOGGER.info(
-            "[TerrabotDiag] event=repository_context_usage_observed source=boolean_resolver context_id=%s path=%s flag=%s",
-            context_matches[0].get("repository_context_id") or "",
-            context_matches[0].get("path") or "",
-            context_matches[0].get("flag") or "",
-        )
-        return strategy, context_matches
-
-    # First-time aliases still get one Boolean-only semantic retry before any
-    # user question. This is especially important for Cursor-generated synonyms.
-    if not validated:
-        retry = _foundry_repository_boolean_inventory_retry(
-            prompt, repository_evidence, inventory, operation_hint=operation
-        )
-        retry_operation = str(retry.get("operation") or operation or "unknown").strip().lower()
-        if retry_operation != "unknown":
-            operation = retry_operation
-            strategy["operation"] = retry_operation
-        if retry.get("boolean_applicable"):
-            validated = _validated(retry)
-            if validated:
-                strategy["boolean_applicable"] = True
-                strategy["reason"] = str(retry.get("reason") or strategy.get("reason") or "")
-                strategy["resolution_source"] = "environment_boolean_retry"
-
-    if not validated:
-        strategy["validated_candidate_count"] = 0
-        strategy["adjudicated_candidate_count"] = 0
-        strategy["requires_user_choice"] = False
-        return strategy, []
-
-    adjudicated = _foundry_adjudicate_repository_boolean_candidates(
-        prompt, repository_evidence, validated
-    )
-    strategy["validated_candidate_count"] = len(validated)
-    strategy["adjudicated_candidate_count"] = len(adjudicated)
-    strategy["requires_user_choice"] = len(adjudicated) > 1
-    if len(adjudicated) == 1:
-        strategy["resolution_source"] = strategy.get("resolution_source") or "unique_live_environment_boolean"
-    return strategy, adjudicated
-
-# =============================================================================
-# 2026-08-20 UNIFIED CLOUD / ENVIRONMENT RESOLUTION - FINAL OVERRIDE
-# =============================================================================
-# Environment identity is repository identity.  Resolve it before allowing a
-# model/router guess to select tf-devops vs tf-azure-hub.  The catalog below is
-# deployment topology supplied by the platform owner; resource/flag mappings
-# remain repository-derived and are intentionally not hardcoded here.
-
-TERRABOT_ENVIRONMENT_CATALOG = {
-    "aws": {
-        "repo_target": "tf-devops",
-        "default_nonprod": "minidev",
-        "nonprod": {
-            "dev": "terraform/dev_aws/dev",
-            "minidev": "terraform/dev_aws/minidev",
-            "bolt": "terraform/dev_aws/bolt",
-            "bolt_dr": "terraform/dev_aws/bolt_dr",
-            "bolt_sqlstaging": "terraform/dev_aws/bolt_sqlstaging",
-            "dev_devops": "terraform/dev_aws/dev_devops",
-            "dev_sqlstaging": "terraform/dev_aws/dev_sqlstaging",
-            "global": "terraform/dev_aws/global",
-            "minidev_sqlstaging": "terraform/dev_aws/minidev_sqlstaging",
-            "observe": "terraform/dev_aws/observe",
-        },
-        "prod": {
-            "ca3": "terraform/prod_aws/ca3",
-            "ca3_dr": "terraform/prod_aws/ca3_dr",
-            "devops": "terraform/prod_aws/devops",
-            "eu1": "terraform/prod_aws/eu1",
-            "eu1_dr": "terraform/prod_aws/eu1_dr",
-            "eu2": "terraform/prod_aws/eu2",
-            "eu2_dr": "terraform/prod_aws/eu2_dr",
-            "global": "terraform/prod_aws/global",
-            "observe": "terraform/prod_aws/observe",
-            "sqlstaging": "terraform/prod_aws/sqlstaging",
-            "sqlstaging_ca": "terraform/prod_aws/sqlstaging_ca",
-            "sqlstaging_eu": "terraform/prod_aws/sqlstaging_eu",
-            "sqlstaging_eu2": "terraform/prod_aws/sqlstaging_eu2",
-            "sqlstaging_us4": "terraform/prod_aws/sqlstaging_us4",
-            "sqlstaging_west": "terraform/prod_aws/sqlstaging_west",
-            "us1": "terraform/prod_aws/us1",
-            "us1_dr": "terraform/prod_aws/us1_dr",
-            "us2": "terraform/prod_aws/us2",
-            "us2_dr": "terraform/prod_aws/us2_dr",
-            "us3": "terraform/prod_aws/us3",
-            "us3_dr": "terraform/prod_aws/us3_dr",
-            "us4": "terraform/prod_aws/us4",
-            "us4_dr": "terraform/prod_aws/us4_dr",
-            "root/global": "terraform/root/global",
-        },
-    },
-    "azure": {
-        "repo_target": "tf-azure-hub",
-        "default_nonprod": "sbx-infra",
-        "nonprod": {
-            "npr-int": "vars/npr/npr-int",
-            "npr-stg": "vars/npr/npr-stg",
-            "sbx-infra": "vars/sbx/sbx-infra",
-        },
-        "prod": {
-            "prd-ca4": "vars/prd/prd-ca4",
-            "prd-eu3": "vars/prd/prd-eu3",
-            "prd-us5": "vars/prd/prd-us5",
-            "prd-us6": "vars/prd/prd-us6",
-        },
-    },
-}
-
-TERRABOT_AZURE_ENVIRONMENT_ALIASES = {
-    "sandbox": "sbx-infra",
-    "sbx": "sbx-infra",
-    "npr-staging": "npr-stg",
-    "npr-staging": "npr-stg",
-    "ca4": "prd-ca4",
-    "eu3": "prd-eu3",
-    "us5": "prd-us5",
-    "us6": "prd-us6",
-}
-
-
+        _diag("test_run_enqueue_failed", level="error", error=exc)
+        return {
+            "ok": False,
+            "reply": f"Terrabot could not queue the automated test run: {exc}",
+            "mode": "automated_test",
+        }, 500

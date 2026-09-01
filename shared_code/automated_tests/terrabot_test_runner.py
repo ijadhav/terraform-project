@@ -1272,6 +1272,15 @@ def _resolve_automated_clarifications(
         clarified = True
         candidates = [item for item in (current.get("candidates") or []) if isinstance(item, dict)]
         clarification_text = str(current.get("reply") or current.get("question") or "").strip()
+        _diag(
+            "cursor_clarification_requested",
+            run_id=run_id,
+            test_case_id=case.case_id,
+            phase=phase,
+            round=round_no,
+            candidate_count=len(candidates),
+            clarification=clarification_text[:500],
+        )
         cursor_resolution = cursor_prompt_provider.resolve_repository_clarification(
             owner=case.owner,
             repo=case.repo,
@@ -1284,37 +1293,38 @@ def _resolve_automated_clarifications(
             log_event=_diag,
         )
 
-        structured_picker = bool(candidates)
-        if structured_picker:
-            selection = str(cursor_resolution.get("answer") or "").strip()
-            if not selection:
+        resolution_type = str(cursor_resolution.get("resolution_type") or "").strip().lower()
+        structured_picker = bool(candidates) and bool(cursor_resolution.get("use_structured_picker"))
+        selection = str(cursor_resolution.get("answer") or "").strip()
+
+        if not cursor_resolution or resolution_type == "unresolved" or not selection:
+            # For Boolean-context tests, never silently fall back to the hidden
+            # expected target. The purpose of this continuation is to prove that
+            # Cursor can independently resolve Terrabot's clarification from the
+            # pinned repository. Resource-creation pickers retain their existing
+            # random valid-option fallback because no exact Boolean truth exists.
+            if case.case_type == "resource_creation" and candidates:
                 selection = _pick_automated_candidate_reply(case, current)
+                structured_picker = bool(selection)
             if not selection:
                 _diag(
                     "automated_clarification_unresolved",
                     level="warning",
+                    run_id=run_id,
                     test_case_id=case.case_id,
                     phase=phase,
                     round=round_no,
                     candidate_count=len(candidates),
+                    cursor_resolution_type=resolution_type or "<none>",
+                    cursor_used=bool(cursor_resolution),
                 )
                 break
-        else:
+
+        if not structured_picker:
             if phase == 1:
                 row.phase1_freeform_clarification = True
             else:
                 row.phase2_freeform_clarification = True
-            selection = str(cursor_resolution.get("answer") or "").strip()
-            if not selection:
-                _diag(
-                    "automated_freeform_clarification_unresolved",
-                    level="warning",
-                    test_case_id=case.case_id,
-                    phase=phase,
-                    round=round_no,
-                    candidate_count=0,
-                )
-                break
 
         if cursor_resolution:
             if phase == 1:
@@ -1350,6 +1360,10 @@ def _resolve_automated_clarifications(
             candidate_count=len(candidates),
             structured_picker=structured_picker,
             cursor_used=bool(cursor_resolution),
+            cursor_resolution_type=resolution_type or "<none>",
+            cursor_candidates_relevant=cursor_resolution.get("candidates_relevant") if cursor_resolution else "",
+            cursor_selected_path=cursor_resolution.get("selected_path") if cursor_resolution else "",
+            cursor_selected_flag=cursor_resolution.get("selected_flag") if cursor_resolution else "",
         )
         followup = {
             "prompt": selection,
