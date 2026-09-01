@@ -1055,6 +1055,8 @@ def _commit_preview_to_test_branch(
         return {"ok": False, "mode": "test_commit_unavailable", "reply": "_teams_auto_commit_preview is unavailable."}, 500
     commit_request = dict(original_request or {})
     commit_request.update({
+        "pending_branch_choice_resolved": True,
+        "branch_choice": "new",
         "force_new_branch": True,
         "reuse_branch": False,
         "existing_branch": "",
@@ -1079,12 +1081,23 @@ def _phase_request(case: TestCase, prompt: str, conversation_id: str, *, phase: 
         "memory_conversation_id": f"{conversation_id}::memory::{uuid.uuid4().hex}",
         "teams_requester": "terrabot-automated-test",
         "source": "teams",
+        # Repository-context E2E cases are infrastructure tests by construction.
+        # Bypass only the generic chat-vs-infra routing decision; Terrabot must
+        # still resolve the environment, repository target, live Boolean, and
+        # generate repository-aligned Terraform itself.
+        "mode": "infra",
         "test_mode": True,
         "automated_test_phase": phase,
         "automated_test_case_id": case.case_id,
         "fresh_infra_generation": True,
         "cloud": case.cloud,
         "requested_cloud": case.cloud,
+        # Test runs never reuse a user's existing Terrabot branch. Resolve the
+        # branch decision up front so generation cannot stop at the production
+        # branch-choice UX. Phase 1 later commits the validated preview to its
+        # isolated test branch; Phase 2 remains test_mode and never commits.
+        "pending_branch_choice_resolved": True,
+        "branch_choice": "new",
         "force_new_branch": True,
         "reuse_branch": False,
         "existing_branch": "",
@@ -1233,6 +1246,11 @@ def _resolve_automated_clarifications(
             "automated_test_phase": phase,
             "automated_test_case_id": case.case_id,
             "fresh_infra_generation": True,
+            # Keep the already-resolved test branch strategy across target or
+            # free-form clarification continuations. A clarification must not
+            # reopen the normal user branch-choice stage.
+            "pending_branch_choice_resolved": True,
+            "branch_choice": "new",
             "force_new_branch": True,
             "reuse_branch": False,
             "existing_branch": "",
