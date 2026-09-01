@@ -185,6 +185,10 @@ class TestCaseResult:
     phase1_cursor_clarification_used: bool = False
     expected_target_found: bool = False
     correct_flag_detected: bool = False
+    phase1_control_mentioned: bool = False
+    phase2_control_mentioned: bool = False
+    phase1_mode: str = ""
+    phase2_mode: str = ""
     phase1_file_generated: bool = False
     validation_ok: bool = False
     validation_error: str = ""
@@ -846,6 +850,25 @@ def _cursor_context_evidence(record: dict | None) -> dict[str, Any]:
     }
 
 
+def _control_mentioned(case: TestCase, result: dict) -> bool:
+    """Diagnostic-only signal that Terrabot named the expected Boolean control.
+
+    This intentionally excludes generated file bodies and never contributes to
+    pass/fail scoring. Boolean correctness requires the exact requested literal
+    assignment in the generated expected file.
+    """
+    if case.case_type != "boolean_context" or not case.flag:
+        return False
+    parts = [
+        str(result.get("summary") or ""),
+        str(result.get("reply") or ""),
+        str(result.get("analysis") or ""),
+        str(result.get("questions") or ""),
+        str(result.get("candidates") or ""),
+    ]
+    return case.flag.lower() in "\n".join(parts).lower()
+
+
 def _target_detection(case: TestCase, result: dict) -> tuple[bool, bool, bool, str]:
     paths = [path.strip().strip("/") for path in _response_file_paths(result)]
     text = _response_text(result)
@@ -871,7 +894,10 @@ def _target_detection(case: TestCase, result: dict) -> tuple[bool, bool, bool, s
             content,
             re.IGNORECASE,
         ) if content and case.flag else None
-        correct_flag_detected = bool(assignment) or (bool(case.flag) and case.flag.lower() in text)
+        # Boolean correctness is an output assertion, not a prose/analysis assertion.
+        # Mentioning the expected control elsewhere is tracked separately by
+        # ``_control_mentioned`` and must never make this assertion pass.
+        correct_flag_detected = bool(assignment)
     file_generated = bool(paths)
     actual_file = next((path for path in paths if path == expected_path), paths[0] if paths else "")
     return expected_target_found, correct_flag_detected, file_generated, actual_file
@@ -980,13 +1006,60 @@ def _ensure_context_mapping(
     evidence_branch: str = "",
     evidence_commit_sha: str = "",
 ) -> bool:
-    existing = _search_context(case)
+    try:
+        existing = _search_context(case)
+    except Exception as exc:
+        _diag(
+            "context_mapping_search_failed",
+            level="error",
+            run_id=run_id,
+            test_case_id=case.case_id,
+            repo=f"{case.owner}/{case.repo}",
+            path=case.path,
+            flag=case.flag,
+            error=exc,
+        )
+        raise
     if _matching_context_record(case, existing):
+        _diag(
+            "context_mapping_already_present",
+            run_id=run_id,
+            test_case_id=case.case_id,
+            repo=f"{case.owner}/{case.repo}",
+            path=case.path,
+            flag=case.flag,
+        )
         return True
 
     ref = str(evidence_branch or case.branch).strip()
     commit_sha = str(evidence_commit_sha or case.commit_sha).strip()
-    live_content = core.github_get_file_content_by_repo(case.owner, case.repo, case.path, ref=ref) or ""
+    try:
+        live_content = core.github_get_file_content_by_repo(case.owner, case.repo, case.path, ref=ref) or ""
+    except Exception as exc:
+        _diag(
+            "context_mapping_evidence_read_failed",
+            level="error",
+            run_id=run_id,
+            test_case_id=case.case_id,
+            repo=f"{case.owner}/{case.repo}",
+            ref=ref,
+            path=case.path,
+            flag=case.flag,
+            error=exc,
+        )
+        raise
+    if not live_content:
+        _diag(
+            "context_mapping_evidence_missing",
+            level="warning",
+            run_id=run_id,
+            test_case_id=case.case_id,
+            repo=f"{case.owner}/{case.repo}",
+            ref=ref,
+            commit_sha=commit_sha,
+            path=case.path,
+            flag=case.flag,
+        )
     evidence_line = case.evidence_line
     assignment = re.search(
         rf"(?m)^\s*{re.escape(case.flag)}\s*=\s*(?:true|false)\s*(?:#.*)?$",
@@ -995,6 +1068,19 @@ def _ensure_context_mapping(
     )
     if assignment:
         evidence_line = assignment.group(0).strip()
+    else:
+        _diag(
+            "context_mapping_assignment_not_found",
+            level="warning",
+            run_id=run_id,
+            test_case_id=case.case_id,
+            repo=f"{case.owner}/{case.repo}",
+            ref=ref,
+            path=case.path,
+            flag=case.flag,
+            live_content_chars=len(live_content),
+            fallback_evidence_line=evidence_line,
+        )
 
     statement = (
         f"In {case.repo}, {case.alias} maps to Boolean control {case.flag} "
@@ -1022,16 +1108,48 @@ def _ensure_context_mapping(
     def evidence_fetcher(owner: str, repo: str, path: str, ref_value: str) -> str | None:
         return core.github_get_file_content_by_repo(owner, repo, path, ref=ref_value)
 
-    action = repository_context.add_repository_context(
-        repo_owner=case.owner,
-        repo_name=case.repo,
-        evidence_commit_sha=commit_sha,
-        evidence_branch=ref,
-        source_task_hash=hashlib.sha256(f"{run_id}:{case.case_id}:{ref}".encode()).hexdigest(),
-        candidate=candidate,
-        evidence_fetcher=evidence_fetcher,
+    try:
+        action = repository_context.add_repository_context(
+            repo_owner=case.owner,
+            repo_name=case.repo,
+            evidence_commit_sha=commit_sha,
+            evidence_branch=ref,
+            source_task_hash=hashlib.sha256(f"{run_id}:{case.case_id}:{ref}".encode()).hexdigest(),
+            candidate=candidate,
+            evidence_fetcher=evidence_fetcher,
+        )
+    except Exception as exc:
+        _diag(
+            "context_mapping_add_failed",
+            level="error",
+            run_id=run_id,
+            test_case_id=case.case_id,
+            repo=f"{case.owner}/{case.repo}",
+            ref=ref,
+            commit_sha=commit_sha,
+            path=case.path,
+            flag=case.flag,
+            error=exc,
+        )
+        raise
+    stored = bool(action.get("stored"))
+    _diag(
+        "context_mapping_add_result",
+        level="info" if stored else "warning",
+        run_id=run_id,
+        test_case_id=case.case_id,
+        repo=f"{case.owner}/{case.repo}",
+        ref=ref,
+        commit_sha=commit_sha,
+        path=case.path,
+        flag=case.flag,
+        stored=stored,
+        action=str(action.get("action") or action.get("status") or ""),
+        reason=str(action.get("reason") or action.get("error") or ""),
+        validation_errors=action.get("validation_errors") or action.get("errors") or [],
+        context_id=str(action.get("id") or action.get("context_id") or ""),
     )
-    return bool(action.get("stored"))
+    return stored
 
 
 def _branch_head_sha(core: Any, case: TestCase, branch: str) -> str:
@@ -1293,7 +1411,22 @@ def _run_case(core: Any, case: TestCase, run_id: str, requester_id: str) -> Test
         phase1_request = _phase_request(case, case.phase1_prompt, p1_conversation, phase=1)
         phase1_request["teams_requester"] = f"terrabot-test-{run_id[-6:]}-{case.case_id}"
         phase1_result, status = _invoke_backend(core, phase1_request, row)
+        row.phase1_mode = str(phase1_result.get("mode") or "").lower()
         row.actual_mode = str(phase1_result.get("mode") or "")
+        row.phase1_control_mentioned = _control_mentioned(case, phase1_result)
+        _diag(
+            "phase1_initial_backend_result",
+            run_id=run_id,
+            test_case_id=case.case_id,
+            status=status,
+            mode=row.phase1_mode or "<none>",
+            ok=phase1_result.get("ok"),
+            file_count=len(phase1_result.get("files") or []),
+            candidate_count=len(phase1_result.get("candidates") or []),
+            control_mentioned=row.phase1_control_mentioned,
+            decision_state=phase1_result.get("decision_state") or "",
+            reply=str(phase1_result.get("reply") or "")[:500],
+        )
         row.phase1_ok = status < 500 and bool(phase1_result.get("ok", True))
 
         phase1_result, status, row.phase1_clarified = _resolve_automated_clarifications(
@@ -1308,6 +1441,7 @@ def _run_case(core: Any, case: TestCase, run_id: str, requester_id: str) -> Test
             run_id=run_id,
         )
         row.actual_mode = str(phase1_result.get("mode") or "")
+        row.phase1_control_mentioned = row.phase1_control_mentioned or _control_mentioned(case, phase1_result)
         row.phase1_ok = status < 500 and bool(phase1_result.get("ok", True))
 
         (
@@ -1508,8 +1642,24 @@ def _run_case(core: Any, case: TestCase, run_id: str, requester_id: str) -> Test
         if phase2_match and str(phase2_match.get("id") or "").strip():
             phase2_request["required_repository_context_ids"] = [str(phase2_match.get("id"))]
         phase2_result, status = _invoke_backend(core, phase2_request, row)
+        row.phase2_mode = str(phase2_result.get("mode") or "").lower()
+        row.phase2_control_mentioned = _control_mentioned(case, phase2_result)
+        _diag(
+            "phase2_initial_backend_result",
+            run_id=run_id,
+            test_case_id=case.case_id,
+            status=status,
+            mode=row.phase2_mode or "<none>",
+            ok=phase2_result.get("ok"),
+            file_count=len(phase2_result.get("files") or []),
+            candidate_count=len(phase2_result.get("candidates") or []),
+            control_mentioned=row.phase2_control_mentioned,
+            decision_state=phase2_result.get("decision_state") or "",
+            repository_context_attached=bool(((phase2_result.get("test_diagnostics") or {}).get("repository_context") or {}).get("attached")),
+            reply=str(phase2_result.get("reply") or "")[:500],
+        )
         row.phase2_ok = status < 500 and bool(phase2_result.get("ok", True))
-        first_phase2_mode = str(phase2_result.get("mode") or "").lower()
+        first_phase2_mode = row.phase2_mode
         diagnostics = ((phase2_result.get("test_diagnostics") or {}).get("repository_context") or {})
         attached_ids = {str(value) for value in (diagnostics.get("context_ids") or []) if str(value)}
         expected_context_id = str((phase2_match or {}).get("id") or "")
@@ -1545,6 +1695,7 @@ def _run_case(core: Any, case: TestCase, run_id: str, requester_id: str) -> Test
             run_id=run_id,
         )
         row.phase2_ok = status < 500 and bool(phase2_result.get("ok", True))
+        row.phase2_control_mentioned = row.phase2_control_mentioned or _control_mentioned(case, phase2_result)
 
         p2_target, p2_flag, row.phase2_file_generated, _ = _target_detection(case, phase2_result)
         row.phase2_target_ok = p2_target and p2_flag and _repo_matches(case, phase2_result)
@@ -1590,6 +1741,10 @@ def _run_case(core: Any, case: TestCase, run_id: str, requester_id: str) -> Test
         test_case_id=case.case_id,
         expected_target_found=row.expected_target_found,
         correct_flag_detected=row.correct_flag_detected,
+        phase1_control_mentioned=row.phase1_control_mentioned,
+        phase2_control_mentioned=row.phase2_control_mentioned,
+        phase1_mode=row.phase1_mode,
+        phase2_mode=row.phase2_mode,
         phase1_file_generated=row.phase1_file_generated,
         validation_ok=row.validation_ok,
         branch_pushed=row.branch_pushed,
@@ -1718,6 +1873,10 @@ def _cursor_validation_case_payload(item: TestCaseResult) -> dict[str, Any]:
         "backend_assertions": {
             "target_found": item.expected_target_found,
             "control_detected": item.correct_flag_detected,
+            "phase1_control_mentioned": item.phase1_control_mentioned,
+            "phase2_control_mentioned": item.phase2_control_mentioned,
+            "phase1_mode": item.phase1_mode,
+            "phase2_mode": item.phase2_mode,
             "phase1_file_generated": item.phase1_file_generated,
             "precommit_validation_ok": item.validation_ok,
             "branch_pushed": item.branch_pushed,
@@ -1890,8 +2049,8 @@ def format_test_run_report(run: TestRunResult) -> str:
         )
     lines.extend([
         "",
-        "| Test | Type | Cloud/Env | Phase 1 prompt | Expected target | Target found | Control/relevance | P1 file | Validation | Branch pushed | Context | P2 retrieved | P2 attached | P2 useful | Cursor output | Cursor context | Cursor overall | Classification | Score |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---:|",
+        "| Test | Type | Cloud/Env | Phase 1 prompt | Expected target | P1 mode | P2 mode | Target found | Control/output | Control mentioned | P1 file | Validation | Branch pushed | Context | P2 retrieved | P2 attached | P2 useful | Cursor output | Cursor context | Cursor overall | Classification | Score |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---:|",
     ])
     for item in run.cases:
         case = item.case
@@ -1907,8 +2066,15 @@ def format_test_run_report(run: TestRunResult) -> str:
                     _escape_table(f"{case.cloud}/{case.environment}", 22),
                     _escape_table(case.phase1_prompt, 38),
                     _escape_table(target, 50),
+                    _escape_table(item.phase1_mode or "<none>", 20),
+                    _escape_table(item.phase2_mode or "<none>", 20) if case.case_type == "boolean_context" else "N/A",
                     _status(item.expected_target_found),
                     _status(item.correct_flag_detected),
+                    (
+                        f"P1:{_status(item.phase1_control_mentioned)} P2:{_status(item.phase2_control_mentioned)}"
+                        if case.case_type == "boolean_context"
+                        else "N/A"
+                    ),
                     _status(item.phase1_file_generated),
                     _status(item.validation_ok),
                     _status(item.branch_pushed),
@@ -2046,6 +2212,10 @@ def _case_state_payload(item: TestCaseResult) -> dict[str, Any]:
         "expected_flag": item.case.flag,
         "expected_target_found": item.expected_target_found,
         "correct_flag_detected": item.correct_flag_detected,
+        "phase1_control_mentioned": item.phase1_control_mentioned,
+        "phase2_control_mentioned": item.phase2_control_mentioned,
+        "phase1_mode": item.phase1_mode,
+        "phase2_mode": item.phase2_mode,
         "phase1_file_generated": item.phase1_file_generated,
         "validation_ok": item.validation_ok,
         "branch_pushed": item.branch_pushed,
