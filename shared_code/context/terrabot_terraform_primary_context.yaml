@@ -1,0 +1,473 @@
+schema_version: terrabot.terraform-primary-context.v1
+generated_at: "2026-08-31"
+purpose: >-
+  Primary repository-alignment context for Terrabot when it reads, creates,
+  modifies, validates, commits, and opens pull requests for Terraform in
+  venasolutions/tf-devops and venasolutions/tf-azure-hub.
+
+authority_and_precedence:
+  rule: >-
+    This file is the primary authoring playbook, but it is not a substitute for
+    current repository evidence. For exact paths, values, versions, module
+    inputs, branch policy, and pipeline behavior, live GitHub content at the
+    selected commit always wins.
+  order:
+    - "Live selected-commit Terraform and pipeline files supplied in context_pack."
+    - "Live selected-commit README files, module READMEs, .github instructions, PR templates, CODEOWNERS, and .serena/.Serena files when present."
+    - "This primary Terraform context for stable repository conventions and workflow rules."
+    - "Validated repository-index context for prior clarifications and relationships; revalidate it against live files before use."
+  conflict_behavior:
+    - "Do not silently choose this file over contradictory live code."
+    - "Log the conflicting path and follow the current repository artifact."
+    - "Do not invent a convention when the nearest live sibling demonstrates one."
+
+snapshot_evidence:
+  tf_devops:
+    repository: "venasolutions/tf-devops"
+    snapshot_branch: "vena-ishika/STO-9604/terrabot-test"
+    snapshot_commit: "1a4115a7249ef82ca9fc642cda1eacfc012c2252"
+    inspected_artifacts:
+      - "README.md"
+      - "terraform/README.md"
+      - ".github/copilot-instructions.md"
+      - ".github/instructions/terraform-modules.instructions.md"
+      - ".github/instructions/hub-environments.instructions.md"
+      - ".github/PULL_REQUEST_TEMPLATE.md"
+      - ".github/CODEOWNERS"
+      - ".cm/gitstream.cm"
+      - "pipeline-templates/tf-stages.yml"
+      - "pipeline-templates/tf-code-checks.yml"
+      - "representative backend.tf, versions.tf, main.tf, vars.tf, outputs.tf, and module files"
+  tf_azure_hub:
+    repository: "venasolutions/tf-azure-hub"
+    snapshot_branch: "vena-ishika/STO-9604/terrabot-test"
+    snapshot_commit: "e2e12cb9f60f0e6a93e5443e250f85e75da381a7"
+    inspected_artifacts:
+      - "README.md"
+      - ".github/copilot-instructions.md"
+      - ".github/PULL_REQUEST_TEMPLATE.md"
+      - ".github/CODEOWNERS"
+      - ".cm/gitstream.cm"
+      - ".pre-commit-config.yaml"
+      - ".tool-versions"
+      - "provider.tf"
+      - "pipelines/azure-pipelines-npr.yml"
+      - "pipelines/azure-pipelines-prd.yml"
+      - "representative root .tf files and vars/**/*.tfvars"
+  serena_status:
+    snapshot_result: >-
+      No .serena or .Serena directory was present in either supplied snapshot.
+      This is not a permanent exception. Terrabot must scan the live selected
+      commit and read any such files if they are added later.
+
+mandatory_task_sequence:
+  - "Resolve cloud, repository, environment, requested operation, and target branch before generation."
+  - "Fetch the selected repository tree and exact current commit SHA."
+  - "Read the complete target file and the nearest relevant sibling files; do not generate from snippets alone."
+  - "Read applicable repository guidance in .github, README files, module READMEs, and .serena/.Serena when present."
+  - "Retrieve validated repository-index context for the repo and request. Treat it as a hint until live evidence confirms it."
+  - "Choose the existing repository pattern that implements the requested behavior. Ask a clarification only when live evidence leaves more than one materially valid target."
+  - "Generate complete final contents for every changed file. Never emit placeholders, scratch paths, partial fragments, or omitted unchanged sections."
+  - "Run deterministic target, minimal-diff, structure, syntax, and repository-specific validators before writing."
+  - "Use existing Terrabot branch, commit, push, PR, Azure DevOps plan, plan-risk, drift, and Teams notification workflows. Do not bypass them."
+  - "Store only evidence-validated durable facts or resolved clarifications in the repository index."
+
+cross_repository_rules:
+  change_safety:
+    - "Preserve every unrelated existing line, block, resource, function, output, variable, comment, and ordering choice unless the request requires it to change."
+    - "For a Boolean-gated modification, change only the selected live Boolean literal after backend verification."
+    - "For modification of an existing resource, permit only the smallest targeted delta inside the selected resource or its environment value."
+    - "For creation in an existing file, follow the nearest sibling placement. Use append-only behavior only when the live file pattern and Terrabot validator require it."
+    - "Never bulk-modernize legacy code as part of an unrelated request."
+  source_of_values:
+    - "Reuse exact live sibling structure, source, version, provider alias, tags, input order, and naming pattern."
+    - "Use concrete non-secret values from the target environment or a verified nearest sibling."
+    - "Use the repository's existing secret-reference mechanism. Never write credentials or secret values."
+    - "Do not invent account IDs, subscription IDs, regions, CIDRs, names, ARNs, resource IDs, backend keys, module refs, or pipeline parameters."
+  terraform_basics:
+    - "Use snake_case for Terraform labels and variables unless an existing public interface requires another form."
+    - "New input variables need an explicit type and description unless the live scoped convention demonstrates a justified exception."
+    - "Pin module and provider versions exactly as the live repository does; never replace a pin with latest."
+    - "Use encryption and least privilege where supported, matching the repository's current resource pattern."
+    - "Run terraform fmt on changed Terraform files. Do not reformat unrelated files."
+  backend_rules:
+    - "Terraform backend blocks cannot use normal var.* expressions. Do not copy the invalid variable-based backend templates from the old Copilot context."
+    - "Backend and state-key changes are high risk and require explicit request scope, exact sibling evidence, and plan review."
+  pull_requests:
+    - "Never push directly to the default branch unless the user explicitly authorizes it and repository policy allows it."
+    - "Use the live .github/PULL_REQUEST_TEMPLATE.md verbatim as the PR body skeleton."
+    - "The supplied snapshot template requires: JIRA ticket link, Description, Why was this required, How to test, Deployment plan, Checklist, and required Risk assessment sections."
+    - "The supplied snapshot checklist expects a PR title shaped like [#INF-<num>] and gives [#STO-1] as the example; preserve the exact live convention rather than converting it to a generic Conventional Commit title."
+    - "Select the live template's required review label from the actual risk answers, including hotfix-process, cab, security, third-party-libraries, or team-only where applicable. Do not add every label mechanically."
+    - "Use the current repository title and Jira conventions from the live template and branch policy."
+    - "Do not claim an approval or apply policy that is not visible in the live pipeline or Azure DevOps environment configuration."
+  validation:
+    - "At minimum perform targeted terraform fmt checks and repository-specific deterministic validation."
+    - "Use terraform init -backend=false and terraform validate only where the selected root and providers allow it without credentials."
+    - "A real plan may require backend, cloud, GitHub, and module credentials; use the established Azure DevOps pipeline instead of fabricating local success."
+    - "Treat planned replacement or destruction as a blocking risk requiring explicit review."
+
+repositories:
+  tf_devops:
+    identity:
+      repository: "venasolutions/tf-devops"
+      cloud: "aws"
+      purpose: "AWS Terraform infrastructure monorepo with Azure DevOps CI/CD."
+    layout:
+      terraform_modules: "terraform/modules/<module_name>/"
+      account_roots:
+        - "terraform/dev_aws/"
+        - "terraform/prod_aws/"
+        - "terraform/services_aws/"
+        - "terraform/dev_services_aws/"
+        - "terraform/network_services/"
+        - "terraform/root/"
+        - "terraform/datadog/"
+        - "terraform/pagerduty/"
+      environment_model:
+        - "Environments are directories, not Terraform workspaces."
+        - "Each runnable root owns separate remote state."
+        - "Hub examples include dev, minidev, bolt, us1, eu2, and ca3."
+        - "DR roots use a _dr directory suffix."
+        - "SQL staging roots use sqlstaging naming variants."
+        - "global roots contain account-level resources; devops roots contain CI/CD tooling."
+      common_root_files:
+        - "backend.tf"
+        - "versions.tf"
+        - "main.tf"
+        - "vars.tf"
+        - "outputs.tf"
+      variable_filename: "vars.tf"
+    architecture:
+      root_module:
+        name: "vena_datacentre"
+        rule: >-
+          Vena hub core infrastructure belongs inside vena_datacentre. New hub
+          functionality should normally be a dedicated submodule called from
+          vena_datacentre and exposed through a feature flag, not a new direct
+          sibling module in each hub main.tf.
+      approved_direct_hub_satellites:
+        - "vena_sqlstaging_peering"
+        - "patch_management"
+      legacy_direct_satellites:
+        examples:
+          - "otel_collector"
+          - "otel_collector_daemon"
+          - "file_metrics"
+        rule: "Preserve existing instances but do not extend this legacy pattern for new hub features."
+      module_sources:
+        default: "Relative local paths under terraform/modules."
+        live_exceptions:
+          - "terraform-aws-modules/cloudfront/aws"
+          - "observeinc/terraform-aws-collection modules pinned to v3.0.0"
+          - "venasolutions/terraform-aws-datadog-forwarders pinned to v5.1.0"
+        rule: "Copy the exact source and ref from a verified live sibling."
+    modules:
+      preferred_new_module_files:
+        - "main.tf"
+        - "vars.tf"
+        - "outputs.tf"
+        - "versions.tf"
+      large_module_pattern: "Split concerns into additional files such as iam.tf, cloudwatch.tf, alb.tf, asg.tf, or kinesis.tf."
+      compatibility_exception: >-
+        Many legacy modules predate the current four-file instruction. Do not
+        add empty files or refactor them merely to satisfy the newer convention.
+        Apply the convention to new modules and active refactors.
+      feature_flags:
+        enable_prefix: "Application services and feature behavior."
+        create_prefix: "Stateful, costly, or independently provisioned resources."
+        dr_rule: "Expose and wire create flags so expensive resources can remain disabled in DR until a test."
+      dr_awareness:
+        - "Use is_dr_region when the module pattern supports it."
+        - "Gate non-essential alarms and secondary resources using the live module pattern."
+        - "Do not indiscriminately disable replicated data, networking, or recovery prerequisites."
+    hub_roots:
+      locals:
+        expected_concepts:
+          - "env"
+          - "subdomain"
+          - "region"
+          - "network_base"
+          - "source_account_id"
+        exception: >-
+          Repository guidance says hub main.tf opens with locals, but legacy
+          roots may have provider or data blocks first. Do not reorder a working
+          root. Reuse the nearest same-type hub structure.
+      dr_pattern:
+        - "Use a different region and VPC CIDR from the primary hub."
+        - "Use a -dr subdomain convention where the live sibling does."
+        - "Pass is_dr_region = true where present."
+        - "Set expensive create flags false and scale active compute to zero where the live DR sibling does."
+        - "Preserve production classification and compliance tags for production DR."
+    state_and_backends:
+      backend_type: "s3"
+      observed_pattern:
+        - "backend.tf contains literal bucket, key, and region values for that root."
+        - "encrypt = true is common, but some legacy roots differ."
+        - "No universal DynamoDB lock-table convention was observed in the supplied snapshot."
+      authoring_rule:
+        - "Copy the nearest equivalent root's backend shape."
+        - "Use a unique state key for a new root."
+        - "Do not introduce var.* expressions in the backend block."
+        - "Do not assume the old create_env.py output is current policy."
+    versions:
+      terraform_repository_constraint: ">= 1.11.4"
+      aws_provider_common_constraint: "~> 5.34.0"
+      pipeline_terraform_version: "1.11.4"
+      rule: "The selected root's live versions/backend files override these snapshot values."
+    review_ownership:
+      default: "@venasolutions/devops-guardians-team"
+      dns_firewall_exception: "terraform/modules/vena_datacentre/dns_firewall.tf also requires @venasolutions/information-security-team in the supplied snapshot."
+      automation_paths: ".github/workflows/ and .cm/ are owned by @venasolutions/tooling-team."
+      rule: "Read live CODEOWNERS; do not hardcode an approver count or bypass path-specific owners."
+    pipelines:
+      entrypoints:
+        - "azure-pipelines_dev.yml"
+        - "azure-pipelines_prod.yml"
+        - "azure-pipelines_bolt.yml"
+        - "azure-pipelines_drift.yml"
+      reusable_templates: "pipeline-templates/"
+      test_behavior:
+        - "Recursive terraform fmt check."
+        - "Checkov security analysis; current template settings may be soft-fail."
+      plan_behavior:
+        - "Initialize the selected environment, validate, and create plan.out."
+        - "Publish sanitized JSON/text plan artifacts because plan output may contain sensitive data."
+        - "Use Azure DevOps service connections and AWS STS role assumption."
+      apply_exception: >-
+        Do not state that every production apply is manual. Some pipelines have
+        applyFromBranch controls and Azure DevOps environment gates. Read the
+        exact entrypoint, template ref, and environment approval configuration.
+    new_aws_resource_workflow:
+      module_exists:
+        - "Read the complete module and all consumers."
+        - "Select the correct existing environment consumer file, normally main.tf when verified."
+        - "Append or surgically modify the module call using exact sibling inputs and ordering."
+      module_missing:
+        - "Create terraform/modules/<resource>/ using repository-aligned files and patterns."
+        - "Create the environment consumer in the same change."
+        - "Do not ask the user to provide a module source when the repository workflow is to create a local module."
+      environment_rule: "Never create variables.tf or outputs.tf in an environment root merely to pass module inputs when that root uses direct locals/values in main.tf."
+    modification_workflow:
+      boolean_gate: "Verify the literal assignment in the complete live environment file, then change only that literal."
+      existing_resource: "Modify only the selected block or its verified input; preserve the complete file otherwise."
+      creation: "Use exact same-type sibling placement and call structure."
+
+  tf_azure_hub:
+    identity:
+      repository: "venasolutions/tf-azure-hub"
+      cloud: "azure"
+      purpose: "A single Azure hub Terraform root parameterized by layered tfvars, plus an isolated Datadog monitoring root."
+    layout:
+      root_model:
+        - "The repository root is the shared Terraform root for hub infrastructure."
+        - "Do not create terraform/<environment>/ roots or per-environment backend.tf files."
+        - "Concern files at root include aca_apps.tf, aca_env.tf, storage_accounts.tf, db_mysql.tf, key_vault.tf, rbac.tf, vnet.tf, and related files."
+      variable_declarations: "variables.tf"
+      values:
+        common: "vars/common.tfvars"
+        tier: "vars/<tier>/tier.tfvars"
+        hub: "vars/<tier>/<hub>/hub.tfvars"
+        dr: "vars/<tier>/<hub>/dr.tfvars when the pipeline includes it"
+      monitoring_exception: "monitoring/dd_monitors is a separate Terraform root with its own backend and Datadog provider behavior."
+      local_module_exception: >-
+        modules/datadog is a legacy local helper with a non-standard file shape.
+        Do not generalize it into a repository-wide module convention.
+    provider_and_backend:
+      root_backend:
+        type: "azurerm"
+        pattern: "Partial backend with use_azuread_auth = true; state coordinates are injected by Azure DevOps templates."
+        rule: "Never invent state storage account, container, resource group, or key in an environment file."
+      terraform_version: ">= 1.11.4"
+      provider_snapshot:
+        azurerm: ">= 4.3.0, < 4.77.0"
+        azuread: ">= 3.0.1"
+        "null": "3.2.2"
+        local: "2.5.1"
+        random: ">= 3.0.0"
+        github: "~> 6.0"
+        cloudamqp: "1.34.0"
+        tls: "4.1.0"
+        kubernetes: ">= 2.29.0"
+        helm: ">= 2.13.2"
+        azapi: "2.7.0"
+      important_exception: >-
+        Preserve the live azurerm upper-bound regression comment and constraint.
+        Do not remove or widen it without a separate verified dependency change.
+      provider_aliases:
+        - "management_sub"
+        - "infradevops_sub"
+        - "npr_infradevops_sub"
+        - "insights_sub"
+        - "global_sub"
+      secret_pattern: "Use existing Key Vault, ephemeral, managed identity, or pipeline secret references; never place credentials in tfvars."
+    modules:
+      dominant_source: "Pinned Git SSH sources under venasolutions."
+      public_exception: "Some resources use public registry modules, such as Azure/aks/azurerm."
+      snapshot_refs:
+        app_gateway: "v2.0.5"
+        mysql_flexible: "v2.0.4"
+        event_hub: "v1.1.0"
+        rbac: "v1.0.0"
+        secret: "v1.0.0"
+        container_apps: "v1.1.6"
+        storage_account: "v1.2.2"
+        vnet: "v5.0.3"
+        load_balancer: "v1.0.1"
+        patch_management: "v2.5.4"
+        function_app: "v1.0.2"
+        apim: "v1.0.2"
+        cloudamqp: "v2.2.2"
+        data_factory: "v1.0.2"
+        datadog_monitor: "v1.0.1"
+      rule: "Always copy the current live source string and ref; the generated README may be stale."
+    naming_and_tags:
+      naming: "Use the established Azure abbreviations and local naming expressions, such as rg-, law-, and resource-family prefixes."
+      tags: "Merge the established shared tags, including current compliance/Vanta tags, rather than replacing them."
+      resource_ids: "Azure resource IDs may be legitimate environment inputs, but secrets and credentials may not be committed."
+    environment_layering:
+      rule: >-
+        Change the narrowest layer that expresses the requested scope. A
+        single-hub change belongs in that hub's hub.tfvars unless the variable
+        is intentionally common or tier-wide. A DR-only value belongs in
+        dr.tfvars when the pipeline loads it.
+      no_cross_references: "Tfvars assignments must contain concrete HCL values, not var.* references to another object."
+      preserve_layers: "Do not copy an environment-specific value into common.tfvars or tier.tfvars without explicit scope evidence."
+    container_apps:
+      design:
+        - "aca_apps.tf defines application metadata in local.default_container_apps."
+        - "Each application has an enable control such as var.aca_app_<name>_enabled."
+        - "A filtered local.container_apps drives the container-app module in aca_env.tf."
+      enable_existing_app: "For one environment, change only the verified most-specific tfvars Boolean when the variable and map entry already exist."
+      add_new_app:
+        - "Add the nearest-sibling-shaped entry in aca_apps.tf."
+        - "Add its Boolean variable declaration in variables.tf."
+        - "Add only required role, secret, ingress, domain, or identity wiring demonstrated by the sibling."
+        - "Add a hub.tfvars override only when the target environment value differs from the declared/default layer."
+        - "Keep aca_env.tf wiring unchanged unless the new app requires a genuinely new module-level capability."
+    object_backed_resources:
+      examples:
+        - "storage accounts"
+        - "database instances"
+        - "other modules consuming var.<object>.*"
+      new_instance_workflow:
+        - "Clone the exact nearest sibling module invocation in the correct concern file."
+        - "Create a dedicated object-root variable with the same type shape in variables.tf."
+        - "Create a concrete object assignment in the target hub.tfvars."
+        - "Do not reuse the sibling's object variable as the new instance's configuration root."
+        - "Ensure source and target object field sets match when cloning the same variant."
+      modification_workflow: "Change only the requested field in the verified object assignment or module input."
+    review_ownership:
+      default: "@venasolutions/saaseng-team"
+      automation_paths: ".github/workflows/ and .cm/ are owned by @venasolutions/tooling-team."
+      rule: "Read live CODEOWNERS and allow GitHub/review automation to request the current owners."
+    pipelines:
+      template_repository: "venasolutions/ado-pipeline-templates"
+      snapshot_template_ref: "refs/tags/v3.3.0"
+      entrypoints:
+        - "pipelines/azure-pipelines-npr.yml"
+        - "pipelines/azure-pipelines-prd.yml"
+      terraform_version: "1.11.4"
+      module_directory: "."
+      nonproduction_layers:
+        - "vars/common.tfvars"
+        - "vars/npr/tier.tfvars"
+        - "vars/npr/<hub>/hub.tfvars"
+      production_layers:
+        - "vars/common.tfvars"
+        - "vars/prd/tier.tfvars"
+        - "vars/prd/<hub>/hub.tfvars"
+        - "optional vars/prd/<hub>/dr.tfvars"
+      state_names:
+        primary: "tf-azure-hub"
+        dr: "tf-azure-hub-dr"
+      apply_exception: >-
+        The NPR pipeline currently passes applyFromBranch = true for active
+        modules. The PRD entrypoint does not define it in the supplied snapshot;
+        external template defaults and Azure DevOps environment gates decide the
+        effective behavior. Never infer more than the live files show.
+    readme_exception: >-
+      The root README is generated by terraform-docs and may list stale provider
+      or module versions. Use provider.tf, .tool-versions, module source refs,
+      and pipeline files for current version truth.
+    validation:
+      pre_commit_hooks:
+        - "terraform_fmt"
+        - "terraform_docs"
+        - "terraform_tflint"
+      tflint_exceptions: "The current pre-commit configuration disables selected unused-declaration and module-version checks; do not claim those checks are enforced when they are disabled."
+      scoped_plan: "Use the exact pipeline var-file order for the selected hub and DR mode."
+
+repository_guidance_discovery:
+  required_live_paths:
+    - ".serena/**"
+    - ".Serena/**"
+    - ".github/copilot-instructions.md"
+    - ".github/instructions/**/*.instructions.md"
+    - ".github/PULL_REQUEST_TEMPLATE.md"
+    - ".github/CODEOWNERS"
+    - "README.md"
+    - "terraform/README.md"
+    - "terraform/modules/*/README.md"
+    - "modules/*/README.md"
+    - "pipeline-templates/**"
+    - "pipelines/**"
+  absence_rule: "Missing optional guidance is not an error and must not be replaced with invented rules."
+
+terrabot_backend_integration:
+  prompt_context:
+    field_name: "terraform_primary_context"
+    intent: "Attach this file to Foundry generation calls before compaction."
+    precedence_note: "The field describes conventions; live context_pack remains authoritative current state."
+  repository_index:
+    role: "Additional durable context for validated decisions, mappings, relationships, and user clarifications."
+    write_rule: "Store only facts validated against an exact repository path and commit."
+    conflict_rule: "Keep conflict/history metadata; never silently overwrite contradictory evidence."
+  cursor_test_generation:
+    role: >-
+      Cursor analyzes the exact live GitHub commit and produces only natural
+      language Phase 1 and Phase 2 test prompts for pre-derived immutable test
+      targets. Cursor does not generate Terraform, change files, push branches,
+      create PRs, write repository context, or post Teams messages in this flow.
+    immutable_case_fields:
+      - "repository"
+      - "commit_sha"
+      - "path"
+      - "environment"
+      - "flag"
+      - "current_value"
+      - "desired_value"
+    mutable_case_fields:
+      - "phase1_prompt"
+      - "phase2_prompt"
+    fallback: "If Cursor is disabled, unavailable, times out, or returns invalid output, use the existing backend-derived prompts and continue the test run."
+  test_execution:
+    existing_behavior_to_preserve:
+      - "Teams run tests authorization and queue-backed execution."
+      - "Live GitHub target discovery."
+      - "Phase 1 Terrabot request, clarification handling, deterministic validation, and isolated test branch push."
+      - "Validated repository-context addition."
+      - "Fresh-conversation Phase 2 context-reuse test."
+      - "Durable run state and final proactive Teams report."
+    logging_events:
+      - "cursor_prompt_generation_started"
+      - "cursor_agent_created"
+      - "cursor_agent_run_status"
+      - "cursor_prompt_case_generated"
+      - "cursor_prompt_generation_completed"
+      - "cursor_agent_archived"
+      - "cursor_agent_archive_failed"
+      - "cursor_read_only_violation"
+      - "cursor_prompt_generation_failed"
+      - "cursor_prompt_fallback_used"
+      - "terraform_primary_context_attached"
+
+prohibited_shortcuts:
+  - "Do not ask for a path, flag, module, or resource when one verified target exists in the live repository."
+  - "Do not manufacture multiple choices from unrelated Boolean flags."
+  - "Do not treat README text as stronger than current HCL or pipeline configuration."
+  - "Do not use a generic AWS or Azure backend template in place of the repository's real backend pattern."
+  - "Do not replace complete files with shortened generated versions."
+  - "Do not return only one file when the repository pattern requires a consumer, variable declaration, and environment value together."
+  - "Do not let Cursor write infrastructure changes during automated test-prompt generation."
+  - "Do not bypass Terrabot validators, branch writers, plan pipelines, or Teams reporting."

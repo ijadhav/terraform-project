@@ -35,6 +35,7 @@ from typing import Any, Callable, Iterable
 from shared_code import repository_context
 from shared_code.automated_tests import terrabot_test_state
 from shared_code.automated_tests import terrabot_semantic_engine
+from shared_code.automated_tests import terrabot_cursor_result_validator
 from shared_code.automated_tests import terrabot_test_analysis
 from shared_code.automated_tests import terrabot_test_coverage
 from shared_code.automated_tests import terrabot_context_revalidation
@@ -200,9 +201,23 @@ class TestCaseResult:
     duration_ms: int = 0
     error: str = ""
     score: int = 0
+    backend_score: int = 0
     actual_file: str = ""
     actual_mode: str = ""
     failure_classification: str = ""
+    cursor_validation_requested: bool = False
+    cursor_validation_completed: bool = False
+    cursor_output_correct: bool = False
+    cursor_context_added: bool = False
+    cursor_context_retrievable: bool = False
+    cursor_context_reused: bool = False
+    cursor_overall_ok: bool = False
+    cursor_validation_reason: str = ""
+    cursor_validation_error: str = ""
+    cursor_agent_url: str = ""
+    cursor_validation_duration_ms: int = 0
+    cursor_verdict_evidence: list[str] = field(default_factory=list)
+    cursor_evidence: dict[str, Any] = field(default_factory=dict, repr=False)
 
 
 @dataclass
@@ -214,6 +229,43 @@ class TestRunResult:
     cases: list[TestCaseResult] = field(default_factory=list)
     discovery_errors: list[str] = field(default_factory=list)
     duration_ms: int = 0
+
+
+def _calculate_case_score(row: TestCaseResult, *, include_cursor: bool) -> int:
+    if row.case.case_type == "resource_creation":
+        assertions = [
+            row.expected_target_found,
+            row.correct_flag_detected,
+            row.phase1_file_generated,
+            row.validation_ok,
+            row.branch_pushed,
+        ]
+    else:
+        assertions = [
+            row.expected_target_found,
+            row.correct_flag_detected,
+            row.phase1_file_generated,
+            row.validation_ok,
+            row.branch_pushed,
+            row.context_stored,
+            row.phase2_context_retrieved,
+            row.phase2_file_generated,
+            row.phase2_target_ok,
+            row.phase2_context_useful,
+        ]
+
+    if include_cursor and row.cursor_validation_requested:
+        assertions.append(row.cursor_validation_completed)
+        if row.cursor_validation_completed:
+            assertions.append(row.cursor_output_correct)
+            if row.case.case_type == "boolean_context":
+                assertions.extend([
+                    row.cursor_context_added,
+                    row.cursor_context_retrievable,
+                    row.cursor_context_reused,
+                ])
+            assertions.append(row.cursor_overall_ok)
+    return round(100 * sum(bool(value) for value in assertions) / max(len(assertions), 1))
 
 
 def _humanize_flag(flag: str) -> str:
@@ -721,6 +773,66 @@ def _response_file_content(result: dict, expected_path: str) -> str:
     return ""
 
 
+def _cursor_file_evidence(case: TestCase, result: dict) -> list[dict[str, Any]]:
+    """Return bounded generated-file evidence for the final Cursor review."""
+    evidence: list[dict[str, Any]] = []
+    try:
+        configured_files = int(os.getenv("TERRABOT_TEST_CURSOR_VALIDATION_MAX_FILES_PER_PHASE", "5"))
+    except (TypeError, ValueError):
+        configured_files = 5
+    try:
+        configured_chars = int(os.getenv("TERRABOT_TEST_CURSOR_VALIDATION_FILE_EXCERPT_CHARS", "9000"))
+    except (TypeError, ValueError):
+        configured_chars = 9000
+    max_files = max(1, min(configured_files, 12))
+    max_chars = max(1000, min(configured_chars, 30000))
+    for item in (result.get("files") or [])[:max_files]:
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("path") or item.get("filename") or "").strip().strip("/")
+        content = ""
+        for key in ("content", "final_content", "text", "terraform"):
+            value = item.get(key)
+            if isinstance(value, str) and value:
+                content = value
+                break
+        if not path:
+            continue
+        excerpt = content
+        if content and case.flag:
+            lines = content.splitlines()
+            index = next(
+                (i for i, line in enumerate(lines) if re.search(rf"\b{re.escape(case.flag)}\b", line, re.IGNORECASE)),
+                -1,
+            )
+            if index >= 0:
+                excerpt = "\n".join(lines[max(0, index - 24) : min(len(lines), index + 25)])
+        if len(excerpt) > max_chars:
+            excerpt = excerpt[: max_chars // 2] + "\n...<excerpt truncated>...\n" + excerpt[-max_chars // 2 :]
+        evidence.append({
+            "path": path,
+            "content_length": len(content),
+            "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest() if content else "",
+            "excerpt": excerpt,
+        })
+    return evidence
+
+
+def _cursor_context_evidence(record: dict | None) -> dict[str, Any]:
+    if not isinstance(record, dict):
+        return {}
+    return {
+        "id": str(record.get("id") or ""),
+        "category": str(record.get("category") or ""),
+        "subject": str(record.get("subject") or ""),
+        "scope": str(record.get("scope") or ""),
+        "statement": str(record.get("statement") or "")[:4000],
+        "evidence_paths": [str(value) for value in (record.get("evidence_paths") or [])[:12]],
+        "confidence": record.get("confidence"),
+        "stale": bool(record.get("stale")),
+    }
+
+
 def _target_detection(case: TestCase, result: dict) -> tuple[bool, bool, bool, str]:
     paths = [path.strip().strip("/") for path in _response_file_paths(result)]
     text = _response_text(result)
@@ -1091,6 +1203,13 @@ def _run_case(core: Any, case: TestCase, run_id: str, requester_id: str) -> Test
             row.actual_file,
         ) = _target_detection(case, phase1_result)
         row.expected_target_found = row.expected_target_found and _repo_matches(case, phase1_result)
+        row.cursor_evidence["phase1"] = {
+            "mode": str(phase1_result.get("mode") or ""),
+            "status": status,
+            "generated_files": _cursor_file_evidence(case, phase1_result),
+            "backend_target_found": row.expected_target_found,
+            "backend_control_detected": row.correct_flag_detected,
+        }
 
         validation_thread = str(phase1_result.get("thread_id") or p1_conversation)
         if str(phase1_result.get("mode") or "").lower() == "infra_preview":
@@ -1120,6 +1239,13 @@ def _run_case(core: Any, case: TestCase, run_id: str, requester_id: str) -> Test
             and str(branch_result.get("mode") or "").lower() == "branch_created"
             and bool(row.branch_name or row.branch_url)
         )
+        row.cursor_evidence["phase1"].update({
+            "backend_validation_ok": row.validation_ok,
+            "backend_validation_error": row.validation_error,
+            "branch_pushed": row.branch_pushed,
+            "branch_name": row.branch_name,
+            "branch_url": row.branch_url,
+        })
         _diag(
             "phase1_branch_result",
             run_id=run_id,
@@ -1133,14 +1259,8 @@ def _run_case(core: Any, case: TestCase, run_id: str, requester_id: str) -> Test
             # Creation is a separate workflow test. It intentionally allows
             # one or more repository/module pickers and does not require a
             # Phase 2 repository-context reuse assertion.
-            creation_assertions = [
-                row.expected_target_found,
-                row.correct_flag_detected,
-                row.phase1_file_generated,
-                row.validation_ok,
-                row.branch_pushed,
-            ]
-            row.score = round(100 * sum(bool(value) for value in creation_assertions) / len(creation_assertions))
+            row.score = _calculate_case_score(row, include_cursor=False)
+            row.backend_score = row.score
             _diag(
                 "resource_creation_case_completed",
                 run_id=run_id,
@@ -1225,6 +1345,19 @@ def _run_case(core: Any, case: TestCase, run_id: str, requester_id: str) -> Test
                 except Exception as exc:
                     _diag("context_candidate_state_update_failed", level="warning", run_id=run_id, test_case_id=case.case_id, error=exc)
 
+        # Capture the actual indexed record after production learning or the
+        # verified harness promotion. Cursor later checks its semantics and
+        # correlates it with the independent Phase 2 search result.
+        final_context_search = _search_context(case) if row.context_stored else context_search
+        final_context_match = _matching_context_record(case, final_context_search)
+        row.cursor_evidence["context_after_phase1"] = {
+            "stored": row.context_stored,
+            "present_before": row.context_present_before,
+            "production_created": row.production_context_created,
+            "fallback_created": row.fallback_context_created,
+            "record": _cursor_context_evidence(final_context_match),
+        }
+
         # Phase 2 retrieval is checked with the actual randomized paraphrase and
         # then exercised through a completely fresh Teams conversation.
         phase2_search = repository_context.search_repository_context(
@@ -1273,20 +1406,21 @@ def _run_case(core: Any, case: TestCase, run_id: str, requester_id: str) -> Test
             and row.phase2_target_ok
             and row.phase2_reused_without_clarification
         )
+        row.cursor_evidence["phase2"] = {
+            "first_mode": first_phase2_mode,
+            "final_mode": str(phase2_result.get("mode") or ""),
+            "context_retrieved": row.phase2_context_retrieved,
+            "retrieved_record": _cursor_context_evidence(phase2_match),
+            "context_attached": row.phase2_context_attached,
+            "attached_context_ids": sorted(attached_ids),
+            "expected_context_id": expected_context_id,
+            "reused_without_clarification": row.phase2_reused_without_clarification,
+            "target_ok": row.phase2_target_ok,
+            "generated_files": _cursor_file_evidence(case, phase2_result),
+        }
 
-        assertions = [
-            row.expected_target_found,
-            row.correct_flag_detected,
-            row.phase1_file_generated,
-            row.validation_ok,
-            row.branch_pushed,
-            row.context_stored,
-            row.phase2_context_retrieved,
-            row.phase2_file_generated,
-            row.phase2_target_ok,
-            row.phase2_context_useful,
-        ]
-        row.score = round(100 * sum(bool(value) for value in assertions) / len(assertions))
+        row.score = _calculate_case_score(row, include_cursor=False)
+        row.backend_score = row.score
     except Exception as exc:
         row.error = str(exc)
         _diag(
@@ -1410,6 +1544,109 @@ def _derive_test_cases(core: Any, cloud_filter: str, count: int, run_id: str, ru
     return cases[:count], errors
 
 
+def _cursor_validation_case_payload(item: TestCaseResult) -> dict[str, Any]:
+    case = item.case
+    return {
+        "case_id": case.case_id,
+        "case_type": case.case_type,
+        "owner": case.owner,
+        "repo": case.repo,
+        "cloud": case.cloud,
+        "environment": case.environment,
+        "commit_sha": case.commit_sha,
+        "base_branch": case.branch,
+        "test_branch": item.branch_name,
+        "test_branch_url": item.branch_url,
+        "phase1_prompt": case.phase1_prompt,
+        "phase2_prompt": case.phase2_prompt if case.case_type == "boolean_context" else "",
+        "expected": {
+            "path": case.path,
+            "flag": case.flag,
+            "alias": case.alias,
+            "current_value": case.current_value,
+            "desired_value": case.desired_value,
+            "evidence_line": case.evidence_line,
+        },
+        "backend_assertions": {
+            "target_found": item.expected_target_found,
+            "control_detected": item.correct_flag_detected,
+            "phase1_file_generated": item.phase1_file_generated,
+            "precommit_validation_ok": item.validation_ok,
+            "branch_pushed": item.branch_pushed,
+            "context_stored": item.context_stored,
+            "phase2_context_retrieved": item.phase2_context_retrieved,
+            "phase2_context_attached": item.phase2_context_attached,
+            "phase2_target_ok": item.phase2_target_ok,
+            "phase2_reused_without_clarification": item.phase2_reused_without_clarification,
+            "backend_score": item.score,
+        },
+        "evidence": item.cursor_evidence,
+    }
+
+
+def _apply_cursor_validation_result(
+    run_id: str,
+    cases: list[TestCaseResult],
+    validation: dict[str, Any],
+) -> None:
+    requested = bool(validation.get("enabled"))
+    if not requested:
+        return
+    completed = bool(validation.get("completed"))
+    verdicts = validation.get("case_results") or {}
+    shared_error = str(validation.get("error") or "").strip()
+    agent_url = str(validation.get("agent_url") or "").strip()
+    duration_ms = int(validation.get("duration_ms") or 0)
+
+    for item in cases:
+        item.cursor_validation_requested = True
+        item.cursor_agent_url = agent_url
+        item.cursor_validation_duration_ms = duration_ms
+        item.backend_score = item.score
+        verdict = verdicts.get(item.case.case_id) if isinstance(verdicts, dict) else None
+        if completed and isinstance(verdict, dict):
+            item.cursor_validation_completed = True
+            item.cursor_output_correct = bool(verdict.get("output_correct"))
+            if item.case.case_type == "boolean_context":
+                item.cursor_context_added = bool(verdict.get("context_added"))
+                item.cursor_context_retrievable = bool(verdict.get("context_retrievable"))
+                item.cursor_context_reused = bool(verdict.get("context_reused"))
+                applicable_ok = bool(
+                    item.cursor_output_correct
+                    and item.cursor_context_added
+                    and item.cursor_context_retrievable
+                    and item.cursor_context_reused
+                )
+            else:
+                applicable_ok = item.cursor_output_correct
+            item.cursor_overall_ok = bool(verdict.get("overall_ok")) and applicable_ok
+            item.cursor_validation_reason = str(verdict.get("reason") or "").strip()
+            item.cursor_verdict_evidence = [
+                str(value).strip()[:500]
+                for value in (verdict.get("evidence") or [])[:8]
+                if str(value).strip()
+            ]
+        else:
+            item.cursor_validation_error = shared_error or "Cursor validation did not return a verdict for this case."
+
+        item.score = _calculate_case_score(item, include_cursor=True)
+        item.failure_classification = terrabot_test_analysis.classify_result(item.case, item)
+        _diag(
+            "cursor_validation_applied",
+            run_id=run_id,
+            test_case_id=item.case.case_id,
+            completed=item.cursor_validation_completed,
+            output_correct=item.cursor_output_correct,
+            context_added=item.cursor_context_added if item.case.case_type == "boolean_context" else "n/a",
+            context_retrievable=item.cursor_context_retrievable if item.case.case_type == "boolean_context" else "n/a",
+            context_reused=item.cursor_context_reused if item.case.case_type == "boolean_context" else "n/a",
+            overall_ok=item.cursor_overall_ok,
+            backend_score=item.backend_score,
+            final_score=item.score,
+            error=item.cursor_validation_error,
+        )
+
+
 def _escape_table(value: Any, limit: int = 56) -> str:
     text = re.sub(r"\s+", " ", str(value if value is not None else "")).strip()
     text = text.replace("|", "\\|")
@@ -1422,10 +1659,33 @@ def _status(value: bool) -> str:
     return "PASS" if value else "FAIL"
 
 
+def _cursor_status(item: TestCaseResult, attribute: str) -> str:
+    if not item.cursor_validation_requested:
+        return "N/A"
+    if not item.cursor_validation_completed:
+        return "ERROR"
+    return _status(bool(getattr(item, attribute, False)))
+
+
+def _cursor_context_status(item: TestCaseResult) -> str:
+    if item.case.case_type != "boolean_context" or not item.cursor_validation_requested:
+        return "N/A"
+    if not item.cursor_validation_completed:
+        return "ERROR"
+    return (
+        f"ADD:{_status(item.cursor_context_added)} "
+        f"GET:{_status(item.cursor_context_retrievable)} "
+        f"USE:{_status(item.cursor_context_reused)}"
+    )
+
+
 def format_test_run_report(run: TestRunResult) -> str:
     completed = len(run.cases)
     passed = sum(1 for item in run.cases if item.score == 100)
     average_score = round(sum(item.score for item in run.cases) / completed, 1) if completed else 0.0
+    average_backend_score = round(
+        sum((item.backend_score or item.score) for item in run.cases) / completed, 1
+    ) if completed else 0.0
     branches = sum(1 for item in run.cases if item.branch_pushed)
     p1_files = sum(1 for item in run.cases if item.phase1_file_generated)
     context_cases = [item for item in run.cases if item.case.case_type == "boolean_context"]
@@ -1439,6 +1699,14 @@ def format_test_run_report(run: TestRunResult) -> str:
     p2_files = sum(1 for item in context_cases if item.phase2_file_generated)
     avg_calls = round(sum(item.bot_calls for item in run.cases) / completed, 1) if completed else 0.0
     avg_seconds = round(sum(item.duration_ms for item in run.cases) / max(completed, 1) / 1000.0, 1)
+    cursor_cases = [item for item in run.cases if item.cursor_validation_requested]
+    cursor_reviewed = sum(1 for item in cursor_cases if item.cursor_validation_completed)
+    cursor_output = sum(1 for item in cursor_cases if item.cursor_validation_completed and item.cursor_output_correct)
+    cursor_context_cases = [item for item in context_cases if item.cursor_validation_requested]
+    cursor_context_added = sum(1 for item in cursor_context_cases if item.cursor_validation_completed and item.cursor_context_added)
+    cursor_context_get = sum(1 for item in cursor_context_cases if item.cursor_validation_completed and item.cursor_context_retrievable)
+    cursor_context_use = sum(1 for item in cursor_context_cases if item.cursor_validation_completed and item.cursor_context_reused)
+    cursor_overall = sum(1 for item in cursor_cases if item.cursor_validation_completed and item.cursor_overall_ok)
 
     lines = [
         "**Terrabot automated repository-context test results**",
@@ -1448,10 +1716,25 @@ def format_test_run_report(run: TestRunResult) -> str:
         f"Boolean-context cases: **{len(context_cases)}** | Context available: **{contexts}/{len(context_cases) or 1}** | Production learned: **{production_context}** | Harness promoted: **{fallback_context}**",
         f"Phase 2 context retrieved: **{p2_context}/{len(context_cases) or 1}** | Attached to Foundry: **{p2_attached}/{len(context_cases) or 1}** | Useful: **{p2_useful}/{len(context_cases) or 1}** | Phase 2 files: **{p2_files}/{len(context_cases) or 1}**",
         f"Average backend calls/case: **{avg_calls}** | Average case time: **{avg_seconds}s** | Total: **{round(run.duration_ms / 1000.0, 1)}s**",
-        "",
-        "| Test | Type | Cloud/Env | Phase 1 prompt | Expected target | Target found | Control/relevance | P1 file | Validation | Branch pushed | Context | P2 retrieved | P2 attached | P2 useful | Classification | Score |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---:|",
     ]
+    if cursor_cases:
+        lines.append(
+            f"Cursor independent review: **{cursor_reviewed}/{len(cursor_cases)}** completed | "
+            f"Output correct: **{cursor_output}/{len(cursor_cases)}** | "
+            f"Context added: **{cursor_context_added}/{len(cursor_context_cases) or 1}** | "
+            f"Retrievable: **{cursor_context_get}/{len(cursor_context_cases) or 1}** | "
+            f"Reused: **{cursor_context_use}/{len(cursor_context_cases) or 1}** | "
+            f"Overall accepted: **{cursor_overall}/{len(cursor_cases)}**"
+        )
+        lines.append(
+            f"Backend-only accuracy: **{average_backend_score}%** | "
+            f"Final accuracy after Cursor: **{average_score}%**"
+        )
+    lines.extend([
+        "",
+        "| Test | Type | Cloud/Env | Phase 1 prompt | Expected target | Target found | Control/relevance | P1 file | Validation | Branch pushed | Context | P2 retrieved | P2 attached | P2 useful | Cursor output | Cursor context | Cursor overall | Classification | Score |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---:|",
+    ])
     for item in run.cases:
         case = item.case
         target = f"{case.path} :: {case.flag}" if case.flag else f"repository creation near {case.path}"
@@ -1475,12 +1758,53 @@ def format_test_run_report(run: TestRunResult) -> str:
                     p2_context_status,
                     _status(item.phase2_context_attached) if case.case_type == "boolean_context" else "N/A",
                     _status(item.phase2_context_useful) if case.case_type == "boolean_context" else "N/A",
-                    _escape_table(item.failure_classification or "", 28),
+                    _cursor_status(item, "cursor_output_correct"),
+                    _escape_table(_cursor_context_status(item), 42),
+                    _cursor_status(item, "cursor_overall_ok"),
+                    _escape_table(item.failure_classification or "", 36),
                     f"{item.score}%",
                 ]
             )
             + " |"
         )
+
+    if cursor_cases:
+        lines.extend([
+            "",
+            "**Cursor independent validation**",
+            "| Test | Output correct | Context added | Context retrievable | Context reused | Overall | Reason |",
+            "|---|---|---|---|---|---|---|",
+        ])
+        for item in cursor_cases:
+            context_added_status = (
+                _cursor_status(item, "cursor_context_added")
+                if item.case.case_type == "boolean_context"
+                else "N/A"
+            )
+            context_retrievable_status = (
+                _cursor_status(item, "cursor_context_retrievable")
+                if item.case.case_type == "boolean_context"
+                else "N/A"
+            )
+            context_reused_status = (
+                _cursor_status(item, "cursor_context_reused")
+                if item.case.case_type == "boolean_context"
+                else "N/A"
+            )
+            reason = item.cursor_validation_reason or item.cursor_validation_error or "No Cursor reason returned."
+            lines.append(
+                "| "
+                + " | ".join([
+                    _escape_table(item.case.case_id, 24),
+                    _cursor_status(item, "cursor_output_correct"),
+                    context_added_status,
+                    context_retrievable_status,
+                    context_reused_status,
+                    _cursor_status(item, "cursor_overall_ok"),
+                    _escape_table(reason, 100),
+                ])
+                + " |"
+            )
 
     failures = [item for item in run.cases if item.score < 100]
     if failures:
@@ -1511,6 +1835,21 @@ def format_test_run_report(run: TestRunResult) -> str:
                 reasons.append("Phase 2 target mismatch")
             if item.case.case_type == "boolean_context" and not item.phase2_reused_without_clarification:
                 reasons.append("Phase 2 required clarification")
+            if item.cursor_validation_requested and not item.cursor_validation_completed:
+                reasons.append("Cursor validation unavailable")
+            if item.cursor_validation_completed and not item.cursor_output_correct:
+                reasons.append("Cursor rejected generated output")
+            if item.case.case_type == "boolean_context" and item.cursor_validation_completed:
+                if not item.cursor_context_added:
+                    reasons.append("Cursor did not verify context addition")
+                if not item.cursor_context_retrievable:
+                    reasons.append("Cursor did not verify context retrieval")
+                if not item.cursor_context_reused:
+                    reasons.append("Cursor did not verify context reuse")
+            if item.cursor_validation_reason and not item.cursor_overall_ok:
+                reasons.append("Cursor: " + item.cursor_validation_reason)
+            if item.cursor_validation_error:
+                reasons.append("Cursor error: " + item.cursor_validation_error)
             if item.error:
                 reasons.append(item.error)
             elif item.validation_error and not item.validation_ok:
@@ -1524,8 +1863,8 @@ def format_test_run_report(run: TestRunResult) -> str:
 
     lines.extend([
         "",
-        "Phase 1 pushes each validated test change to its own Terrabot test branch; no pull request is created. Phase 2 applies only to Boolean-context cases, uses a fresh synthetic Teams conversation, and does not push another branch. Resource-creation cases automatically answer bounded module/resource clarification pickers with a valid numeric choice and are scored on generation, validation, and branch transport.",
-        f"Search Function App logs with `run_id={run.run_id}` for the complete `[TerrabotTest]` execution trace.",
+        "Phase 1 pushes each backend-validated test change to its own Terrabot test branch; no pull request is created. Phase 2 applies only to Boolean-context cases, uses a fresh synthetic Teams conversation, and does not push another branch. After all cases finish, one read-only Cursor review independently checks generated output plus context addition, retrieval, attachment, and reuse evidence. Cursor verdicts are included in full-pass scoring when the feature is enabled.",
+        f"Search Function App logs with `run_id={run.run_id}` for `[TerrabotTest]` and `[TerrabotCursorValidation]` traces.",
     ])
     return "\n".join(lines)
 
@@ -1564,9 +1903,22 @@ def _case_state_payload(item: TestCaseResult) -> dict[str, Any]:
         "phase2_reused_without_clarification": item.phase2_reused_without_clarification,
         "bot_calls": item.bot_calls,
         "duration_ms": item.duration_ms,
+        "backend_score": item.backend_score,
         "score": item.score,
+        "cursor_validation_requested": item.cursor_validation_requested,
+        "cursor_validation_completed": item.cursor_validation_completed,
+        "cursor_output_correct": item.cursor_output_correct,
+        "cursor_context_added": item.cursor_context_added,
+        "cursor_context_retrievable": item.cursor_context_retrievable,
+        "cursor_context_reused": item.cursor_context_reused,
+        "cursor_overall_ok": item.cursor_overall_ok,
+        "cursor_validation_reason": item.cursor_validation_reason,
+        "cursor_validation_error": item.cursor_validation_error,
+        "cursor_agent_url": item.cursor_agent_url,
+        "cursor_validation_duration_ms": item.cursor_validation_duration_ms,
+        "cursor_verdict_evidence": list(item.cursor_verdict_evidence),
         "failure_classification": item.failure_classification,
-        "error": item.error or item.validation_error,
+        "error": item.error or item.validation_error or item.cursor_validation_error,
     }
 
 
@@ -1747,26 +2099,6 @@ def execute_automated_test_job(core: Any, job: dict) -> str:
                     _diag("test_case_future_failed", level="error", run_id=run_id, test_case_id=case.case_id, error=exc)
                 completed_by_index[index] = case_result
                 terrabot_test_state.save_case_result(owner_hash, run_id, index, _case_state_payload(case_result))
-                try:
-                    key = terrabot_test_coverage.coverage_key(case_result.case)
-                    existing = terrabot_test_state.load_coverage(f"{case_result.case.owner}/{case_result.case.repo}").get(key) or {}
-                    test_count = int(existing.get("test_count") or 0) + 1
-                    failure_count = int(existing.get("failure_count") or 0) + (0 if case_result.score == 100 else 1)
-                    terrabot_test_state.save_coverage(
-                        f"{case_result.case.owner}/{case_result.case.repo}",
-                        key,
-                        {
-                            "test_count": test_count,
-                            "failure_count": failure_count,
-                            "last_score": case_result.score,
-                            "last_run_id": run_id,
-                            "last_commit_sha": case_result.case.commit_sha,
-                            "last_classification": case_result.failure_classification,
-                            "updated_at": terrabot_test_state.utc_now(),
-                        },
-                    )
-                except Exception as exc:
-                    _diag("coverage_state_save_failed", level="warning", run_id=run_id, test_case_id=case_result.case.case_id, error=exc)
                 run_state["completed_cases"] = len(completed_by_index)
                 run_state["discovery_errors"] = discovery_errors
                 terrabot_test_state.save_run(run_state)
@@ -1778,6 +2110,53 @@ def execute_automated_test_job(core: Any, job: dict) -> str:
                 )
 
         result.cases = [completed_by_index[index] for index in sorted(completed_by_index)]
+
+        # Deterministic backend checks have already completed and gated every
+        # branch push. Run one independent read-only Cursor review across the
+        # complete run, then include its verdicts in durable state and Teams.
+        cursor_validation = terrabot_cursor_result_validator.validate_test_run_with_cursor(
+            run_id=run_id,
+            cases=[_cursor_validation_case_payload(item) for item in result.cases],
+        )
+        _apply_cursor_validation_result(run_id, result.cases, cursor_validation)
+        for index, case_result in enumerate(result.cases, start=1):
+            terrabot_test_state.save_case_result(
+                owner_hash, run_id, index, _case_state_payload(case_result)
+            )
+            try:
+                key = terrabot_test_coverage.coverage_key(case_result.case)
+                repository_key = f"{case_result.case.owner}/{case_result.case.repo}"
+                existing = terrabot_test_state.load_coverage(repository_key).get(key) or {}
+                test_count = int(existing.get("test_count") or 0) + 1
+                failure_count = int(existing.get("failure_count") or 0) + (0 if case_result.score == 100 else 1)
+                terrabot_test_state.save_coverage(
+                    repository_key,
+                    key,
+                    {
+                        "test_count": test_count,
+                        "failure_count": failure_count,
+                        "last_score": case_result.score,
+                        "last_backend_score": case_result.backend_score,
+                        "last_cursor_overall_ok": (
+                            case_result.cursor_overall_ok
+                            if case_result.cursor_validation_requested
+                            else None
+                        ),
+                        "last_run_id": run_id,
+                        "last_commit_sha": case_result.case.commit_sha,
+                        "last_classification": case_result.failure_classification,
+                        "updated_at": terrabot_test_state.utc_now(),
+                    },
+                )
+            except Exception as exc:
+                _diag(
+                    "coverage_state_save_failed",
+                    level="warning",
+                    run_id=run_id,
+                    test_case_id=case_result.case.case_id,
+                    error=exc,
+                )
+
         result.duration_ms = int((time.monotonic() - started) * 1000)
         report = format_test_run_report(result)
         run_state.update({
@@ -1786,6 +2165,21 @@ def execute_automated_test_job(core: Any, job: dict) -> str:
             "completed_at": terrabot_test_state.utc_now(),
             "duration_ms": result.duration_ms,
             "discovery_errors": discovery_errors,
+            "cursor_validation": {
+                "enabled": bool(cursor_validation.get("enabled")),
+                "completed": bool(cursor_validation.get("completed")),
+                "agent_id": str(cursor_validation.get("agent_id") or ""),
+                "agent_url": str(cursor_validation.get("agent_url") or ""),
+                "duration_ms": int(cursor_validation.get("duration_ms") or 0),
+                "requested_cases": sum(1 for item in result.cases if item.cursor_validation_requested),
+                "completed_cases": sum(1 for item in result.cases if item.cursor_validation_completed),
+                "output_correct_cases": sum(1 for item in result.cases if item.cursor_output_correct),
+                "overall_accepted_cases": sum(1 for item in result.cases if item.cursor_overall_ok),
+                "context_added_cases": sum(1 for item in result.cases if item.cursor_context_added),
+                "context_retrievable_cases": sum(1 for item in result.cases if item.cursor_context_retrievable),
+                "context_reused_cases": sum(1 for item in result.cases if item.cursor_context_reused),
+                "error": str(cursor_validation.get("error") or ""),
+            },
             "report": report,
         })
         terrabot_test_state.save_run(run_state)

@@ -5,6 +5,25 @@ import hashlib
 from typing import Any
 
 
+def _cursor_failure(case: Any, result: Any) -> str:
+    if not getattr(result, "cursor_validation_requested", False):
+        return ""
+    if not getattr(result, "cursor_validation_completed", False):
+        return "CURSOR_VALIDATION_UNAVAILABLE"
+    if not getattr(result, "cursor_output_correct", False):
+        return "CURSOR_OUTPUT_VALIDATION_FAILURE"
+    if str(getattr(case, "case_type", "")) == "boolean_context":
+        if not getattr(result, "cursor_context_added", False):
+            return "CURSOR_CONTEXT_STORAGE_VALIDATION_FAILURE"
+        if not getattr(result, "cursor_context_retrievable", False):
+            return "CURSOR_CONTEXT_RETRIEVAL_VALIDATION_FAILURE"
+        if not getattr(result, "cursor_context_reused", False):
+            return "CURSOR_CONTEXT_REUSE_VALIDATION_FAILURE"
+    if not getattr(result, "cursor_overall_ok", False):
+        return "CURSOR_VALIDATION_FAILURE"
+    return ""
+
+
 def classify_result(case: Any, result: Any) -> str:
     if getattr(result, "error", ""):
         return "BACKEND_OR_HARNESS_FAILURE"
@@ -19,6 +38,9 @@ def classify_result(case: Any, result: Any) -> str:
     if not getattr(result, "branch_pushed", False):
         return "BRANCH_FAILURE"
     if str(getattr(case, "case_type", "")) == "resource_creation":
+        cursor_failure = _cursor_failure(case, result)
+        if cursor_failure:
+            return cursor_failure
         return "PASS" if getattr(result, "score", 0) == 100 else "CREATION_WORKFLOW_FAILURE"
     if not getattr(result, "context_stored", False):
         return "CONTEXT_STORAGE_FAILURE"
@@ -30,6 +52,9 @@ def classify_result(case: Any, result: Any) -> str:
         return "UNNECESSARY_CLARIFICATION"
     if not getattr(result, "phase2_target_ok", False):
         return "CONTEXT_REUSE_FAILURE"
+    cursor_failure = _cursor_failure(case, result)
+    if cursor_failure:
+        return cursor_failure
     return "PASS"
 
 
