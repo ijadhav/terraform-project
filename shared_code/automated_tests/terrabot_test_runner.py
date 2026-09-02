@@ -1391,6 +1391,30 @@ def _resolve_automated_clarifications(
             "requested_cloud": case.cloud,
             "required_repository_context_ids": list(phase_request.get("required_repository_context_ids") or []),
         }
+        if cursor_resolution and resolution_type in {"candidate", "repository_control"}:
+            followup["cursor_repository_resolution"] = {
+                "source": "cursor_read_only_repository_clarification",
+                "resolution_type": resolution_type,
+                "repository": f"{case.owner}/{case.repo}",
+                "commit_sha": case.commit_sha,
+                "path": str(cursor_resolution.get("selected_path") or "").strip().strip("/"),
+                "flag": str(cursor_resolution.get("selected_flag") or "").strip(),
+                "current_value": cursor_resolution.get("selected_current_value"),
+                "new_value": cursor_resolution.get("selected_new_value"),
+                "reason": str(cursor_resolution.get("reason") or "").strip(),
+                "evidence": list(cursor_resolution.get("evidence") or [])[:4],
+            }
+            _diag(
+                "cursor_clarification_handoff_prepared",
+                run_id=run_id,
+                test_case_id=case.case_id,
+                phase=phase,
+                path=followup["cursor_repository_resolution"]["path"],
+                flag=followup["cursor_repository_resolution"]["flag"],
+                current_value=followup["cursor_repository_resolution"]["current_value"],
+                new_value=followup["cursor_repository_resolution"]["new_value"],
+                process="cursor_repo_analysis->backend_live_verification->foundry_generation",
+            )
         if structured_picker:
             followup["pending_target_selection_reply"] = True
             followup["pending_target_selection_thread_id"] = str(current.get("thread_id") or "")
@@ -1779,6 +1803,8 @@ def _run_case(core: Any, case: TestCase, run_id: str, requester_id: str) -> Test
         calls=row.bot_calls,
         duration_ms=row.duration_ms,
         score=row.score,
+        failure_classification=row.failure_classification,
+        error=row.error[:800] if row.error else "",
     )
     return row
 
@@ -2158,6 +2184,11 @@ def format_test_run_report(run: TestRunResult) -> str:
         lines.extend(["", "**Failed assertions**"])
         for item in failures[:12]:
             reasons: list[str] = []
+            # Surface the root backend/harness exception first so the 360-char
+            # report truncation cannot hide the actual failure behind derived
+            # assertions such as target/file/context failures.
+            if item.error:
+                reasons.append("backend/harness error: " + item.error)
             if not item.expected_target_found:
                 reasons.append("expected target not detected")
             if not item.correct_flag_detected:
@@ -2203,9 +2234,7 @@ def format_test_run_report(run: TestRunResult) -> str:
                 reasons.append("Cursor: " + item.cursor_validation_reason)
             if item.cursor_validation_error:
                 reasons.append("Cursor error: " + item.cursor_validation_error)
-            if item.error:
-                reasons.append(item.error)
-            elif item.validation_error and not item.validation_ok:
+            if not item.error and item.validation_error and not item.validation_ok:
                 reasons.append(item.validation_error)
             branch_note = f" branch={item.branch_name}" if item.branch_name else ""
             lines.append(f"- `{item.case.case_id}`:{branch_note} {_escape_table('; '.join(reasons), 360)}")

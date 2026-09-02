@@ -821,8 +821,11 @@ def resolve_repository_clarification(
         "If exactly one supplied candidate is genuinely correct, set resolution_type=candidate, candidates_relevant=true, and selected_index to its 1-based position.",
         "If the supplied candidates are all unrelated but exactly one live repository control implements the request, set resolution_type=repository_control, candidates_relevant=false, selected_index=null, and return that exact selected_path and selected_flag.",
         "If no unique repository-grounded control can be determined, set resolution_type=unresolved and selected_index=null.",
-        f"Return JSON only with schema_version={_CLARIFICATION_SCHEMA_VERSION} and keys: schema_version, answer, resolution_type, candidates_relevant, selected_index, selected_path, selected_flag, reason.",
-        "The answer must be concise and directly usable as the clarification reply. Never invent a path or flag.",
+        f"Return JSON only with schema_version={_CLARIFICATION_SCHEMA_VERSION} and keys: schema_version, answer, resolution_type, candidates_relevant, selected_index, selected_path, selected_flag, selected_current_value, selected_new_value, reason, evidence.",
+        "For candidate or repository_control resolutions, selected_current_value and selected_new_value must be JSON booleans, must differ, and must describe the exact live assignment before/after the requested change.",
+        "For unresolved, set selected_current_value=null, selected_new_value=null, selected_path=\"\", selected_flag=\"\", and evidence=[].",
+        "evidence must contain at most 4 short repository-grounded strings identifying the live file/assignment or wiring that proves the choice.",
+        "The answer must be concise and directly usable as the clarification reply. Never invent a path, flag, current value, or target value.",
     ])
     repos = [{"url": f"https://github.com/{owner}/{repo}", "startingRef": commit_sha}]
     remote_before = cursor_readonly_guard.snapshot_remote_branches(repos)
@@ -892,6 +895,8 @@ def resolve_repository_clarification(
             raise CursorPromptError("Cursor clarification candidates_relevant must be Boolean.")
         selected_path = str(parsed.get("selected_path") or "").strip().strip("/")
         selected_flag = str(parsed.get("selected_flag") or "").strip()
+        selected_current_value = parsed.get("selected_current_value")
+        selected_new_value = parsed.get("selected_new_value")
         selected_index = parsed.get("selected_index")
         use_structured_picker = False
         if resolution_type == "candidate":
@@ -912,6 +917,26 @@ def resolve_repository_clarification(
                 raise CursorPromptError("Cursor clarification selected_flag disagrees with the selected Terrabot candidate.")
             selected_path = selected_path or chosen_path
             selected_flag = selected_flag or chosen_flag
+            chosen_current = chosen.get("current_value")
+            chosen_new = chosen.get("new_value")
+            if isinstance(chosen_current, bool):
+                if selected_current_value is not None and selected_current_value is not chosen_current:
+                    raise CursorPromptError("Cursor clarification selected_current_value disagrees with the selected Terrabot candidate.")
+                selected_current_value = chosen_current
+            elif isinstance(chosen_current, str) and chosen_current.strip().lower() in {"true", "false"}:
+                candidate_current = chosen_current.strip().lower() == "true"
+                if selected_current_value is not None and selected_current_value is not candidate_current:
+                    raise CursorPromptError("Cursor clarification selected_current_value disagrees with the selected Terrabot candidate.")
+                selected_current_value = candidate_current
+            if isinstance(chosen_new, bool):
+                if selected_new_value is not None and selected_new_value is not chosen_new:
+                    raise CursorPromptError("Cursor clarification selected_new_value disagrees with the selected Terrabot candidate.")
+                selected_new_value = chosen_new
+            elif isinstance(chosen_new, str) and chosen_new.strip().lower() in {"true", "false"}:
+                candidate_new = chosen_new.strip().lower() == "true"
+                if selected_new_value is not None and selected_new_value is not candidate_new:
+                    raise CursorPromptError("Cursor clarification selected_new_value disagrees with the selected Terrabot candidate.")
+                selected_new_value = candidate_new
             answer = str(chosen.get("index") or idx)
             selected_index = idx
             use_structured_picker = True
@@ -927,8 +952,17 @@ def resolve_repository_clarification(
             selected_index = None
             selected_path = ""
             selected_flag = ""
+            selected_current_value = None
+            selected_new_value = None
             answer = ""
 
+        if resolution_type != "unresolved":
+            if not isinstance(selected_current_value, bool) or not isinstance(selected_new_value, bool):
+                raise CursorPromptError(
+                    "Cursor clarification must return Boolean selected_current_value and selected_new_value for a resolved repository control."
+                )
+            if selected_current_value == selected_new_value:
+                raise CursorPromptError("Cursor clarification selected_current_value and selected_new_value must differ.")
         if resolution_type != "unresolved" and not answer:
             raise CursorPromptError("Cursor clarification did not return a usable answer.")
         result = {
@@ -939,7 +973,14 @@ def resolve_repository_clarification(
             "selected_index": selected_index,
             "selected_path": selected_path,
             "selected_flag": selected_flag,
+            "selected_current_value": selected_current_value,
+            "selected_new_value": selected_new_value,
             "reason": re.sub(r"\s+", " ", str(parsed.get("reason") or "")).strip()[:1200],
+            "evidence": [
+                re.sub(r"\s+", " ", str(item or "")).strip()[:500]
+                for item in (parsed.get("evidence") or [])[:4]
+                if str(item or "").strip()
+            ],
             "agent_id": agent_id,
             "run_id": cursor_run_id,
         }
@@ -950,6 +991,8 @@ def resolve_repository_clarification(
             test_case_id=case_id,
             selected_path=selected_path,
             selected_flag=selected_flag,
+            selected_current_value=selected_current_value,
+            selected_new_value=selected_new_value,
             selected_index=selected_index,
             resolution_type=resolution_type,
             candidates_relevant=candidates_relevant,

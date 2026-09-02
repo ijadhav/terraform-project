@@ -1449,6 +1449,34 @@ def _teams_shared_context_for_repository_decision(prompt: str) -> tuple[str, lis
             if isinstance(item, dict) and str(item.get("id") or "").strip()
         ],
     }
+    if active.get("test_mode"):
+        previous = active.get("repository_context_test_diagnostics")
+        diagnostics = dict(previous) if isinstance(previous, dict) else {}
+        existing_ids = {
+            str(value).strip() for value in (diagnostics.get("context_ids") or []) if str(value).strip()
+        }
+        existing_ids.update(metadata["context_ids"])
+        stages = [str(value) for value in (diagnostics.get("attachment_stages") or []) if str(value)]
+        if block and "semantic_target_resolution" not in stages:
+            stages.append("semantic_target_resolution")
+        diagnostics.update({
+            "case_id": str(active.get("automated_test_case_id") or diagnostics.get("case_id") or ""),
+            "repository": f"{owner}/{repo}",
+            "searched": True,
+            "attached": bool(diagnostics.get("attached") or block),
+            "semantic_target_resolution_attached": bool(block),
+            "result_count": max(int(diagnostics.get("result_count") or 0), metadata["result_count"]),
+            "context_ids": sorted(existing_ids),
+            "attachment_stages": stages,
+        })
+        active["repository_context_test_diagnostics"] = diagnostics
+        LOGGER.info(
+            "[TerrabotFlow] step=context_attachment actor=backend->foundry stage=semantic_target_resolution "
+            "case_id=%s attached=%s context_ids=%s",
+            active.get("automated_test_case_id") or "",
+            bool(block),
+            ",".join(metadata["context_ids"])[:800],
+        )
     return block, live_files, metadata
 
 
@@ -2315,8 +2343,8 @@ def _foundry_adjudicate_repository_boolean_candidates(
     exact repository-validated candidates and nearby live code, then validates
     that Foundry's adjudicated selections are a subset of those candidates.
     """
-    if not candidates:
-        return []
+    if len(candidates or []) <= 1:
+        return list(candidates or [])
 
     candidate_payload = []
     for candidate in candidates or []:
@@ -2356,7 +2384,6 @@ def _foundry_adjudicate_repository_boolean_candidates(
             "Return JSON only with keys reason and selected.",
             "Select only from validated_candidates; never invent or rename a flag/path/line.",
             "Judge semantic relevance from the user request plus scope, nearby_live_code, and repository naming/context.",
-            "Trace each candidate through nearby module/resource arguments and comments before deciding. Explain the repository relationship in description rather than relying on token overlap.",
             "Do not select a Boolean merely because it is in the same file or because of weak generic lexical overlap with the request.",
             "If exactly one control clearly implements the requested behavior, return exactly one selected item.",
             "Return multiple selected items only when they are genuinely distinct plausible implementations of the same requested behavior and a user choice is truly required.",
@@ -2366,16 +2393,11 @@ def _foundry_adjudicate_repository_boolean_candidates(
         ],
     }
 
-    adjudication_error = ""
     try:
         raw = call_named_agent(json.dumps(request, ensure_ascii=False), AGENT_NAME)
         parsed = extract_json_from_text(raw)
     except Exception as exc:
-        adjudication_error = str(exc)
-        LOGGER.warning(
-            "[TerrabotDiag] event=boolean_candidate_adjudication_failed error=%s",
-            exc,
-        )
+        LOGGER.warning("Boolean candidate adjudication failed; using bounded validated fallback: %s", exc)
         parsed = {}
 
     original_index = {
@@ -2422,24 +2444,25 @@ def _foundry_adjudicate_repository_boolean_candidates(
             item for item in adjudicated
             if float(item.get("confidence") or 0.0) >= max(0.60, top - 0.18)
         ]
-        LOGGER.info(
-            "[TerrabotDiag] event=boolean_candidate_adjudication_complete input_candidates=%s selected_candidates=%s flags=%s",
-            len(candidates or []),
-            len(adjudicated),
-            ",".join(str(item.get("flag") or "") for item in adjudicated)[:1000],
-        )
         return adjudicated[:5]
 
-    # A live Boolean assignment is only a structural candidate. If Foundry
-    # cannot strongly relate it to the requested behavior, do not surface it
-    # to the user merely because it exists in the repository. Returning no
-    # candidates keeps the existing grounded clarification/generation flow.
-    LOGGER.info(
-        "[TerrabotDiag] event=boolean_candidate_adjudication_rejected_all input_candidates=%s agent_error=%s",
-        len(candidates or []),
-        adjudication_error[:800],
+    # If adjudication is unavailable, never expose an unbounded inventory.
+    # Preserve the strongest repository-validated candidates only; ambiguity is
+    # safer than auto-selecting a weak control.
+    fallback = sorted(
+        [dict(item) for item in candidates or [] if isinstance(item, dict)],
+        key=lambda item: float(item.get("confidence") or 0.0),
+        reverse=True,
     )
-    return []
+    if not fallback:
+        return []
+    top = float(fallback[0].get("confidence") or 0.0)
+    if top > 0:
+        fallback = [
+            item for item in fallback
+            if float(item.get("confidence") or 0.0) >= max(0.50, top - 0.15)
+        ]
+    return fallback[:5]
 
 
 def _repository_context_unique_boolean_match(
@@ -2542,10 +2565,9 @@ def _foundry_repository_boolean_inventory_retry(
     )
     request = {
         "task": (
-            "SECOND-PASS ENVIRONMENT BOOLEAN RESOLUTION. Before any clarification, analytically determine which live "
-            "Terraform control implements the user's requested behavior in the already-resolved target environment. "
-            "Reason from the complete environment file, the Boolean name, nearby module/resource wiring, comments, "
-            "sibling arguments and durable repository context. Resolve colloquial wording semantically; do not generate Terraform."
+            "SECOND-PASS ENVIRONMENT BOOLEAN RESOLUTION. Before any clarification, determine whether the current "
+            "create/delete/enable/disable infrastructure request is controlled by one existing Boolean in the target "
+            "environment. Resolve colloquial wording semantically; do not generate Terraform."
         ),
         "user_request": str(prompt or "").strip(),
         "operation_hint": str(operation_hint or "unknown"),
@@ -2573,33 +2595,95 @@ def _foundry_repository_boolean_inventory_retry(
             "Inspect environment controls first for create/delete/enable/disable requests before considering ordinary code edits.",
             "Choose only from literal_boolean_inventory and only when the live environment files prove the control exists.",
             "Use semantic synonyms and surrounding Terraform/module context; exact token overlap with the flag is not required.",
-            "Perform repository reasoning in this order: identify the requested behavior/resource concept; locate candidate Booleans in the target environment; trace each candidate into the adjacent module/resource invocation; reject candidates whose wiring implements a different behavior; then rank the remaining controls.",
-            "Treat common user nouns as semantic concepts rather than literal tokens. For example, a request may omit implementation suffixes such as fix/task/setup/integration or use a human description instead of the exact Terraform identifier.",
-            "If one control is materially stronger than all others after repository tracing, return exactly one candidate and do not ask for clarification.",
-            "Return multiple candidates only for genuine repository ambiguity after tracing the controls into live Terraform wiring.",
+            "If one control clearly implements the request, return exactly one candidate and do not ask for clarification.",
+            "Return multiple candidates only for genuine repository ambiguity.",
             "Use shared repository context only after revalidating its mapped flag/path against current live files.",
         ],
     }
     try:
-        LOGGER.info(
-            "[TerrabotFlow] step=target_reasoning actor=foundry action=resolve_boolean candidates=%s evidence_files=%s",
-            len(inventory),
-            len(request.get("target_environment_files") or []),
-        )
         raw = call_named_agent(json.dumps(request, ensure_ascii=False), AGENT_NAME)
         parsed = extract_json_from_text(raw)
-        if isinstance(parsed, dict):
-            LOGGER.info(
-                "[TerrabotFlow] step=target_reasoning actor=foundry result=%s candidates=%s operation=%s",
-                "resolved" if parsed.get("boolean_applicable") else "not_resolved",
-                len(parsed.get("candidates") or []),
-                parsed.get("operation") or "unknown",
-            )
-            return parsed
-        return {}
+        return parsed if isinstance(parsed, dict) else {}
     except Exception as exc:
-        LOGGER.warning("[TerrabotFlow] step=target_reasoning actor=foundry result=error error=%s", str(exc)[:500])
+        LOGGER.warning("Second-pass environment Boolean resolution failed: %s", exc)
         return {"operation": operation_hint or "unknown", "boolean_applicable": False, "candidates": [], "error": str(exc)}
+
+
+def _verified_cursor_repository_boolean_resolution(
+    inventory: list[dict],
+) -> dict:
+    """Live-verify a read-only Cursor clarification result before generation.
+
+    This path is intentionally test-only. Cursor is never trusted as a write
+    authority: the exact repository/path/flag/current value must exist in the
+    literal inventory derived from the live environment evidence, and the
+    requested new value must be a different Boolean. If any check fails, the
+    normal Foundry/repository resolver continues unchanged.
+    """
+    active = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
+    if not active.get("test_mode"):
+        return {}
+    resolution = active.get("cursor_repository_resolution")
+    if not isinstance(resolution, dict) or not resolution:
+        return {}
+    if str(resolution.get("source") or "").strip() != "cursor_read_only_repository_clarification":
+        return {}
+
+    path = str(resolution.get("path") or "").strip().strip("/")
+    flag = str(resolution.get("flag") or "").strip()
+    current_value = resolution.get("current_value")
+    new_value = resolution.get("new_value")
+    if not path or not flag or not isinstance(current_value, bool) or not isinstance(new_value, bool):
+        LOGGER.warning(
+            "[TerrabotFlow] step=cursor_clarification_handoff actor=backend result=rejected reason=incomplete_resolution path=%s flag=%s",
+            path, flag,
+        )
+        return {}
+    if current_value == new_value:
+        LOGGER.warning(
+            "[TerrabotFlow] step=cursor_clarification_handoff actor=backend result=rejected reason=no_boolean_delta path=%s flag=%s",
+            path, flag,
+        )
+        return {}
+
+    matches = [
+        item for item in (inventory or [])
+        if isinstance(item, dict)
+        and str(item.get("path") or "").strip().strip("/") == path
+        and str(item.get("flag") or "").strip() == flag
+    ]
+    if len(matches) != 1:
+        LOGGER.warning(
+            "[TerrabotFlow] step=cursor_clarification_handoff actor=backend result=rejected reason=live_assignment_count path=%s flag=%s matches=%s",
+            path, flag, len(matches),
+        )
+        return {}
+    live = dict(matches[0])
+    live_current = str(live.get("current_value") or "").strip().lower()
+    expected_current = "true" if current_value else "false"
+    if live_current != expected_current:
+        LOGGER.warning(
+            "[TerrabotFlow] step=cursor_clarification_handoff actor=backend result=rejected reason=current_value_mismatch path=%s flag=%s cursor=%s live=%s",
+            path, flag, expected_current, live_current,
+        )
+        return {}
+
+    candidate = {
+        **live,
+        "new_value": "true" if new_value else "false",
+        "confidence": 1.0,
+        "context": str(resolution.get("reason") or "").strip(),
+        "description": str(resolution.get("reason") or "").strip(),
+        "classification_reason": "Cursor independently resolved the clarification and backend revalidated the exact live Boolean assignment.",
+        "operation": "cursor_resolved_clarification",
+        "resolution_source": "verified_cursor_repository_clarification",
+        "cursor_evidence": list(resolution.get("evidence") or [])[:4],
+    }
+    LOGGER.info(
+        "[TerrabotFlow] step=cursor_clarification_handoff actor=backend result=verified path=%s flag=%s old=%s new=%s",
+        path, flag, live_current, candidate["new_value"],
+    )
+    return candidate
 
 
 def _validated_repository_boolean_strategy(
@@ -2611,9 +2695,27 @@ def _validated_repository_boolean_strategy(
     A unique repository-proven Boolean is auto-selected. Clarification is
     reserved for two or more semantically valid live controls.
     """
+    # A Cursor clarification handoff is accepted only after exact literal live
+    # verification. Once verified, it becomes the selected backend target sent
+    # to Foundry generation; do not ask Foundry/user to disambiguate it again.
+    inventory = _repository_literal_boolean_inventory(repository_evidence)
+    cursor_match = _verified_cursor_repository_boolean_resolution(inventory)
+    if cursor_match:
+        strategy = {
+            "operation": "modify",
+            "boolean_applicable": True,
+            "reason": str(cursor_match.get("classification_reason") or ""),
+            "requires_user_choice": False,
+            "resolution_source": "verified_cursor_repository_clarification",
+            "validated_candidate_count": 1,
+            "adjudicated_candidate_count": 1,
+            "inventory": inventory,
+        }
+        return strategy, [cursor_match]
+
     strategy = _foundry_repository_change_strategy(prompt, repository_evidence)
     strategy = dict(strategy or {})
-    inventory = strategy.get("inventory") or _repository_literal_boolean_inventory(repository_evidence)
+    inventory = strategy.get("inventory") or inventory
     operation = str(strategy.get("operation") or "unknown").strip().lower()
 
     literal_index = {
@@ -2700,25 +2802,7 @@ def _validated_repository_boolean_strategy(
         strategy["validated_candidate_count"] = 0
         strategy["adjudicated_candidate_count"] = 0
         strategy["requires_user_choice"] = False
-        LOGGER.info("[TerrabotFlow] step=target_resolution actor=backend result=no_repository_control")
         return strategy, []
-
-    # The strategy/retry call above already performed semantic reasoning and the
-    # backend has literally revalidated path+line+flag against the live file. A
-    # second model adjudication of a single candidate can only discard a correct
-    # unique target (especially on small/fast models), so reserve adjudication
-    # for genuine multi-candidate ambiguity.
-    if len(validated) == 1:
-        strategy["validated_candidate_count"] = 1
-        strategy["adjudicated_candidate_count"] = 1
-        strategy["requires_user_choice"] = False
-        strategy["resolution_source"] = strategy.get("resolution_source") or "unique_live_environment_boolean"
-        LOGGER.info(
-            "[TerrabotFlow] step=target_resolution actor=backend result=unique_live_boolean path=%s flag=%s",
-            validated[0].get("path") or "",
-            validated[0].get("flag") or "",
-        )
-        return strategy, validated
 
     adjudicated = _foundry_adjudicate_repository_boolean_candidates(
         prompt, repository_evidence, validated

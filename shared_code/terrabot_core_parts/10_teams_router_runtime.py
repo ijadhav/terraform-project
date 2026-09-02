@@ -2571,18 +2571,35 @@ def _teams_attach_repository_context(agent_input: str, active: dict) -> str:
         "conflicted_count": int(search_result.get("conflicted_count") or 0),
     }
     if active.get("test_mode"):
-        active["repository_context_test_diagnostics"] = {
-            "case_id": str(active.get("automated_test_case_id") or ""),
+        previous = active.get("repository_context_test_diagnostics")
+        diagnostics = dict(previous) if isinstance(previous, dict) else {}
+        context_ids = [
+            str(item.get("id") or "")
+            for item in (search_result.get("results") or [])
+            if isinstance(item, dict) and str(item.get("id") or "").strip()
+        ]
+        merged_ids = {
+            str(value).strip() for value in (diagnostics.get("context_ids") or []) if str(value).strip()
+        }
+        merged_ids.update(context_ids)
+        stages = [str(value) for value in (diagnostics.get("attachment_stages") or []) if str(value)]
+        if context_block and "generation" not in stages:
+            stages.append("generation")
+        diagnostics.update({
+            "case_id": str(active.get("automated_test_case_id") or diagnostics.get("case_id") or ""),
             "repository": f"{owner}/{repo}",
             "searched": True,
-            "attached": bool(context_block),
-            "result_count": len(search_result.get("results") or []),
-            "context_ids": [
-                str(item.get("id") or "")
-                for item in (search_result.get("results") or [])
-                if isinstance(item, dict) and str(item.get("id") or "").strip()
-            ],
-        }
+            "attached": bool(diagnostics.get("attached") or context_block),
+            "generation_attached": bool(context_block),
+            "result_count": max(int(diagnostics.get("result_count") or 0), len(search_result.get("results") or [])),
+            "context_ids": sorted(merged_ids),
+            "attachment_stages": stages,
+        })
+        active["repository_context_test_diagnostics"] = diagnostics
+        LOGGER.info(
+            "[TerrabotFlow] step=context_attachment actor=backend->foundry stage=generation case_id=%s attached=%s context_ids=%s",
+            active.get("automated_test_case_id") or "", bool(context_block), ",".join(context_ids)[:800],
+        )
     selected_ids = [
         str(item.get("id") or "").strip()
         for item in (search_result.get("results") or [])

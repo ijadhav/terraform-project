@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 from shared_code.automated_tests import terrabot_test_runner as runner
 
@@ -82,6 +83,70 @@ class TerrabotTestRunnerRequestTests(unittest.TestCase):
         # validated preview so Phase 1 can push the isolated test branch.
         self.assertFalse(Core.captured["test_mode"])
         self.assertEqual(Core.captured["automated_test_phase"], 1)
+
+
+    def test_cursor_repository_clarification_is_handed_to_backend_structurally(self):
+        case = self._case()
+        row = runner.TestCaseResult(case=case)
+
+        class Core:
+            captured = None
+
+            @staticmethod
+            def handle_teams_chat_request(request):
+                Core.captured = dict(request)
+                return {"ok": True, "mode": "infra_preview", "files": []}, 200
+
+        cursor_resolution = {
+            "answer": f"Use {case.flag} in {case.path}.",
+            "resolution_type": "repository_control",
+            "candidates_relevant": False,
+            "use_structured_picker": False,
+            "selected_index": None,
+            "selected_path": case.path,
+            "selected_flag": case.flag,
+            "selected_current_value": True,
+            "selected_new_value": False,
+            "reason": "Verified from the pinned live environment file.",
+            "evidence": [f"{case.flag} = true"],
+        }
+        phase_request = runner._phase_request(case, case.phase1_prompt, "conversation-1", phase=1)
+        initial = {
+            "ok": True,
+            "mode": "clarification",
+            "reply": "Which repository control should I modify?",
+            "thread_id": "thread-1",
+            "candidates": [],
+        }
+        with patch.object(
+            runner.cursor_prompt_provider,
+            "resolve_repository_clarification",
+            return_value=cursor_resolution,
+        ), patch.object(runner, "_ensure_context_mapping", return_value=True):
+            final, status, clarified = runner._resolve_automated_clarifications(
+                Core,
+                case,
+                row,
+                initial,
+                200,
+                phase=1,
+                conversation_id="conversation-1",
+                phase_request=phase_request,
+                run_id="ctx-test",
+                max_rounds=1,
+            )
+
+        self.assertTrue(clarified)
+        self.assertEqual(status, 200)
+        self.assertEqual(final["mode"], "infra_preview")
+        self.assertIsNotNone(Core.captured)
+        handoff = Core.captured["cursor_repository_resolution"]
+        self.assertEqual(handoff["source"], "cursor_read_only_repository_clarification")
+        self.assertEqual(handoff["path"], case.path)
+        self.assertEqual(handoff["flag"], case.flag)
+        self.assertIs(handoff["current_value"], True)
+        self.assertIs(handoff["new_value"], False)
+        self.assertFalse(Core.captured.get("pending_target_selection_reply", False))
 
 
 if __name__ == "__main__":

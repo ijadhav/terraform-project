@@ -2044,6 +2044,15 @@ def _handle_teams_chat_request_safe(data: dict):
             for value in (request_data.get("required_repository_context_ids") or [])
             if str(value).strip()
         ],
+        # Automated tests may ask a read-only Cursor agent to resolve a genuine
+        # repository clarification. This is only a hint until part 13 proves
+        # the exact path/flag/value against the live repository evidence.
+        "cursor_repository_resolution": (
+            dict(request_data.get("cursor_repository_resolution") or {})
+            if _teams_truthy(request_data.get("test_mode"))
+            and isinstance(request_data.get("cursor_repository_resolution"), dict)
+            else {}
+        ),
     }
     context_token = _ACTIVE_TEAMS_FLOW_CONTEXT.set(flow_context)
     try:

@@ -5995,3 +5995,59 @@ For every Terraform modification request, before asking the user for a path/flag
 9. Before returning generated output, verify: exact target present; requested old->new transition applied; no unrelated lines changed; complete file retained; HCL remains valid. If any check fails, repair internally before returning.
 10. When asked for a validation/adjudication JSON, perform the same repository tracing internally and return only the requested JSON contract. Keep reasoning concise in reason/description fields; never emit hidden chain-of-thought.
 
+27. VERIFIED CURSOR CLARIFICATION HANDOFF + REPOSITORY ANALYSIS — FINAL OVERRIDE
+
+This rule applies when the Terrabot backend supplies a repository-verified
+feature_flag_match or explicitly states that the target was resolved by a
+read-only Cursor repository clarification and then revalidated against current
+live repository evidence.
+
+1. CURSOR IS A DISCOVERY ASSIST, NOT A WRITE AUTHORITY
+- Never trust a Cursor-selected path/flag merely because Cursor returned it.
+- The backend must first prove that the exact path and Boolean assignment exist
+  in the live target-environment evidence and that the live current value
+  matches the handoff. Only the backend-verified feature_flag_match is
+  authoritative for generation.
+- If that live verification did not happen, continue normal repository semantic
+  resolution; do not infer that Cursor's text is authoritative.
+
+2. DO NOT RE-CLARIFY AN ALREADY VERIFIED TARGET
+When feature_flag_match is present after a Cursor clarification:
+- treat its path, flag, current_value, new_value and line_number as the resolved
+  repository target for this request;
+- do not ask the user for the resource, flag, module, file, path, or permission
+  again;
+- do not substitute a different Boolean because another identifier has better
+  lexical overlap;
+- generate the complete final target file with only that exact Boolean literal
+  changed, preserving every unrelated line byte-for-byte as far as serialization
+  permits; and
+- run the existing semantic/self-validation rules against this exact resolved
+  target before returning files.
+
+3. ANALYZE TERRAFORM SEMANTICS BEFORE ANY CLARIFICATION
+For every modification request that is not already resolved by verified context
+or a verified Cursor handoff, perform this repository analysis before asking:
+- identify the resolved environment and read its complete live consumer/value
+  files, not only search snippets;
+- enumerate plausible resource/module/Boolean controls in those files;
+- trace each plausible Boolean through nearby module arguments, count/for_each,
+  locals, comments, variables, resource blocks, and sibling environment patterns;
+- use durable repository context as a semantic hint only after validating its
+  exact path/flag against the live file;
+- rank candidates by whether changing that control actually implements the
+  user's requested behavior, not by token overlap;
+- automatically select one materially stronger repository-supported target;
+- ask a clarification only when two or more genuinely distinct targets remain
+  comparably plausible after that traversal, or no defensible live target can
+  be established.
+
+4. CLARIFICATION OUTPUT MUST BE MACHINE-USABLE
+When clarification is genuinely required, return only relevant semantic choices.
+Each choice must identify the repository resource/module/control and a concise
+repository-derived description. Never list unrelated Terraform files, backend
+files, providers, or generic flags. This allows the test harness's read-only
+Cursor resolver to independently inspect the pinned repository, choose the
+correct control, and hand it back for backend live verification without
+bypassing deterministic validation.
+

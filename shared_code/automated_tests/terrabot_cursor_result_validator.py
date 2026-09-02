@@ -262,7 +262,7 @@ When evidence disagrees, state exactly which boundary failed: target resolution,
 
 The backend evidence below was collected from the live GitHub repositories, the actual generated responses, the isolated test branches, and the live repository-context index. Independently inspect the repository and branch where available, then validate the evidence correlation.
 
-Return JSON only, with no markdown and exactly this contract:
+PROTOCOL IS PART OF THE TEST: schema_version must be the exact literal shown below; never substitute another version. Return raw JSON only, with no markdown/code fences/prefix/suffix and exactly this contract:
 {{"schema_version":"{_SCHEMA_VERSION}","run_id":"{run_id}","cases":[{{"case_id":"...","output_correct":true,"context_added":true,"context_retrievable":true,"context_reused":true,"overall_ok":true,"reason":"short explanation","evidence":["short evidence"]}}]}}
 
 For resource-creation cases, context_added, context_retrievable, and context_reused must be null.
@@ -270,6 +270,165 @@ For resource-creation cases, context_added, context_retrievable, and context_reu
 RUN EVIDENCE:
 {evidence_json}
 """
+
+
+def _build_protocol_repair_prompt(
+    *,
+    run_id: str,
+    expected_case_ids: Sequence[str],
+    case_types: Mapping[str, str],
+    invalid_result: str,
+    validation_error: str,
+) -> str:
+    """Ask Cursor to reformat an already-produced verdict into the exact contract.
+
+    This is not a second semantic review. The repair agent must preserve the
+    first verdict's assertions and may only make the response machine-valid.
+    """
+    expected = [
+        {"case_id": case_id, "case_type": str(case_types.get(case_id) or "boolean_context")}
+        for case_id in expected_case_ids
+    ]
+    bounded_result = str(invalid_result or "")[:16000]
+    return f"""You are repairing ONLY the response protocol of a completed read-only Terrabot Cursor validation.
+
+Do not edit files, create branches, commit, push, or open a pull request.
+Do not change the semantic verdicts from the prior result. Do not turn a failed assertion into a pass or invent evidence.
+The prior result failed machine validation with: {validation_error}
+
+CRITICAL OUTPUT CONTRACT:
+- Return raw JSON only. No markdown, commentary, code fences, prefixes, or suffixes.
+- schema_version MUST be the exact literal \"{_SCHEMA_VERSION}\".
+- run_id MUST be the exact literal \"{run_id}\".
+- Return exactly one case object for every expected case below, using the exact case_id.
+- Boolean-context cases require Boolean output_correct, context_added, context_retrievable, context_reused, overall_ok.
+- Resource-creation cases require Boolean output_correct/overall_ok and null context_added/context_retrievable/context_reused.
+- overall_ok may never be true when an applicable assertion is false.
+
+Expected cases:
+{json.dumps(expected, ensure_ascii=False)}
+
+Required shape:
+{{"schema_version":"{_SCHEMA_VERSION}","run_id":"{run_id}","cases":[{{"case_id":"...","output_correct":false,"context_added":false,"context_retrievable":false,"context_reused":false,"overall_ok":false,"reason":"short explanation","evidence":["short evidence"]}}]}}
+
+Prior Cursor result to reformat without changing its meaning:
+{bounded_result}
+"""
+
+
+def _run_cursor_protocol_repair(
+    *,
+    http_client: Any,
+    api_base: str,
+    headers: Mapping[str, str],
+    repos: Sequence[Mapping[str, str]],
+    run_id: str,
+    expected_case_ids: Sequence[str],
+    case_types: Mapping[str, str],
+    invalid_result: str,
+    validation_error: str,
+    request_timeout: int,
+    total_timeout: int,
+    poll_seconds: float,
+    model: str,
+) -> tuple[dict[str, dict[str, Any]], str, str]:
+    prompt = _build_protocol_repair_prompt(
+        run_id=run_id,
+        expected_case_ids=expected_case_ids,
+        case_types=case_types,
+        invalid_result=invalid_result,
+        validation_error=validation_error,
+    )
+    payload: dict[str, Any] = {
+        "prompt": {"text": prompt},
+        "repos": list(repos),
+        "mode": "plan",
+        "workOnCurrentBranch": False,
+        "autoCreatePR": False,
+        "skipReviewerRequest": True,
+    }
+    if model:
+        payload["model"] = {"id": model}
+
+    remote_before = cursor_readonly_guard.snapshot_remote_branches(repos)
+    _diag(
+        "cursor_validation_protocol_repair_started",
+        run_id=run_id,
+        validation_error=validation_error,
+        prompt_chars=len(prompt),
+    )
+    response = http_client.post(
+        f"{api_base}/v1/agents",
+        headers=dict(headers),
+        json=payload,
+        timeout=request_timeout,
+    )
+    response.raise_for_status()
+    created = response.json() or {}
+    agent = created.get("agent") or {}
+    run = created.get("run") or {}
+    agent_id = str(agent.get("id") or "").strip()
+    cursor_run_id = str(run.get("id") or agent.get("latestRunId") or "").strip()
+    if not agent_id or not cursor_run_id:
+        raise ValueError("Cursor protocol-repair create-agent response did not include agent.id and run.id.")
+
+    deadline = time.monotonic() + total_timeout
+    terminal: dict[str, Any] = {}
+    previous_status = ""
+    while time.monotonic() < deadline:
+        response = http_client.get(
+            f"{api_base}/v1/agents/{agent_id}/runs/{cursor_run_id}",
+            headers=dict(headers),
+            timeout=request_timeout,
+        )
+        response.raise_for_status()
+        terminal = response.json() or {}
+        status = str(terminal.get("status") or "").strip().upper()
+        if status != previous_status:
+            _diag(
+                "cursor_validation_protocol_repair_status",
+                run_id=run_id,
+                agent_id=agent_id,
+                cursor_run_id=cursor_run_id,
+                status=status,
+            )
+            previous_status = status
+        if status in _TERMINAL_STATUSES:
+            break
+        time.sleep(poll_seconds)
+    else:
+        raise TimeoutError(f"Cursor validation protocol repair exceeded {total_timeout} seconds.")
+
+    status = str(terminal.get("status") or "").strip().upper()
+    if status != "FINISHED":
+        detail = str(terminal.get("result") or terminal.get("error") or "").strip()
+        raise RuntimeError(f"Cursor validation protocol repair ended with status {status or '<empty>'}: {detail[:800]}")
+
+    remote_after = cursor_readonly_guard.snapshot_remote_branches(repos)
+    mutations = cursor_readonly_guard.cursor_reported_remote_mutations(terminal, remote_before, remote_after)
+    if mutations:
+        raise RuntimeError(
+            "Cursor validation protocol repair changed a verified remote GitHub branch; verdict rejected: "
+            + json.dumps(mutations, ensure_ascii=False)[:1200]
+        )
+
+    result_text = str(terminal.get("result") or "")
+    parsed = _extract_json(result_text)
+    case_results = _normalise_case_results(
+        parsed,
+        run_id=run_id,
+        expected_case_ids=expected_case_ids,
+        case_types=case_types,
+    )
+    _diag(
+        "cursor_validation_protocol_repair_completed",
+        run_id=run_id,
+        agent_id=agent_id,
+        cursor_run_id=cursor_run_id,
+        received_schema=str(parsed.get("schema_version") or ""),
+        cases=len(case_results),
+    )
+    return case_results, agent_id, cursor_run_id
 
 
 def validate_test_run_with_cursor(
@@ -355,6 +514,7 @@ def validate_test_run_with_cursor(
             "mode": "plan",
             "workOnCurrentBranch": False,
             "autoCreatePR": False,
+            "skipReviewerRequest": True,
         }
         model = str(os.getenv("TERRABOT_TEST_CURSOR_VALIDATION_MODEL") or "").strip()
         if model:
@@ -458,12 +618,55 @@ def validate_test_run_with_cursor(
 
         assistant_result = str(terminal.get("result") or "")
         parsed = _extract_json(assistant_result)
-        case_results = _normalise_case_results(
-            parsed,
+        received_schema = str(parsed.get("schema_version") or "").strip()
+        _diag(
+            "cursor_validation_protocol_received",
             run_id=run_id,
-            expected_case_ids=expected_case_ids,
-            case_types=case_types,
+            received_schema=received_schema or "<missing>",
+            result_chars=len(assistant_result),
         )
+        try:
+            case_results = _normalise_case_results(
+                parsed,
+                run_id=run_id,
+                expected_case_ids=expected_case_ids,
+                case_types=case_types,
+            )
+        except ValueError as protocol_error:
+            _diag(
+                "cursor_validation_protocol_invalid",
+                level="warning",
+                run_id=run_id,
+                received_schema=received_schema or "<missing>",
+                error=protocol_error,
+                result_preview=assistant_result[:1000],
+            )
+            if str(os.getenv("TERRABOT_TEST_CURSOR_VALIDATION_PROTOCOL_REPAIR_ENABLED", "true")).strip().lower() not in _TRUE_VALUES:
+                raise
+            repair_timeout = _bounded_int(
+                "TERRABOT_TEST_CURSOR_VALIDATION_PROTOCOL_REPAIR_TIMEOUT_SECONDS", 180, 30, 600
+            )
+            case_results, repair_agent_id, repair_run_id = _run_cursor_protocol_repair(
+                http_client=http_client,
+                api_base=api_base,
+                headers=headers,
+                repos=repos,
+                run_id=run_id,
+                expected_case_ids=expected_case_ids,
+                case_types=case_types,
+                invalid_result=assistant_result,
+                validation_error=str(protocol_error),
+                request_timeout=request_timeout,
+                total_timeout=repair_timeout,
+                poll_seconds=poll_seconds,
+                model=model,
+            )
+            _diag(
+                "cursor_validation_protocol_repair_used",
+                run_id=run_id,
+                repair_agent_id=repair_agent_id,
+                repair_run_id=repair_run_id,
+            )
         duration_ms = int(terminal.get("durationMs") or ((time.monotonic() - started) * 1000))
         for case_id, verdict in case_results.items():
             _diag(

@@ -43,6 +43,33 @@ class FakeHttpClient:
         return FakeResponse(self.terminal_payload)
 
 
+class SequenceHttpClient:
+    def __init__(self, terminal_payloads: list[dict]):
+        self.terminal_payloads = list(terminal_payloads)
+        self.post_calls: list[dict] = []
+        self.get_calls: list[dict] = []
+        self._created = 0
+        self._active = -1
+
+    def post(self, url: str, **kwargs):
+        self.post_calls.append({"url": url, **kwargs})
+        self._active = self._created
+        self._created += 1
+        suffix = self._created
+        return FakeResponse({
+            "agent": {
+                "id": f"bc-test-agent-{suffix}",
+                "latestRunId": f"run-cursor-{suffix}",
+                "url": f"https://cursor.com/agents/bc-test-agent-{suffix}",
+            },
+            "run": {"id": f"run-cursor-{suffix}", "status": "CREATING"},
+        })
+
+    def get(self, url: str, **kwargs):
+        self.get_calls.append({"url": url, **kwargs})
+        return FakeResponse(self.terminal_payloads[self._active])
+
+
 def boolean_case_payload() -> dict:
     return {
         "case_id": "aws-001",
@@ -199,6 +226,37 @@ class CursorResultValidatorTests(unittest.TestCase):
             )
         self.assertFalse(result["completed"])
         self.assertIn("schema_version", result["error"])
+
+
+    def test_protocol_repair_recovers_wrong_schema_without_weakening_parser(self):
+        wrong = finished_payload(schema_version="wrong.schema")
+        repaired = finished_payload()
+        repaired["id"] = "run-cursor-2"
+        repaired["agentId"] = "bc-test-agent-2"
+        client = SequenceHttpClient([wrong, repaired])
+        env = {
+            "TERRABOT_TEST_CURSOR_RESULT_VALIDATION_ENABLED": "true",
+            "TERRABOT_CURSOR_API_KEY": "test-key",
+            "TERRABOT_TEST_CURSOR_VALIDATION_PROTOCOL_REPAIR_ENABLED": "true",
+            "TERRABOT_TEST_CURSOR_VALIDATION_POLL_SECONDS": "1",
+        }
+        snapshot = {"https://github.com/venasolutions/tf-devops": {"main": "abc123"}}
+        with patch.dict(os.environ, env, clear=False), patch.object(
+            validator.cursor_readonly_guard,
+            "snapshot_remote_branches",
+            side_effect=[snapshot, snapshot, snapshot, snapshot],
+        ):
+            result = validator.validate_test_run_with_cursor(
+                run_id="ctx-test",
+                cases=[boolean_case_payload()],
+                http_client=client,
+            )
+        self.assertTrue(result["completed"])
+        self.assertTrue(result["case_results"]["aws-001"]["overall_ok"])
+        self.assertEqual(len(client.post_calls), 2)
+        repair_prompt = client.post_calls[1]["json"]["prompt"]["text"]
+        self.assertIn('schema_version MUST be the exact literal "terrabot.cursor.validation.v1"', repair_prompt)
+        self.assertIn("Do not change the semantic verdicts", repair_prompt)
 
     def test_resource_creation_requires_null_context_fields(self):
         case = boolean_case_payload()

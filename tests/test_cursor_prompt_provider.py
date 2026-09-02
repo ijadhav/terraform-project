@@ -267,5 +267,89 @@ class CursorPromptProviderTests(unittest.TestCase):
                 )
 
 
+    def test_repository_control_clarification_returns_structured_boolean_handoff(self) -> None:
+        result = {
+            "schema_version": "terrabot.cursor.clarification.v1",
+            "answer": "Use enable_object_replication in vars/npr/npr-int/hub.tfvars.",
+            "resolution_type": "repository_control",
+            "candidates_relevant": False,
+            "selected_index": None,
+            "selected_path": "vars/npr/npr-int/hub.tfvars",
+            "selected_flag": "enable_object_replication",
+            "selected_current_value": False,
+            "selected_new_value": True,
+            "reason": "The live npr-int values file gates object replication with this Boolean.",
+            "evidence": ["enable_object_replication = false"],
+        }
+        session = FakeSession({
+            "agent": {"id": "bc-clarify", "url": "https://cursor.com/agents/bc-clarify"},
+            "run": {"id": "run-clarify", "status": "FINISHED", "result": json.dumps(result)},
+        })
+        snapshot = {"https://github.com/venasolutions/tf-azure-hub": {"main": "abc123"}}
+        env = dict(self.base_env)
+        with patch.dict(os.environ, env, clear=False), patch.object(
+            cursor_prompt_provider.cursor_readonly_guard,
+            "snapshot_remote_branches",
+            side_effect=[snapshot, snapshot],
+        ):
+            resolved = cursor_prompt_provider.resolve_repository_clarification(
+                owner="venasolutions",
+                repo="tf-azure-hub",
+                commit_sha="abc123",
+                original_prompt="for npr-int, make the object copying capability on",
+                clarification_text="Which repository control should I change?",
+                candidates=[],
+                run_id="ctx-test",
+                case_id="azure-01-test",
+                session=session,
+            )
+        self.assertEqual(resolved["resolution_type"], "repository_control")
+        self.assertEqual(resolved["selected_path"], "vars/npr/npr-int/hub.tfvars")
+        self.assertEqual(resolved["selected_flag"], "enable_object_replication")
+        self.assertIs(resolved["selected_current_value"], False)
+        self.assertIs(resolved["selected_new_value"], True)
+        self.assertIn("enable_object_replication = false", resolved["evidence"])
+        prompt_text = session.calls[0]["json"]["prompt"]["text"]
+        self.assertIn("selected_current_value", prompt_text)
+        self.assertIn("selected_new_value", prompt_text)
+
+    def test_repository_control_clarification_rejects_missing_boolean_values(self) -> None:
+        result = {
+            "schema_version": "terrabot.cursor.clarification.v1",
+            "answer": "Use enable_object_replication in vars/npr/npr-int/hub.tfvars.",
+            "resolution_type": "repository_control",
+            "candidates_relevant": False,
+            "selected_index": None,
+            "selected_path": "vars/npr/npr-int/hub.tfvars",
+            "selected_flag": "enable_object_replication",
+            "selected_current_value": None,
+            "selected_new_value": None,
+            "reason": "incomplete",
+            "evidence": [],
+        }
+        session = FakeSession({
+            "agent": {"id": "bc-clarify"},
+            "run": {"id": "run-clarify", "status": "FINISHED", "result": json.dumps(result)},
+        })
+        snapshot = {"https://github.com/venasolutions/tf-azure-hub": {"main": "abc123"}}
+        with patch.dict(os.environ, self.base_env, clear=False), patch.object(
+            cursor_prompt_provider.cursor_readonly_guard,
+            "snapshot_remote_branches",
+            side_effect=[snapshot, snapshot],
+        ):
+            resolved = cursor_prompt_provider.resolve_repository_clarification(
+                owner="venasolutions",
+                repo="tf-azure-hub",
+                commit_sha="abc123",
+                original_prompt="enable object copying in npr-int",
+                clarification_text="Which control?",
+                candidates=[],
+                run_id="ctx-test",
+                case_id="azure-01-test",
+                session=session,
+            )
+        self.assertEqual(resolved, {})
+
+
 if __name__ == "__main__":
     unittest.main()
