@@ -998,6 +998,48 @@ def _matching_context_record(case: TestCase, search_result: dict) -> dict | None
     return None
 
 
+def _search_phase2_context(case: TestCase) -> tuple[dict, dict | None]:
+    """Search Phase 2 by paraphrase with bounded index-consistency retries.
+
+    The retry never uses the hidden expected flag/path as a query.  It therefore
+    preserves the semantic-reuse assertion while avoiding false negatives when
+    a verified mapping was indexed only milliseconds before Phase 2.
+    """
+    try:
+        attempts = int(os.getenv("TERRABOT_TEST_PHASE2_CONTEXT_SEARCH_ATTEMPTS", "3"))
+    except (TypeError, ValueError):
+        attempts = 3
+    attempts = max(1, min(attempts, 5))
+    try:
+        top_k = int(os.getenv("TERRABOT_TEST_PHASE2_CONTEXT_TOP_K", "25"))
+    except (TypeError, ValueError):
+        top_k = 25
+    top_k = max(8, min(top_k, 25))
+    last: dict = {}
+    for attempt in range(1, attempts + 1):
+        last = repository_context.search_repository_context(
+            repo_owner=case.owner,
+            repo_name=case.repo,
+            query=case.phase2_prompt,
+            current_commit_sha="",
+            top_k=top_k,
+        )
+        match = _matching_context_record(case, last)
+        if match is not None:
+            if attempt > 1:
+                _diag(
+                    "phase2_context_retrieved_after_retry",
+                    test_case_id=case.case_id,
+                    attempt=attempt,
+                    top_k=top_k,
+                    context_id=str(match.get("id") or ""),
+                )
+            return last, match
+        if attempt < attempts:
+            time.sleep(min(0.5 * attempt, 1.5))
+    return last, None
+
+
 def _ensure_context_mapping(
     core: Any,
     case: TestCase,
@@ -1190,8 +1232,27 @@ def _invoke_backend(core: Any, request: dict, result: TestCaseResult) -> tuple[d
     return core.handle_teams_chat_request(request)
 
 
+def _automated_test_workflow(case: TestCase) -> str:
+    """Return only the workflow class already known from the generated test shape.
+
+    Boolean-context cases are derived from an existing live assignment, so they
+    are modifications by construction.  Pinning that workflow class prevents
+    colloquial prompts such as ``integration off`` from being misrouted into an
+    AWS module-creation workflow while leaving environment/path/flag resolution
+    entirely to the production repository resolver.  Resource-creation cases
+    intentionally keep production workflow inference unchanged.
+    """
+    if case.case_type != "boolean_context":
+        return ""
+    if case.cloud == "aws":
+        return "aws_infra_modification"
+    if case.cloud == "azure":
+        return "azure_infra_modification"
+    return ""
+
+
 def _phase_request(case: TestCase, prompt: str, conversation_id: str, *, phase: int) -> dict:
-    return {
+    request = {
         "prompt": prompt,
         "original_prompt": prompt,
         "thread_id": "",
@@ -1207,6 +1268,7 @@ def _phase_request(case: TestCase, prompt: str, conversation_id: str, *, phase: 
         "test_mode": True,
         "automated_test_phase": phase,
         "automated_test_case_id": case.case_id,
+        "automated_test_case_type": case.case_type,
         "fresh_infra_generation": True,
         "cloud": case.cloud,
         "requested_cloud": case.cloud,
@@ -1220,6 +1282,10 @@ def _phase_request(case: TestCase, prompt: str, conversation_id: str, *, phase: 
         "reuse_branch": False,
         "existing_branch": "",
     }
+    workflow = _automated_test_workflow(case)
+    if workflow:
+        request["workflow"] = workflow
+    return request
 
 
 def _validate_preview(core: Any, backend_result: dict, prompt: str, thread_id: str) -> tuple[bool, str]:
@@ -1378,7 +1444,11 @@ def _resolve_automated_clarifications(
             "test_mode": True,
             "automated_test_phase": phase,
             "automated_test_case_id": case.case_id,
-            "fresh_infra_generation": True,
+            "automated_test_case_type": case.case_type,
+            # This is a continuation of the same pending infrastructure request,
+            # not a new generation.  Keeping this false preserves the pending
+            # target/workflow state that Terrabot created before clarification.
+            "fresh_infra_generation": False,
             # Keep the already-resolved test branch strategy across target or
             # free-form clarification continuations. A clarification must not
             # reopen the normal user branch-choice stage.
@@ -1391,6 +1461,8 @@ def _resolve_automated_clarifications(
             "requested_cloud": case.cloud,
             "required_repository_context_ids": list(phase_request.get("required_repository_context_ids") or []),
         }
+        if str(phase_request.get("workflow") or "").strip():
+            followup["workflow"] = str(phase_request.get("workflow") or "").strip()
         if cursor_resolution and resolution_type in {"candidate", "repository_control"}:
             followup["cursor_repository_resolution"] = {
                 "source": "cursor_read_only_repository_clarification",
@@ -1674,14 +1746,7 @@ def _run_case(core: Any, case: TestCase, run_id: str, requester_id: str) -> Test
 
         # Phase 2 retrieval is checked with the actual randomized paraphrase and
         # then exercised through a completely fresh Teams conversation.
-        phase2_search = repository_context.search_repository_context(
-            repo_owner=case.owner,
-            repo_name=case.repo,
-            query=case.phase2_prompt,
-            current_commit_sha="",
-            top_k=8,
-        )
-        phase2_match = _matching_context_record(case, phase2_search)
+        phase2_search, phase2_match = _search_phase2_context(case)
         row.phase2_context_retrieved = phase2_match is not None
 
         phase2_request = _phase_request(case, case.phase2_prompt, p2_conversation, phase=2)

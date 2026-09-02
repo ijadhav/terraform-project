@@ -92,6 +92,47 @@ def _bounded_float(name: str, default: float, minimum: float, maximum: float) ->
     return max(minimum, min(value, maximum))
 
 
+def _http_status_code(exc: Exception) -> int:
+    response = getattr(exc, "response", None)
+    try:
+        return int(getattr(response, "status_code", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _request_with_retry(
+    http_client: Any,
+    method: str,
+    url: str,
+    *,
+    attempts: int = 3,
+    **kwargs: Any,
+):
+    """Retry only transient Cursor API transport/status failures."""
+    method_fn = getattr(http_client, method.lower())
+    attempts = max(1, min(int(attempts or 1), 5))
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            response = method_fn(url, **kwargs)
+            response.raise_for_status()
+            return response
+        except Exception as exc:
+            last_error = exc
+            status = _http_status_code(exc)
+            transient = status in {408, 409, 425, 429} or 500 <= status <= 599
+            # Test doubles and some requests wrappers raise without attaching a
+            # response. Treat explicit HTTP 5xx/429 text as transient too.
+            message = str(exc).lower()
+            transient = transient or any(token in message for token in ("http 429", "http 500", "http 502", "http 503", "http 504", "temporarily unavailable"))
+            if not transient or attempt >= attempts:
+                raise
+            time.sleep(min(0.5 * (2 ** (attempt - 1)), 2.0))
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("Cursor request retry loop ended unexpectedly.")
+
+
 def _extract_json(text: str) -> dict[str, Any]:
     raw = str(text or "").strip()
     if not raw:
@@ -243,7 +284,9 @@ def _build_prompt(run_id: str, cases: Sequence[Mapping[str, Any]]) -> str:
             final_chars=len(evidence_json),
             limit=max_chars,
         )
-    return f"""You are the independent read-only verifier for a completed Terrabot Terraform test run.
+    return f"""OUTPUT CONTRACT FIRST: your entire response MUST be one raw JSON object. First character {{, last character }}. No markdown, prose, preface, suffix, or sentence saying JSON is required. schema_version MUST equal "{_SCHEMA_VERSION}" and run_id MUST equal "{run_id}".
+
+You are the independent read-only verifier for a completed Terrabot Terraform test run.
 
 STRICT SAFETY RULES:
 - Do not edit files.
@@ -269,6 +312,9 @@ For resource-creation cases, context_added, context_retrievable, and context_reu
 
 RUN EVIDENCE:
 {evidence_json}
+
+FINAL RESPONSE CONTRACT (repeat after evidence because this is the last instruction):
+Return the JSON object itself, not a description of it. The first character must be {{ and the last character must be }}. No markdown/code fence/prose. Use schema_version exactly "{_SCHEMA_VERSION}" and run_id exactly "{run_id}"; include exactly one case object for every supplied case_id even when every assertion is false.
 """
 
 
@@ -341,7 +387,9 @@ def _run_cursor_protocol_repair(
     )
     payload: dict[str, Any] = {
         "prompt": {"text": prompt},
-        "repos": list(repos),
+        # Protocol repair is formatting-only. Do not attach repositories: that
+        # would make Cursor clone/analyse them again and caused the 180-second
+        # repair timeout seen in the test run.
         "mode": "plan",
         "workOnCurrentBranch": False,
         "autoCreatePR": False,
@@ -350,20 +398,20 @@ def _run_cursor_protocol_repair(
     if model:
         payload["model"] = {"id": model}
 
-    remote_before = cursor_readonly_guard.snapshot_remote_branches(repos)
     _diag(
         "cursor_validation_protocol_repair_started",
         run_id=run_id,
         validation_error=validation_error,
         prompt_chars=len(prompt),
     )
-    response = http_client.post(
+    response = _request_with_retry(
+        http_client,
+        "POST",
         f"{api_base}/v1/agents",
         headers=dict(headers),
         json=payload,
         timeout=request_timeout,
     )
-    response.raise_for_status()
     created = response.json() or {}
     agent = created.get("agent") or {}
     run = created.get("run") or {}
@@ -376,12 +424,13 @@ def _run_cursor_protocol_repair(
     terminal: dict[str, Any] = {}
     previous_status = ""
     while time.monotonic() < deadline:
-        response = http_client.get(
+        response = _request_with_retry(
+            http_client,
+            "GET",
             f"{api_base}/v1/agents/{agent_id}/runs/{cursor_run_id}",
             headers=dict(headers),
             timeout=request_timeout,
         )
-        response.raise_for_status()
         terminal = response.json() or {}
         status = str(terminal.get("status") or "").strip().upper()
         if status != previous_status:
@@ -403,14 +452,6 @@ def _run_cursor_protocol_repair(
     if status != "FINISHED":
         detail = str(terminal.get("result") or terminal.get("error") or "").strip()
         raise RuntimeError(f"Cursor validation protocol repair ended with status {status or '<empty>'}: {detail[:800]}")
-
-    remote_after = cursor_readonly_guard.snapshot_remote_branches(repos)
-    mutations = cursor_readonly_guard.cursor_reported_remote_mutations(terminal, remote_before, remote_after)
-    if mutations:
-        raise RuntimeError(
-            "Cursor validation protocol repair changed a verified remote GitHub branch; verdict rejected: "
-            + json.dumps(mutations, ensure_ascii=False)[:1200]
-        )
 
     result_text = str(terminal.get("result") or "")
     parsed = _extract_json(result_text)
@@ -535,13 +576,14 @@ def validate_test_run_with_cursor(
             prompt_chars=len(prompt),
             api_base=api_base,
         )
-        create_response = http_client.post(
+        create_response = _request_with_retry(
+            http_client,
+            "POST",
             f"{api_base}/v1/agents",
             headers=headers,
             json=create_payload,
             timeout=request_timeout,
         )
-        create_response.raise_for_status()
         created = create_response.json() or {}
         agent = created.get("agent") or {}
         run = created.get("run") or {}
@@ -563,12 +605,13 @@ def validate_test_run_with_cursor(
         terminal: dict[str, Any] = {}
         deadline = time.monotonic() + total_timeout
         while time.monotonic() < deadline:
-            response = http_client.get(
+            response = _request_with_retry(
+                http_client,
+                "GET",
                 f"{api_base}/v1/agents/{agent_id}/runs/{run_cursor_id}",
                 headers=headers,
                 timeout=request_timeout,
             )
-            response.raise_for_status()
             terminal = response.json() or {}
             status = str(terminal.get("status") or "").strip().upper()
             if status != previous_status:
@@ -644,7 +687,7 @@ def validate_test_run_with_cursor(
             if str(os.getenv("TERRABOT_TEST_CURSOR_VALIDATION_PROTOCOL_REPAIR_ENABLED", "true")).strip().lower() not in _TRUE_VALUES:
                 raise
             repair_timeout = _bounded_int(
-                "TERRABOT_TEST_CURSOR_VALIDATION_PROTOCOL_REPAIR_TIMEOUT_SECONDS", 180, 30, 600
+                "TERRABOT_TEST_CURSOR_VALIDATION_PROTOCOL_REPAIR_TIMEOUT_SECONDS", 60, 20, 180
             )
             case_results, repair_agent_id, repair_run_id = _run_cursor_protocol_repair(
                 http_client=http_client,

@@ -17,6 +17,8 @@ import json
 import logging
 import os
 import re
+import threading
+import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, Optional
@@ -96,6 +98,12 @@ ALLOWED_CATEGORIES = {
 
 _INDEX_READY = False
 _SEARCH_CLIENT = None
+# Process-local synchronization prevents two concurrent requests in the same
+# Function worker from both attempting index initialization. Azure Functions can
+# still run multiple workers/instances, so ensure_repository_context_index also
+# handles cross-instance create/update conflicts below.
+_INDEX_LOCK = threading.Lock()
+_INDEX_OPERATION_RETRY_DELAYS = (0.2, 0.4, 0.8, 1.5, 2.5, 4.0)
 
 
 def _diag(event: str, level: str = "info", **fields: Any) -> None:
@@ -459,7 +467,128 @@ def build_repository_context_index():
     )
 
 
+def _search_index_exception_status(exc: Exception) -> int:
+    """Best-effort HTTP status extraction without depending on Azure exception classes."""
+    for attr in ("status_code", "status"):
+        value = getattr(exc, attr, None)
+        try:
+            if value is not None:
+                return int(value)
+        except (TypeError, ValueError):
+            pass
+    response = getattr(exc, "response", None)
+    value = getattr(response, "status_code", None)
+    try:
+        return int(value) if value is not None else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def _search_index_exception_code(exc: Exception) -> str:
+    """Return the Azure Search service error code when the SDK exposes one."""
+    error = getattr(exc, "error", None)
+    code = getattr(error, "code", None)
+    if code:
+        return str(code)
+    code = getattr(exc, "error_code", None)
+    return str(code or "")
+
+
+def _is_repository_context_index_not_found(exc: Exception) -> bool:
+    status = _search_index_exception_status(exc)
+    code = _search_index_exception_code(exc).strip().lower()
+    text = str(exc or "").lower()
+    return (
+        status == 404
+        or code in {"resourcenotfound", "indexnotfound"}
+        or ("index" in text and "not found" in text)
+    )
+
+
+def _is_repository_context_index_concurrency_conflict(exc: Exception) -> bool:
+    """Recognize transient Azure AI Search control-plane conflicts.
+
+    Azure Search rejects simultaneous index create/update operations with
+    OperationNotAllowed / ResourceCreationConcurrencyConflict. These are
+    transient coordination failures, not repository-context failures.
+    """
+    status = _search_index_exception_status(exc)
+    code = _search_index_exception_code(exc).strip().lower()
+    text = f"{code} {exc}".lower()
+    markers = (
+        "operationnotallowed",
+        "resourcecreationconcurrencyconflict",
+        "concurrent operation",
+        "already exists",
+        "resourcealreadyexists",
+    )
+    return status in {409, 429} or any(marker in text for marker in markers)
+
+
+def _repository_context_index_exists(client: Any) -> bool:
+    try:
+        client.get_index(REPOSITORY_CONTEXT_INDEX_NAME)
+        return True
+    except Exception as exc:
+        if _is_repository_context_index_not_found(exc):
+            return False
+        raise
+
+
+def _wait_for_repository_context_index(client: Any) -> bool:
+    """Wait for another Function worker/instance to finish creating the index."""
+    for delay in _INDEX_OPERATION_RETRY_DELAYS:
+        time.sleep(delay)
+        try:
+            if _repository_context_index_exists(client):
+                return True
+        except Exception as exc:
+            if _is_repository_context_index_concurrency_conflict(exc):
+                continue
+            raise
+    return False
+
+
+def _force_create_or_update_repository_context_index(client: Any, index: Any) -> None:
+    """Admin/schema-migration path with bounded retry for concurrent updates."""
+    last_error: Exception | None = None
+    attempts = len(_INDEX_OPERATION_RETRY_DELAYS) + 1
+    for attempt in range(1, attempts + 1):
+        try:
+            client.create_or_update_index(index)
+            return
+        except Exception as exc:
+            if not _is_repository_context_index_concurrency_conflict(exc):
+                raise
+            last_error = exc
+            if attempt >= attempts:
+                break
+            delay = _INDEX_OPERATION_RETRY_DELAYS[attempt - 1]
+            _diag(
+                "index_update_concurrency_retry",
+                level="warning",
+                index=REPOSITORY_CONTEXT_INDEX_NAME,
+                attempt=f"{attempt}/{attempts}",
+                delay_seconds=delay,
+                error=exc,
+            )
+            time.sleep(delay)
+    if last_error is not None:
+        raise last_error
+
+
 def ensure_repository_context_index(force: bool = False) -> str:
+    """Ensure the repository-context index exists without racing on cold start.
+
+    Normal runtime initialization is read-before-create: if the index already
+    exists, no schema update is issued. This is critical in a scaled Azure
+    Function because _INDEX_READY is process-local and multiple workers can cold
+    start concurrently.
+
+    ``force=True`` preserves the existing explicit schema-update behavior used by
+    create_search_index.py, but adds bounded retry for concurrent control-plane
+    operations.
+    """
     global _INDEX_READY
     _validate_sdk_available()
     if _INDEX_READY and not force:
@@ -467,15 +596,80 @@ def ensure_repository_context_index(force: bool = False) -> str:
     if not AUTO_CREATE_INDEX and not force:
         return REPOSITORY_CONTEXT_INDEX_NAME
 
-    client = SearchIndexClient(
-        endpoint=AZURE_SEARCH_ENDPOINT,
-        credential=AzureKeyCredential(AZURE_SEARCH_KEY),
-    )
-    index = build_repository_context_index()
-    client.create_or_update_index(index)
-    _INDEX_READY = True
-    _diag("index_ready", index=REPOSITORY_CONTEXT_INDEX_NAME)
-    return REPOSITORY_CONTEXT_INDEX_NAME
+    with _INDEX_LOCK:
+        # Another request in this worker may have completed initialization while
+        # this request waited for the lock.
+        if _INDEX_READY and not force:
+            return REPOSITORY_CONTEXT_INDEX_NAME
+
+        client = SearchIndexClient(
+            endpoint=AZURE_SEARCH_ENDPOINT,
+            credential=AzureKeyCredential(AZURE_SEARCH_KEY),
+        )
+
+        if not force:
+            # Runtime requests must never update an existing index schema. They
+            # only create it when it is genuinely absent.
+            try:
+                index_exists = _repository_context_index_exists(client)
+            except Exception as exc:
+                if not _is_repository_context_index_concurrency_conflict(exc):
+                    raise
+                _diag(
+                    "index_probe_concurrency_wait",
+                    level="warning",
+                    index=REPOSITORY_CONTEXT_INDEX_NAME,
+                    error=exc,
+                )
+                if not _wait_for_repository_context_index(client):
+                    raise
+                index_exists = True
+
+            if index_exists:
+                _INDEX_READY = True
+                _diag(
+                    "index_ready",
+                    index=REPOSITORY_CONTEXT_INDEX_NAME,
+                    action="existing",
+                )
+                return REPOSITORY_CONTEXT_INDEX_NAME
+
+            index = build_repository_context_index()
+            try:
+                client.create_index(index)
+                action = "created"
+            except Exception as exc:
+                if not _is_repository_context_index_concurrency_conflict(exc):
+                    raise
+                _diag(
+                    "index_create_concurrency_wait",
+                    level="warning",
+                    index=REPOSITORY_CONTEXT_INDEX_NAME,
+                    error=exc,
+                )
+                if not _wait_for_repository_context_index(client):
+                    raise
+                action = "created_by_concurrent_worker"
+
+            _INDEX_READY = True
+            _diag(
+                "index_ready",
+                index=REPOSITORY_CONTEXT_INDEX_NAME,
+                action=action,
+            )
+            return REPOSITORY_CONTEXT_INDEX_NAME
+
+        # Explicit deployment/admin path: preserve schema reconciliation while
+        # tolerating another concurrent index operation.
+        index = build_repository_context_index()
+        _force_create_or_update_repository_context_index(client, index)
+        _INDEX_READY = True
+        _diag(
+            "index_ready",
+            index=REPOSITORY_CONTEXT_INDEX_NAME,
+            action="force_create_or_update",
+        )
+        return REPOSITORY_CONTEXT_INDEX_NAME
 
 
 def get_repository_context_search_client():

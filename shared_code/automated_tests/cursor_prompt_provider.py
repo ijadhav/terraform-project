@@ -760,6 +760,131 @@ def apply_cursor_generated_prompts(
     return output
 
 
+def _repair_clarification_protocol(
+    *,
+    session: Any,
+    base_url: str,
+    headers: dict[str, str],
+    request_timeout: float,
+    poll_interval: float,
+    invalid_result: str,
+    validation_error: str,
+    run_id: str,
+    case_id: str,
+    log_event: Callable[..., None] | None,
+) -> dict[str, Any]:
+    """Reformat a completed Cursor clarification without re-reading a repo.
+
+    Cursor's v1 API supports no-repository agents.  This repair is deliberately
+    protocol-only: it may preserve a semantic choice already present in the
+    first result, but it must not derive a new path/flag or turn unresolved into
+    resolved.  Avoiding a second repository checkout keeps clarification repair
+    bounded and prevents the long protocol-repair stalls seen in E2E runs.
+    """
+    try:
+        run_timeout = _float_setting(
+            "TERRABOT_CURSOR_CLARIFICATION_PROTOCOL_REPAIR_TIMEOUT_SECONDS",
+            45.0,
+            15.0,
+            120.0,
+        )
+        prior = str(invalid_result or "")[:12000]
+        instruction = "\n".join([
+            "Repair ONLY the response format of a completed Terrabot Cursor clarification.",
+            "Do not inspect a repository, edit files, commit, push, create branches, or open PRs.",
+            "Do not change the semantic meaning of the prior result and do not invent a path, flag, value, or evidence.",
+            f"The previous response failed validation with: {validation_error}",
+            "Return exactly one raw JSON object; first character { and last character }. No markdown or prose.",
+            f"schema_version must be exactly {_CLARIFICATION_SCHEMA_VERSION}.",
+            "Required keys: schema_version, answer, resolution_type, candidates_relevant, selected_index, selected_path, selected_flag, selected_current_value, selected_new_value, reason, evidence.",
+            "If the prior result did not actually identify a unique repository control, preserve that meaning by returning resolution_type=unresolved, selected_index=null, selected_path=\"\", selected_flag=\"\", selected_current_value=null, selected_new_value=null, answer=\"\", evidence=[].",
+            "Prior Cursor result:",
+            prior,
+            "FINAL: emit the JSON object itself and nothing else.",
+        ])
+        payload = {
+            "name": f"Terrabot clarification protocol repair {run_id} {case_id}"[:100],
+            "mode": "plan",
+            "prompt": {"text": instruction},
+            "workOnCurrentBranch": False,
+            "autoCreatePR": False,
+            "skipReviewerRequest": True,
+        }
+        _emit(
+            "cursor_clarification_protocol_repair_started",
+            log_event=log_event,
+            run_id=run_id,
+            test_case_id=case_id,
+            prompt_chars=len(instruction),
+            validation_error=validation_error,
+        )
+        created = _http_json(
+            session,
+            "POST",
+            f"{base_url}/v1/agents",
+            headers=headers,
+            timeout=request_timeout,
+            payload=payload,
+        )
+        agent_id, cursor_run_id, initial_run = _extract_agent_and_run(created)
+        try:
+            cursor_run_id = _resolve_run_id(
+                session,
+                agent_id,
+                cursor_run_id,
+                base_url=base_url,
+                headers=headers,
+                timeout=request_timeout,
+            )
+            repaired_text, _terminal = _wait_for_result(
+                session,
+                agent_id,
+                cursor_run_id,
+                initial_run,
+                base_url=base_url,
+                headers=headers,
+                request_timeout=request_timeout,
+                run_timeout=run_timeout,
+                poll_interval=poll_interval,
+                run_label=f"{run_id}:{case_id}:clarification-repair",
+                log_event=log_event,
+            )
+            parsed = _parse_result_text(repaired_text)
+            if str(parsed.get("schema_version") or "").strip() != _CLARIFICATION_SCHEMA_VERSION:
+                raise CursorPromptError(
+                    f"Cursor clarification repair schema_version must be {_CLARIFICATION_SCHEMA_VERSION}."
+                )
+            _emit(
+                "cursor_clarification_protocol_repair_completed",
+                log_event=log_event,
+                run_id=run_id,
+                test_case_id=case_id,
+                cursor_agent_id=agent_id,
+                cursor_run_id=cursor_run_id,
+            )
+            return parsed
+        finally:
+            _archive_agent_best_effort(
+                session,
+                agent_id,
+                base_url=base_url,
+                headers=headers,
+                timeout=request_timeout,
+                run_label=f"{run_id}:{case_id}:clarification-repair",
+                log_event=log_event,
+            )
+    except Exception as exc:
+        _emit(
+            "cursor_clarification_protocol_repair_failed",
+            level="warning",
+            log_event=log_event,
+            run_id=run_id,
+            test_case_id=case_id,
+            error=exc,
+        )
+        return {}
+
+
 def resolve_repository_clarification(
     *,
     owner: str,
@@ -796,7 +921,12 @@ def resolve_repository_clarification(
     session = session or requests.Session()
     base_url = _base_url()
     request_timeout = _float_setting("TERRABOT_CURSOR_REQUEST_TIMEOUT_SECONDS", 30.0, 5.0, 120.0)
-    run_timeout = _float_setting("TERRABOT_CURSOR_RUN_TIMEOUT_SECONDS", 300.0, 15.0, 1800.0)
+    run_timeout = _float_setting(
+        "TERRABOT_CURSOR_CLARIFICATION_RUN_TIMEOUT_SECONDS",
+        _float_setting("TERRABOT_CURSOR_RUN_TIMEOUT_SECONDS", 180.0, 15.0, 1800.0),
+        15.0,
+        600.0,
+    )
     poll_interval = _float_setting("TERRABOT_CURSOR_POLL_INTERVAL_SECONDS", 2.0, 0.2, 30.0)
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -826,6 +956,8 @@ def resolve_repository_clarification(
         "For unresolved, set selected_current_value=null, selected_new_value=null, selected_path=\"\", selected_flag=\"\", and evidence=[].",
         "evidence must contain at most 4 short repository-grounded strings identifying the live file/assignment or wiring that proves the choice.",
         "The answer must be concise and directly usable as the clarification reply. Never invent a path, flag, current value, or target value.",
+        "FINAL RESPONSE CONTRACT: output exactly one raw JSON object. The first character must be { and the last character must be }. Do not emit markdown, prose, or a sentence saying that JSON is required; actually emit the JSON object.",
+        f"Use this exact schema_version literal: {_CLARIFICATION_SCHEMA_VERSION}.",
     ])
     repos = [{"url": f"https://github.com/{owner}/{repo}", "startingRef": commit_sha}]
     remote_before = cursor_readonly_guard.snapshot_remote_branches(repos)
@@ -880,12 +1012,28 @@ def resolve_repository_clarification(
                 "Cursor changed a verified remote GitHub branch while resolving a clarification: "
                 + json.dumps(mutations, ensure_ascii=False)[:1000]
             )
-        parsed = _parse_result_text(result_text)
-        schema_version = str(parsed.get("schema_version") or "").strip()
-        if schema_version != _CLARIFICATION_SCHEMA_VERSION:
-            raise CursorPromptError(
-                f"Cursor clarification schema_version must be {_CLARIFICATION_SCHEMA_VERSION}."
+        try:
+            parsed = _parse_result_text(result_text)
+            schema_version = str(parsed.get("schema_version") or "").strip()
+            if schema_version != _CLARIFICATION_SCHEMA_VERSION:
+                raise CursorPromptError(
+                    f"Cursor clarification schema_version must be {_CLARIFICATION_SCHEMA_VERSION}."
+                )
+        except CursorPromptError as protocol_error:
+            parsed = _repair_clarification_protocol(
+                session=session,
+                base_url=base_url,
+                headers=headers,
+                request_timeout=request_timeout,
+                poll_interval=poll_interval,
+                invalid_result=result_text,
+                validation_error=str(protocol_error),
+                run_id=run_id,
+                case_id=case_id,
+                log_event=log_event,
             )
+            if not parsed:
+                raise
         answer = re.sub(r"\s+", " ", str(parsed.get("answer") or "")).strip()
         resolution_type = str(parsed.get("resolution_type") or "").strip().lower()
         if resolution_type not in {"candidate", "repository_control", "unresolved"}:

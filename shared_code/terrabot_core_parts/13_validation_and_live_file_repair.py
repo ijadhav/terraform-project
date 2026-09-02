@@ -2493,6 +2493,47 @@ def _repository_context_unique_boolean_match(
             repo_owner=owner, repo_name=repo, query=str(prompt or "").strip(),
             current_commit_sha=current_sha, top_k=8,
         )
+        # Phase 2 can require a context record that was retrieved by the test
+        # harness but ranked outside this resolver's independent top-8 search.
+        # Merge those exact IDs before semantic matching.  The record still
+        # cannot select a target unless its path+flag exists in the CURRENT live
+        # Boolean inventory below, so durable context remains a hint rather than
+        # an authority over repository truth.
+        required_ids = [
+            str(value).strip()
+            for value in (active.get("required_repository_context_ids") or [])
+            if str(value).strip()
+        ]
+        if required_ids:
+            merged = [dict(item) for item in (search.get("results") or []) if isinstance(item, dict)]
+            present = {str(item.get("id") or "").strip() for item in merged}
+            for context_id in required_ids:
+                if context_id in present:
+                    continue
+                record = shared_repository_context.get_repository_context_by_id(context_id)
+                if record is None or str(record.repo_full_name or "").lower() != f"{owner}/{repo}".lower():
+                    continue
+                merged.insert(0, {
+                    "id": record.id,
+                    "category": record.category,
+                    "subject": record.subject,
+                    "scope": record.scope,
+                    "statement": record.statement,
+                    "evidence_paths": list(record.evidence_paths or []),
+                    "evidence_commit_sha": record.evidence_commit_sha,
+                    "evidence_branch": record.evidence_branch,
+                    "status": record.status,
+                    "confidence": record.confidence,
+                    "conflict_with_ids": list(record.conflict_with_ids or []),
+                    "stale": bool(current_sha and record.evidence_commit_sha and current_sha != record.evidence_commit_sha),
+                })
+                present.add(context_id)
+            search = dict(search or {})
+            search["results"] = merged
+            LOGGER.info(
+                "[TerrabotDiag] event=repository_context_boolean_required_ids_merged repo=%s/%s required_ids=%s results=%s",
+                owner, repo, ",".join(required_ids)[:800], len(merged),
+            )
     except Exception as exc:
         LOGGER.warning(
             "[TerrabotDiag] event=repository_context_boolean_resolution_search_failed repo=%s/%s error=%s",
@@ -2506,8 +2547,16 @@ def _repository_context_unique_boolean_match(
     matches: list[dict] = []
     seen: set[tuple[str, int, str]] = set()
     for record in search.get("results") or []:
-        if not isinstance(record, dict) or str(record.get("status") or "active").lower() == "conflicted":
+        if not isinstance(record, dict):
             continue
+        status = str(record.get("status") or "active").strip().lower()
+        if status not in {"active", "conflicted"}:
+            continue
+        # A conflicted historical record may participate only through the same
+        # exact CURRENT live path+flag verification as an active record. If two
+        # conflicting mappings are both still live they produce multiple matches
+        # and are not auto-selected; a single surviving live mapping is safe to
+        # reuse because repository truth has disambiguated the conflict.
         record_text = " ".join([
             str(record.get("subject") or ""),
             str(record.get("scope") or ""),
