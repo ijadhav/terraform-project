@@ -1,4 +1,4 @@
- from __future__ import annotations
+from __future__ import annotations
 from typing import TYPE_CHECKING , Any, Optional
 
 if TYPE_CHECKING:
@@ -2429,11 +2429,10 @@ def _foundry_adjudicate_repository_boolean_candidates(
         )
         return adjudicated[:5]
 
-    # Never fall back from a failed/empty semantic adjudication to unrelated
-    # repository Booleans merely because they were repository-valid. A live
-    # Boolean assignment is only a syntactic candidate; it must also implement
-    # the requested resource/behavior. Returning [] lets the existing second
-    # pass / grounded clarification path run without exposing irrelevant flags.
+    # A live Boolean assignment is only a structural candidate. If Foundry
+    # cannot strongly relate it to the requested behavior, do not surface it
+    # to the user merely because it exists in the repository. Returning no
+    # candidates keeps the existing grounded clarification/generation flow.
     LOGGER.info(
         "[TerrabotDiag] event=boolean_candidate_adjudication_rejected_all input_candidates=%s agent_error=%s",
         len(candidates or []),
