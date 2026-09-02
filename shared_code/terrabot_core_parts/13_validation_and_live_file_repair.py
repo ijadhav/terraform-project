@@ -2356,6 +2356,7 @@ def _foundry_adjudicate_repository_boolean_candidates(
             "Return JSON only with keys reason and selected.",
             "Select only from validated_candidates; never invent or rename a flag/path/line.",
             "Judge semantic relevance from the user request plus scope, nearby_live_code, and repository naming/context.",
+            "Trace each candidate through nearby module/resource arguments and comments before deciding. Explain the repository relationship in description rather than relying on token overlap.",
             "Do not select a Boolean merely because it is in the same file or because of weak generic lexical overlap with the request.",
             "If exactly one control clearly implements the requested behavior, return exactly one selected item.",
             "Return multiple selected items only when they are genuinely distinct plausible implementations of the same requested behavior and a user choice is truly required.",
@@ -2541,9 +2542,10 @@ def _foundry_repository_boolean_inventory_retry(
     )
     request = {
         "task": (
-            "SECOND-PASS ENVIRONMENT BOOLEAN RESOLUTION. Before any clarification, determine whether the current "
-            "create/delete/enable/disable infrastructure request is controlled by one existing Boolean in the target "
-            "environment. Resolve colloquial wording semantically; do not generate Terraform."
+            "SECOND-PASS ENVIRONMENT BOOLEAN RESOLUTION. Before any clarification, analytically determine which live "
+            "Terraform control implements the user's requested behavior in the already-resolved target environment. "
+            "Reason from the complete environment file, the Boolean name, nearby module/resource wiring, comments, "
+            "sibling arguments and durable repository context. Resolve colloquial wording semantically; do not generate Terraform."
         ),
         "user_request": str(prompt or "").strip(),
         "operation_hint": str(operation_hint or "unknown"),
@@ -2571,17 +2573,32 @@ def _foundry_repository_boolean_inventory_retry(
             "Inspect environment controls first for create/delete/enable/disable requests before considering ordinary code edits.",
             "Choose only from literal_boolean_inventory and only when the live environment files prove the control exists.",
             "Use semantic synonyms and surrounding Terraform/module context; exact token overlap with the flag is not required.",
-            "If one control clearly implements the request, return exactly one candidate and do not ask for clarification.",
-            "Return multiple candidates only for genuine repository ambiguity.",
+            "Perform repository reasoning in this order: identify the requested behavior/resource concept; locate candidate Booleans in the target environment; trace each candidate into the adjacent module/resource invocation; reject candidates whose wiring implements a different behavior; then rank the remaining controls.",
+            "Treat common user nouns as semantic concepts rather than literal tokens. For example, a request may omit implementation suffixes such as fix/task/setup/integration or use a human description instead of the exact Terraform identifier.",
+            "If one control is materially stronger than all others after repository tracing, return exactly one candidate and do not ask for clarification.",
+            "Return multiple candidates only for genuine repository ambiguity after tracing the controls into live Terraform wiring.",
             "Use shared repository context only after revalidating its mapped flag/path against current live files.",
         ],
     }
     try:
+        LOGGER.info(
+            "[TerrabotFlow] step=target_reasoning actor=foundry action=resolve_boolean candidates=%s evidence_files=%s",
+            len(inventory),
+            len(request.get("target_environment_files") or []),
+        )
         raw = call_named_agent(json.dumps(request, ensure_ascii=False), AGENT_NAME)
         parsed = extract_json_from_text(raw)
-        return parsed if isinstance(parsed, dict) else {}
+        if isinstance(parsed, dict):
+            LOGGER.info(
+                "[TerrabotFlow] step=target_reasoning actor=foundry result=%s candidates=%s operation=%s",
+                "resolved" if parsed.get("boolean_applicable") else "not_resolved",
+                len(parsed.get("candidates") or []),
+                parsed.get("operation") or "unknown",
+            )
+            return parsed
+        return {}
     except Exception as exc:
-        LOGGER.warning("Second-pass environment Boolean resolution failed: %s", exc)
+        LOGGER.warning("[TerrabotFlow] step=target_reasoning actor=foundry result=error error=%s", str(exc)[:500])
         return {"operation": operation_hint or "unknown", "boolean_applicable": False, "candidates": [], "error": str(exc)}
 
 
@@ -2683,7 +2700,25 @@ def _validated_repository_boolean_strategy(
         strategy["validated_candidate_count"] = 0
         strategy["adjudicated_candidate_count"] = 0
         strategy["requires_user_choice"] = False
+        LOGGER.info("[TerrabotFlow] step=target_resolution actor=backend result=no_repository_control")
         return strategy, []
+
+    # The strategy/retry call above already performed semantic reasoning and the
+    # backend has literally revalidated path+line+flag against the live file. A
+    # second model adjudication of a single candidate can only discard a correct
+    # unique target (especially on small/fast models), so reserve adjudication
+    # for genuine multi-candidate ambiguity.
+    if len(validated) == 1:
+        strategy["validated_candidate_count"] = 1
+        strategy["adjudicated_candidate_count"] = 1
+        strategy["requires_user_choice"] = False
+        strategy["resolution_source"] = strategy.get("resolution_source") or "unique_live_environment_boolean"
+        LOGGER.info(
+            "[TerrabotFlow] step=target_resolution actor=backend result=unique_live_boolean path=%s flag=%s",
+            validated[0].get("path") or "",
+            validated[0].get("flag") or "",
+        )
+        return strategy, validated
 
     adjudicated = _foundry_adjudicate_repository_boolean_candidates(
         prompt, repository_evidence, validated

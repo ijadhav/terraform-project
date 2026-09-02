@@ -251,12 +251,14 @@ STRICT SAFETY RULES:
 - You may read the checked-out repositories and fetch the explicitly listed Terrabot test branches only for inspection.
 - Treat the supplied expected target and live repository as ground truth. Do not invent a different target.
 
-For each case verify:
-1. output_correct: all applicable generated output is correct. For Boolean-context cases, independently check both the Phase 1 isolated test-branch diff and the Phase 2 generated files. The exact expected flag must have the expected value in the correct repository/environment/path and unrelated content must not be changed. For resource-creation cases, check the Phase 1 generated files and branch against nearby repository patterns.
+For each case verify using repository evidence, not backend labels alone:
+1. output_correct: all applicable generated output is correct. For Boolean-context cases, independently inspect the complete expected live file at the pinned commit, identify the exact expected Boolean assignment, then compare the Phase 1 isolated test-branch diff and Phase 2 generated files. The exact expected flag must have the desired value in the correct repository/environment/path, the complete file content must remain structurally complete, and every unrelated line must remain unchanged. For resource-creation cases, inspect nearest live repository siblings and check the Phase 1 generated files and branch against those patterns.
 2. context_added: for Boolean-context cases, the Phase 1 repository-index record exists and semantically maps the alias/environment to the exact path and flag with repository evidence. Use null for resource-creation cases.
 3. context_retrievable: for Boolean-context cases, the Phase 2 live search returned that same or an equivalent exact mapping. Use null for resource-creation cases.
-4. context_reused: for Boolean-context cases, the retrieved context was attached to Foundry and Phase 2 resolved the correct target without another clarification. Use null for resource-creation cases.
+4. context_reused: for Boolean-context cases, require all three facts: the exact/equivalent context mapping was retrieved, that record was attached to the Phase 2 Foundry target-resolution/generation call, and the generated Phase 2 output actually changed the mapped path+flag correctly without another target clarification. Attachment alone is not reuse. Use null for resource-creation cases.
 5. overall_ok: true only when every applicable Cursor assertion above passes.
+
+When evidence disagrees, state exactly which boundary failed: target resolution, generation, deterministic backend validation, branch materialization, context storage/retrieval/attachment, or Cursor verification. Do not collapse these into a generic failure.
 
 The backend evidence below was collected from the live GitHub repositories, the actual generated responses, the isolated test branches, and the live repository-context index. Independently inspect the repository and branch where available, then validate the evidence correlation.
 

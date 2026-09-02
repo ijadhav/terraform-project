@@ -814,6 +814,8 @@ def resolve_repository_clarification(
         "Terrabot structured candidates:",
         json.dumps(candidate_payload, ensure_ascii=False, indent=2),
         "Inspect the complete relevant Terraform environment files and repository guidance before answering.",
+        "Use an analytical repository traversal: (1) identify the behavior/resource concept in the user's words, (2) inspect every Boolean assignment in the resolved environment file(s), (3) trace plausible flags into their module/resource arguments and nearby comments, (4) reject controls for different behavior, and (5) choose a control only when one is uniquely supported.",
+        "Do not require literal word overlap between the user phrase and the Terraform identifier; infer meaning from wiring and nearby repository context.",
         "Evaluate Terrabot's structured candidates for semantic relevance before choosing one.",
         "Do not choose a candidate merely because it is offered. If every supplied candidate is unrelated to the requested resource/behavior, reject the candidate list and independently identify the correct live repository control.",
         "If exactly one supplied candidate is genuinely correct, set resolution_type=candidate, candidates_relevant=true, and selected_index to its 1-based position.",
@@ -841,6 +843,7 @@ def resolve_repository_clarification(
             test_case_id=case_id,
             repo=f"{owner}/{repo}",
             candidate_count=len(candidate_payload),
+            prompt_chars=len(instruction),
         )
         created = _http_json(
             session,

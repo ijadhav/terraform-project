@@ -90,6 +90,19 @@ load_dotenv()
 LOGGER = logging.getLogger("terrabot.service")
 LOGGER.setLevel(logging.INFO)
 
+# Keep Function App Log Stream focused on Terrabot orchestration. Azure SDK HTTP,
+# identity-cache and lease-renewal INFO logs are operational noise for request
+# debugging; warnings/errors remain visible. This changes logging only.
+if str(os.getenv("TERRABOT_SUPPRESS_AZURE_SDK_INFO_LOGS", "true")).strip().lower() not in {"0", "false", "no"}:
+    for _azure_logger_name in (
+        "azure",
+        "azure.core.pipeline.policies.http_logging_policy",
+        "azure.identity",
+        "azure.storage",
+        "azure.data.tables",
+    ):
+        logging.getLogger(_azure_logger_name).setLevel(logging.WARNING)
+
 _TERRABOT_IO_EXECUTOR = ThreadPoolExecutor(
     max_workers=max(4, int(os.getenv("TERRABOT_IO_MAX_WORKERS", "12"))),
     thread_name_prefix="terrabot-io",

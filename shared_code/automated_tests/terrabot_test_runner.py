@@ -1364,6 +1364,7 @@ def _resolve_automated_clarifications(
             cursor_candidates_relevant=cursor_resolution.get("candidates_relevant") if cursor_resolution else "",
             cursor_selected_path=cursor_resolution.get("selected_path") if cursor_resolution else "",
             cursor_selected_flag=cursor_resolution.get("selected_flag") if cursor_resolution else "",
+            process="cursor_repo_analysis->backend_continuation",
         )
         followup = {
             "prompt": selection,
@@ -1405,6 +1406,14 @@ def _run_case(core: Any, case: TestCase, run_id: str, requester_id: str) -> Test
     phase1_result: dict = {}
     phase2_result: dict = {}
 
+    _diag(
+        "case_flow_started",
+        run_id=run_id,
+        test_case_id=case.case_id,
+        repo=f"{case.owner}/{case.repo}",
+        environment=case.environment,
+        expected_target=f"{case.path}::{case.flag}",
+    )
     _diag(
         "test_case_started",
         run_id=run_id,

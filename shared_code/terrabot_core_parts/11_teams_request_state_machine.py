@@ -2929,6 +2929,25 @@ def _prompt_guard_agent_self_validate_stage1(agent_result: dict, prompt: str) ->
         if resolved_feature_flag:
             break
 
+    # The selected Boolean is also stored in active repository evidence by the
+    # backend target resolver. Prefer that authoritative live-verified selection
+    # when retrieved_value_context did not carry the feature_flag_match forward.
+    # This prevents self-validation from re-solving an already-solved target.
+    if not resolved_feature_flag:
+        try:
+            selected = _selected_feature_flag_match_from_active_context()
+        except Exception:
+            selected = {}
+        if isinstance(selected, dict) and selected.get("flag"):
+            resolved_feature_flag = {
+                "path": str(selected.get("path") or selected.get("filename") or "").strip(),
+                "flag": str(selected.get("flag") or "").strip(),
+                "line_number": int(selected.get("line_number") or selected.get("line") or 0),
+                "current_value": str(selected.get("current_value") or "").strip().lower(),
+                "new_value": str(selected.get("new_value") or "").strip().lower(),
+                "description": str(selected.get("description") or selected.get("context") or "").strip(),
+            }
+
     validation_request = {
         "task": "VALIDATE GENERATED TERRAFORM AGAINST CURRENT USER REQUEST. Return JSON verdict only.",
         "user_request": prompt,
@@ -2939,7 +2958,8 @@ def _prompt_guard_agent_self_validate_stage1(agent_result: dict, prompt: str) ->
         "required_verdict": {"valid": True, "errors": [], "reason": "short explanation"},
         "rules": [
             "When resolved_repository_target is non-empty, the repository target has ALREADY been semantically selected and literally verified against live repository evidence. Do not rediscover or challenge that target because other flags/resources also exist in the full file.",
-            "For a resolved_repository_target, validate only that the generated file implements the stated current_value -> new_value transition for that exact path/flag and does not introduce unrelated changes.",
+            "For a resolved_repository_target, validate only that the generated file implements the stated current_value -> new_value transition for that exact path/flag and does not introduce unrelated changes. Treat that exact target as authoritative backend evidence, not as a hypothesis to reinterpret.",
+            "For a Boolean-only change, compare the target assignment directly. Do not fail merely because the compact validation excerpt omits unrelated middle sections of a large file.",
             "The generated files must implement the current user_request, not a previous or neighboring resource request.",
             "Reject output when the requested resource family/name is absent or a different resource family is generated.",
             "Reject stale paths/module sources that belong to a different request unless live repository wiring makes them strictly necessary.",
@@ -2949,6 +2969,12 @@ def _prompt_guard_agent_self_validate_stage1(agent_result: dict, prompt: str) ->
         ],
     }
     try:
+        LOGGER.info(
+            "[TerrabotFlow] step=generated_output_validation actor=foundry target=%s flag=%s files=%s",
+            resolved_feature_flag.get("path") or "unresolved",
+            resolved_feature_flag.get("flag") or "unresolved",
+            len(compact_files),
+        )
         _validation_thread, validation_text = _TEAMS_MULTICLOUD_PREVIOUS_CALL_AGENT(
             None,
             json.dumps(validation_request, separators=(",", ":")),
@@ -2964,6 +2990,7 @@ def _prompt_guard_agent_self_validate_stage1(agent_result: dict, prompt: str) ->
     if not isinstance(verdict, dict):
         raise ValueError("AGENT_SELF_VALIDATION_FAILED: validator returned a non-object verdict.")
     if verdict.get("valid") is True:
+        LOGGER.info("[TerrabotFlow] step=generated_output_validation actor=foundry result=pass")
         return
     errors = verdict.get("errors") or []
     if isinstance(errors, str):
