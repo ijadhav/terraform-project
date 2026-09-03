@@ -857,11 +857,18 @@ def _build_agent_input_for_infra_teams_v1(
         return original
 
     expected_cloud = safe_normalize_cloud(selected_cloud) or safe_normalize_cloud(context.get("expected_cloud"))
-    expected_workflow = str(workflow or context.get("expected_workflow") or "").strip()
-    if not expected_workflow and expected_cloud == "aws":
-        expected_workflow = "aws_module_consumer"
-    if not expected_workflow and expected_cloud == "azure":
-        expected_workflow = "azure_consumer_generation"
+    # Production owns workflow classification. Never manufacture a workflow from
+    # cloud identity alone. The original builder/router may already have resolved
+    # a workflow in its payload; preserve that decision when present. Otherwise
+    # leave workflow empty so the normal repository-aware routing path can infer
+    # whether this is an existing modification, consumer generation, or creation.
+    expected_workflow = str(
+        workflow
+        or context.get("expected_workflow")
+        or payload.get("workflow")
+        or payload.get("expected_workflow")
+        or ""
+    ).strip()
     expected_repo_target = (
         _teams_repo_target_for_expected(expected_cloud, expected_workflow)
         if expected_cloud else ""
@@ -961,6 +968,19 @@ def _build_agent_input_for_infra_teams_v1(
         "context_branch": context_branch,
         "context_root": context_root,
     }
+    immutable_target = context.get("resolved_repository_target_contract")
+    if isinstance(immutable_target, dict) and immutable_target:
+        payload["resolved_repository_target"] = dict(immutable_target)
+        context["expected_workflow"] = str(immutable_target.get("workflow") or expected_workflow or "").strip()
+        if context["expected_workflow"]:
+            expected_workflow = context["expected_workflow"]
+        payload["workflow"] = expected_workflow
+        LOGGER.info(
+            "[TerrabotFlow] step=target_contract actor=backend->foundry result=attached workflow=%s path=%s flag=%s",
+            expected_workflow,
+            immutable_target.get("path") or "",
+            immutable_target.get("flag") or "",
+        )
     payload["required_output"] = {
         "mode": "infra",
         "cloud": expected_cloud or "aws | azure",
@@ -993,6 +1013,8 @@ def _build_agent_input_for_infra_teams_v1(
     ]
     instructions.extend([
         "TEAMS CHANNEL OVERRIDE: apply every repository inference, safety, modification, feature-flag, default-value ladder, and __FILL__ rule from the VS Code Terrabot instructions.",
+        "WORKFLOW CLASSIFICATION MUST COME FROM THE CURRENT REQUEST + LIVE REPOSITORY EVIDENCE. Do not default an AWS request to module consumption or an Azure request to consumer creation merely because of cloud identity.",
+        "When resolved_repository_target is present, it is a current-live-repository-verified immutable target contract for this request. Preserve its workflow/path/flag/current_value/new_value across generation, self-validation, and repair. Do not broaden a single Boolean change into module/resource creation or another file.",
         "The only platform difference is repository context: use backend-provided live GitHub files from the selected remote branch instead of a local VS Code workspace.",
         "Return the Teams backend JSON shape in required_output. Include mode, cloud, workflow, repo_target, title, branch_name, summary, analysis, files, user_fillable, questions, and validation_commands.",
         "For a confirmed AWS module selection, use exactly the selected module_source and module inputs from retrieved_module_context. Do not restart module discovery and do not return an empty files array.",

@@ -955,6 +955,54 @@ def _teams_run_generation_hard_validations(
         )
     return result
 
+def _teams_semantic_operation_classification(prompt: str, target_cloud: str) -> dict:
+    """Classify operation shape without selecting any repository implementation.
+
+    This intentionally contains no resource, flag, module, or path mapping. The
+    Foundry agent decides only whether the user is modifying existing infra or
+    asking for creation/consumption; repository target selection remains a live
+    repository task later in the workflow.
+    """
+    request = {
+        "task": "Classify only the infrastructure operation shape for routing. Do not generate Terraform and do not choose a file, module, resource, flag, or path.",
+        "user_request": str(prompt or "").strip(),
+        "cloud": str(target_cloud or "").strip().lower(),
+        "required_output": {
+            "operation_shape": "existing_modification|creation_or_consumer|unclear",
+            "reason": "one short semantic explanation",
+        },
+        "rules": [
+            "Return JSON only.",
+            "existing_modification means the request changes, enables, disables, decommissions, deletes, or updates infrastructure described as already present; do not infer the exact implementation.",
+            "creation_or_consumer means the request clearly asks for a new infrastructure instance/module/consumer rather than changing an existing repository-controlled capability.",
+            "When wording could mean either, return unclear so live repository analysis can decide later.",
+            "Never return resource names, Terraform identifiers, paths, flags, or module names.",
+        ],
+    }
+    try:
+        _conversation, raw = call_agent(None, json.dumps(request, ensure_ascii=False))
+        parsed = extract_json_from_text(raw)
+        if not isinstance(parsed, dict):
+            return {"operation_shape": "unclear", "reason": "non-object classifier response"}
+        shape = str(parsed.get("operation_shape") or "").strip().lower()
+        if shape not in {"existing_modification", "creation_or_consumer", "unclear"}:
+            shape = "unclear"
+        return {"operation_shape": shape, "reason": str(parsed.get("reason") or "").strip()}
+    except Exception as exc:
+        LOGGER.warning("[TerrabotFlow] step=workflow_classification actor=foundry result=failed error=%s", exc)
+        return {"operation_shape": "unclear", "reason": str(exc)}
+
+
+def _teams_existing_modification_workflow_for_cloud(target_cloud: str) -> str:
+    """Return the one already-defined modification workflow for the cloud."""
+    cloud = str(target_cloud or "").strip().lower()
+    candidates = sorted(
+        str(value) for value in INFRA_MODIFICATION_WORKFLOWS
+        if str(value).startswith(cloud + "_")
+    )
+    return candidates[0] if len(candidates) == 1 else ""
+
+
 def handle_chat_request(data: dict):
     data = data or {}
 
@@ -1897,6 +1945,38 @@ def handle_chat_request(data: dict):
             target_cloud,
             requested_workflow=requested_workflow,
         ) or router_decision.workflow
+
+        # The normal inference can confuse colloquial existing-resource wording
+        # with a module-consumer/create request. Ask Foundry one small semantic
+        # routing question before repository discovery. This is generic: no
+        # resource/flag/path names exist in backend code. Explicit continuation
+        # workflow state (for example Phase 2) remains immutable and wins.
+        if (
+            request_source == "teams"
+            and target_cloud
+            and not requested_workflow
+            and str(effective_workflow or "").strip() not in INFRA_MODIFICATION_WORKFLOWS
+        ):
+            operation_class = _teams_semantic_operation_classification(
+                effective_prompt, target_cloud
+            )
+            if operation_class.get("operation_shape") == "existing_modification":
+                modification_workflow = _teams_existing_modification_workflow_for_cloud(target_cloud)
+                if modification_workflow:
+                    LOGGER.info(
+                        "[TerrabotFlow] step=workflow_classification actor=foundry->backend result=existing_modification previous=%s resolved=%s reason=%s",
+                        effective_workflow or "<none>",
+                        modification_workflow,
+                        str(operation_class.get("reason") or "")[:300],
+                    )
+                    effective_workflow = modification_workflow
+            else:
+                LOGGER.info(
+                    "[TerrabotFlow] step=workflow_classification actor=foundry->backend result=%s workflow=%s reason=%s",
+                    operation_class.get("operation_shape") or "unclear",
+                    effective_workflow or "<none>",
+                    str(operation_class.get("reason") or "")[:300],
+                )
 
         # Bind the FINAL cloud/repository/workflow before repository-context
         # search or semantic target resolution. Early Teams state can still

@@ -252,6 +252,7 @@ class TestRunResult:
     requested_cases: int
     cases: list[TestCaseResult] = field(default_factory=list)
     discovery_errors: list[str] = field(default_factory=list)
+    repository_question_checks: list[dict[str, Any]] = field(default_factory=list)
     duration_ms: int = 0
 
 
@@ -1054,9 +1055,22 @@ def _ensure_context_mapping(
     *,
     evidence_branch: str = "",
     evidence_commit_sha: str = "",
+    subject_override: str = "",
+    statement_override: str = "",
+    source_suffix: str = "",
 ) -> bool:
+    subject_value = re.sub(r"\s+", " ", str(subject_override or case.alias or "")).strip()
     try:
-        existing = _search_context(case)
+        if subject_override:
+            existing = repository_context.search_repository_context(
+                repo_owner=case.owner,
+                repo_name=case.repo,
+                query=f"{subject_value} {case.environment}",
+                current_commit_sha=str(evidence_commit_sha or case.commit_sha),
+                top_k=12,
+            )
+        else:
+            existing = _search_context(case)
     except Exception as exc:
         _diag(
             "context_mapping_search_failed",
@@ -1069,7 +1083,14 @@ def _ensure_context_mapping(
             error=exc,
         )
         raise
-    if _matching_context_record(case, existing):
+    existing_match = _matching_context_record(case, existing)
+    if existing_match and (
+        not subject_override
+        or subject_value.lower() in " ".join([
+            str(existing_match.get("subject") or ""),
+            str(existing_match.get("statement") or ""),
+        ]).lower()
+    ):
         _diag(
             "context_mapping_already_present",
             run_id=run_id,
@@ -1131,13 +1152,13 @@ def _ensure_context_mapping(
             fallback_evidence_line=evidence_line,
         )
 
-    statement = (
-        f"In {case.repo}, {case.alias} maps to Boolean control {case.flag} "
+    statement = str(statement_override or "").strip() or (
+        f"In {case.repo}, {subject_value} maps to Boolean control {case.flag} "
         f"in {case.path} for environment {case.environment}."
     )
     candidate = {
         "category": "resolved_clarification",
-        "subject": case.alias,
+        "subject": subject_value,
         "scope": case.environment,
         "statement": statement,
         "confidence": 0.99,
@@ -1163,7 +1184,9 @@ def _ensure_context_mapping(
             repo_name=case.repo,
             evidence_commit_sha=commit_sha,
             evidence_branch=ref,
-            source_task_hash=hashlib.sha256(f"{run_id}:{case.case_id}:{ref}".encode()).hexdigest(),
+            source_task_hash=hashlib.sha256(
+                f"{run_id}:{case.case_id}:{ref}:{source_suffix}:{subject_value}".encode()
+            ).hexdigest(),
             candidate=candidate,
             evidence_fetcher=evidence_fetcher,
         )
@@ -1354,6 +1377,23 @@ def _resolve_automated_clarifications(
             original_prompt=case.phase1_prompt if phase == 1 else case.phase2_prompt,
             clarification_text=clarification_text,
             candidates=candidates,
+            # Cursor authored/validated the test prompt from this immutable test
+            # target. Supplying the oracle back to Cursor makes clarification an
+            # additive teaching step rather than a blind second discovery task.
+            # Cursor must still verify it against the pinned live repository, and
+            # the backend independently verifies the returned path/flag again.
+            expected_target_hint=(
+                {
+                    "path": case.path,
+                    "flag": case.flag,
+                    "current_value": case.current_value,
+                    "new_value": case.desired_value,
+                    "environment": case.environment,
+                    "alias": case.alias,
+                }
+                if case.case_type == "boolean_context"
+                else None
+            ),
             run_id=run_id,
             case_id=case.case_id,
             log_event=_diag,
@@ -1780,6 +1820,45 @@ def _run_case(core: Any, case: TestCase, run_id: str, requester_id: str) -> Test
                 flag=case.flag,
             )
 
+        # Add the NATURAL-LANGUAGE request wording as a second repository-context
+        # synonym only after validated branch transport. This is the additive
+        # learning loop: future users do not have to use the same alias that the
+        # initial deterministic repository scan derived. The mapping remains
+        # live-file validated by repository_context.add_repository_context.
+        if row.branch_pushed and row.context_stored and case.phase1_prompt:
+            try:
+                learned = _ensure_context_mapping(
+                    core,
+                    case,
+                    run_id,
+                    evidence_branch=row.branch_name or case.branch,
+                    evidence_commit_sha=_branch_head_sha(core, case, row.branch_name) or case.commit_sha,
+                    subject_override=case.phase1_prompt,
+                    statement_override=(
+                        f"In {case.repo} environment {case.environment}, a request phrased as "
+                        f"'{case.phase1_prompt}' refers to Boolean control {case.flag} in {case.path}."
+                    ),
+                    source_suffix="phase1_natural_language_learning",
+                )
+                _diag(
+                    "repository_context_learning_variant_persisted",
+                    run_id=run_id,
+                    test_case_id=case.case_id,
+                    phase=1,
+                    stored=learned,
+                    path=case.path,
+                    flag=case.flag,
+                )
+            except Exception as exc:
+                _diag(
+                    "repository_context_learning_variant_failed",
+                    level="warning",
+                    run_id=run_id,
+                    test_case_id=case.case_id,
+                    phase=1,
+                    error=exc,
+                )
+
         # Capture the actual indexed record after production learning or the
         # verified harness promotion. Cursor later checks its semantics and
         # correlates it with the independent Phase 2 search result.
@@ -1811,6 +1890,7 @@ def _run_case(core: Any, case: TestCase, run_id: str, requester_id: str) -> Test
             )
         if phase2_match and str(phase2_match.get("id") or "").strip():
             phase2_request["required_repository_context_ids"] = [str(phase2_match.get("id"))]
+            phase2_request["repository_context_reuse_required"] = True
         phase2_result, status = _invoke_backend(core, phase2_request, row)
         row.phase2_mode = str(phase2_result.get("mode") or "").lower()
         row.phase2_control_mentioned = _control_mentioned(case, phase2_result)
@@ -1879,6 +1959,38 @@ def _run_case(core: Any, case: TestCase, run_id: str, requester_id: str) -> Test
             and row.phase2_target_ok
             and row.phase2_reused_without_clarification
         )
+        if row.phase2_context_useful and row.branch_pushed and case.phase2_prompt:
+            try:
+                _ensure_context_mapping(
+                    core,
+                    case,
+                    run_id,
+                    evidence_branch=row.branch_name or case.branch,
+                    evidence_commit_sha=_branch_head_sha(core, case, row.branch_name) or case.commit_sha,
+                    subject_override=case.phase2_prompt,
+                    statement_override=(
+                        f"In {case.repo} environment {case.environment}, a request phrased as "
+                        f"'{case.phase2_prompt}' refers to Boolean control {case.flag} in {case.path}."
+                    ),
+                    source_suffix="phase2_reused_phrase_learning",
+                )
+                _diag(
+                    "repository_context_learning_variant_persisted",
+                    run_id=run_id,
+                    test_case_id=case.case_id,
+                    phase=2,
+                    path=case.path,
+                    flag=case.flag,
+                )
+            except Exception as exc:
+                _diag(
+                    "repository_context_learning_variant_failed",
+                    level="warning",
+                    run_id=run_id,
+                    test_case_id=case.case_id,
+                    phase=2,
+                    error=exc,
+                )
         row.cursor_evidence["phase2"] = {
             "first_mode": first_phase2_mode,
             "final_mode": str(phase2_result.get("mode") or ""),
@@ -1950,6 +2062,112 @@ def _repo_specs(core: Any, cloud_filter: str) -> list[RepositorySpec]:
         if owner and repo:
             specs.append(RepositorySpec("azure", owner, repo, branch))
     return specs
+
+
+def _run_repository_question_checks(
+    core: Any,
+    specs: list[RepositorySpec],
+    *,
+    run_id: str,
+    requester_id: str,
+) -> list[dict[str, Any]]:
+    """Use Cursor to author and independently validate repo/workflow questions.
+
+    These checks exercise Terrabot's plain-language repository Q&A path without
+    creating Terraform, branches, or PRs. They are supplemental and currently
+    run only in exploration/mixed modes so regression mutation-case scoring
+    remains backward compatible.
+    """
+    try:
+        per_repo = int(os.getenv("TERRABOT_TEST_CURSOR_REPOSITORY_QUESTION_CASES", "1"))
+    except (TypeError, ValueError):
+        per_repo = 1
+    per_repo = max(0, min(per_repo, 3))
+    if per_repo <= 0:
+        return []
+    checks: list[dict[str, Any]] = []
+    for spec in specs:
+        try:
+            commit_sha = core.github_get_base_branch_sha_by_repo(spec.owner, spec.repo, spec.branch)
+        except Exception as exc:
+            _diag("repository_question_commit_resolution_failed", level="warning", run_id=run_id, repo=f"{spec.owner}/{spec.repo}", error=exc)
+            continue
+        questions = cursor_prompt_provider.generate_repository_questions(
+            owner=spec.owner,
+            repo=spec.repo,
+            commit_sha=str(commit_sha or ""),
+            run_id=run_id,
+            count=per_repo,
+            log_event=_diag,
+        )
+        for item in questions:
+            qid = f"{spec.cloud}-{item.get('question_id') or uuid.uuid4().hex[:6]}"
+            conversation_id = f"terrabot-test::{requester_id}::{run_id}::{qid}::repo-question"
+            request = {
+                "prompt": str(item.get("question") or ""),
+                "original_prompt": str(item.get("question") or ""),
+                "teams_conversation_id": conversation_id,
+                "memory_conversation_id": f"{conversation_id}::memory::{uuid.uuid4().hex}",
+                "teams_requester": f"terrabot-test-repo-question-{run_id[-6:]}",
+                "source": "teams",
+                "mode": "chat",
+                "test_mode": True,
+                "automated_test_phase": 0,
+                "automated_test_case_id": qid,
+                "cloud": spec.cloud,
+                "requested_cloud": spec.cloud,
+            }
+            started = time.monotonic()
+            try:
+                response, status = core.handle_teams_chat_request(request)
+                answer = str((response or {}).get("reply") or "").strip()
+                backend_mode = str((response or {}).get("mode") or "").strip().lower()
+                backend_ok = bool(status < 400 and answer and backend_mode == "chat")
+            except Exception as exc:
+                response, status, answer, backend_mode, backend_ok = {}, 500, "", "", False
+                _diag("repository_question_backend_failed", level="warning", run_id=run_id, question_id=qid, error=exc)
+            validation = cursor_prompt_provider.validate_repository_answer(
+                owner=spec.owner,
+                repo=spec.repo,
+                commit_sha=str(commit_sha or ""),
+                question=str(item.get("question") or ""),
+                terrabot_answer=answer,
+                expected_answer=str(item.get("expected_answer") or ""),
+                evidence_paths=list(item.get("evidence_paths") or []),
+                run_id=run_id,
+                question_id=qid,
+                log_event=_diag,
+            ) if backend_ok else {"completed": False, "correct": False, "reason": "Terrabot did not return a normal chat answer.", "evidence": [], "error": "backend_chat_failed"}
+            check = {
+                "question_id": qid,
+                "cloud": spec.cloud,
+                "repository": f"{spec.owner}/{spec.repo}",
+                "commit_sha": str(commit_sha or ""),
+                "question": str(item.get("question") or ""),
+                "expected_answer": str(item.get("expected_answer") or ""),
+                "evidence_paths": list(item.get("evidence_paths") or []),
+                "terrabot_answer": answer,
+                "backend_status": status,
+                "backend_mode": backend_mode,
+                "backend_ok": backend_ok,
+                "cursor_completed": bool(validation.get("completed")),
+                "cursor_correct": bool(validation.get("correct")),
+                "cursor_reason": str(validation.get("reason") or ""),
+                "cursor_evidence": list(validation.get("evidence") or []),
+                "cursor_error": str(validation.get("error") or ""),
+                "duration_ms": int((time.monotonic() - started) * 1000),
+            }
+            checks.append(check)
+            _diag(
+                "repository_question_check_completed",
+                run_id=run_id,
+                question_id=qid,
+                repo=check["repository"],
+                backend_ok=backend_ok,
+                cursor_correct=check["cursor_correct"],
+                duration_ms=check["duration_ms"],
+            )
+    return checks
 
 
 def _derive_test_cases(core: Any, cloud_filter: str, count: int, run_id: str, run_mode: str = "regression") -> tuple[list[TestCase], list[str]]:
@@ -2214,6 +2432,11 @@ def format_test_run_report(run: TestRunResult) -> str:
         int(item.phase1_cursor_clarification_failed) + int(item.phase2_cursor_clarification_failed)
         for item in run.cases
     )
+    repository_questions = list(run.repository_question_checks or [])
+    repository_questions_correct = sum(
+        1 for item in repository_questions
+        if item.get("backend_ok") and item.get("cursor_completed") and item.get("cursor_correct")
+    )
 
     lines = [
         "**Terrabot automated repository-context test results**",
@@ -2225,6 +2448,11 @@ def format_test_run_report(run: TestRunResult) -> str:
         f"Unexpected free-form clarifications: **P1 {freeform_p1} / P2 {freeform_p2}** | Cursor clarification assists: **{cursor_clarifications}** (attempts **{cursor_clarification_attempts}**, failures **{cursor_clarification_failures}**) | Context-attachment backend defects: **{context_attach_defects}**",
         f"Average backend calls/case: **{avg_calls}** | Average case time: **{avg_seconds}s** | Total: **{round(run.duration_ms / 1000.0, 1)}s**",
     ]
+    if repository_questions:
+        lines.append(
+            f"Cursor repository/workflow Q&A checks: **{repository_questions_correct}/{len(repository_questions)}** correct "
+            "(read-only questions authored from the pinned repositories and independently validated by Cursor)"
+        )
     if cursor_cases:
         lines.append(
             f"Cursor independent review: **{cursor_reviewed}/{len(cursor_cases)}** completed | "
@@ -2327,6 +2555,27 @@ def format_test_run_report(run: TestRunResult) -> str:
                     context_reused_status,
                     _cursor_status(item, "cursor_overall_ok"),
                     _escape_table(reason, 100),
+                ])
+                + " |"
+            )
+
+    if repository_questions:
+        lines.extend([
+            "",
+            "**Cursor repository/workflow Q&A checks**",
+            "| Check | Repository | Question | Terrabot answer | Cursor verified | Reason |",
+            "|---|---|---|---|---|---|",
+        ])
+        for check in repository_questions:
+            lines.append(
+                "| "
+                + " | ".join([
+                    _escape_table(check.get("question_id") or "", 22),
+                    _escape_table(check.get("repository") or "", 32),
+                    _escape_table(check.get("question") or "", 60),
+                    _escape_table(check.get("terrabot_answer") or "", 80),
+                    _status(bool(check.get("backend_ok") and check.get("cursor_completed") and check.get("cursor_correct"))),
+                    _escape_table(check.get("cursor_reason") or check.get("cursor_error") or "", 90),
                 ])
                 + " |"
             )
@@ -2614,6 +2863,27 @@ def execute_automated_test_job(core: Any, job: dict) -> str:
                 except Exception as exc:
                     _diag("repository_context_revalidation_failed", level="warning", run_id=run_id, repo=f"{spec.owner}/{spec.repo}", error=exc)
         cases, discovery_errors = _derive_test_cases(core, cloud_filter, count, run_id, run_mode=run_mode)
+        # When enabled, Cursor now actively authors the mutation prompts from the
+        # pinned repositories instead of being only a post-run validator. Target
+        # metadata remains immutable; Cursor varies realistic developer language
+        # across creation/provisioning, modification, enable/disable and
+        # decommission/delete-style requests while preserving test intent.
+        try:
+            cases = cursor_prompt_provider.apply_cursor_generated_prompts(
+                cases,
+                run_id=run_id,
+                log_event=_diag,
+            )
+        except Exception as exc:
+            # Respect the provider's fail-open/fail-closed behavior. The helper
+            # only raises when configured fail-open=false.
+            _diag(
+                "cursor_prompt_generation_job_failed",
+                level="error",
+                run_id=run_id,
+                error=exc,
+            )
+            raise
         result = TestRunResult(run_id=run_id, requested_cases=count, discovery_errors=discovery_errors)
         indexed_cases = list(enumerate(cases, start=1))
         completed_by_index: dict[int, TestCaseResult] = {}
@@ -2648,6 +2918,22 @@ def execute_automated_test_job(core: Any, job: dict) -> str:
                 )
 
         result.cases = [completed_by_index[index] for index in sorted(completed_by_index)]
+
+        if run_mode in {"exploration", "mixed"}:
+            try:
+                result.repository_question_checks = _run_repository_question_checks(
+                    core,
+                    _repo_specs(core, cloud_filter),
+                    run_id=run_id,
+                    requester_id=aad_object_id,
+                )
+            except Exception as exc:
+                _diag(
+                    "repository_question_checks_failed",
+                    level="warning",
+                    run_id=run_id,
+                    error=exc,
+                )
 
         # Deterministic backend checks have already completed and gated every
         # branch push. Run one independent read-only Cursor review across the
@@ -2703,6 +2989,7 @@ def execute_automated_test_job(core: Any, job: dict) -> str:
             "completed_at": terrabot_test_state.utc_now(),
             "duration_ms": result.duration_ms,
             "discovery_errors": discovery_errors,
+            "repository_question_checks": list(result.repository_question_checks),
             "cursor_validation": {
                 "enabled": bool(cursor_validation.get("enabled")),
                 "completed": bool(cursor_validation.get("completed")),

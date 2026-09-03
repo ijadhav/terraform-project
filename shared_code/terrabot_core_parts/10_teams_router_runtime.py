@@ -2439,6 +2439,7 @@ def _teams_repository_context_live_files(
     branch: str,
     search_result: dict,
     max_files: int = 8,
+    required_context_ids: list[str] | None = None,
 ) -> list[dict]:
     """Re-read current files referenced by retrieved repository context.
 
@@ -2448,12 +2449,15 @@ def _teams_repository_context_live_files(
     it can validate that mapping before choosing the implementation target.
     """
     results = [item for item in (search_result.get("results") or []) if isinstance(item, dict)]
+    required_ids = {str(value).strip() for value in (required_context_ids or []) if str(value).strip()}
     path_context: dict[str, dict] = {}
     for result in results:
-        # Conflicted records are never promoted into decision evidence. Stale
-        # records may still suggest a path, but the current file below is the
-        # only source of truth and the agent is told to revalidate semantics.
-        if str(result.get("status") or "").strip().lower() == "conflicted":
+        # Conflicted records normally remain historical hints only. A record
+        # explicitly required by a continuation/test may still contribute its
+        # evidence PATH so current GitHub can resolve the conflict. The stored
+        # statement is never treated as current truth without the live file.
+        result_id = str(result.get("id") or "").strip()
+        if str(result.get("status") or "").strip().lower() == "conflicted" and result_id not in required_ids:
             continue
         context_id = str(result.get("id") or "").strip()
         subject = str(result.get("subject") or "").strip()
@@ -2467,7 +2471,10 @@ def _teams_repository_context_live_files(
                 "subjects": [],
                 "statements": [],
                 "stale_context": False,
+                "required_context": False,
             })
+            if result_id and result_id in required_ids:
+                entry["required_context"] = True
             if context_id and context_id not in entry["context_ids"]:
                 entry["context_ids"].append(context_id)
             if subject and subject not in entry["subjects"]:
@@ -2504,6 +2511,45 @@ def _teams_repository_context_live_files(
             **metadata,
         })
     return live_files
+
+
+def _teams_required_repository_context_block(search_result: dict, required_ids: list[str]) -> str:
+    """Format required continuation records even when the normal formatter omits them.
+
+    This does not make historical context authoritative. It guarantees transport
+    of the exact record IDs selected by the caller, while live repository files
+    remain the mandatory verification source before target selection.
+    """
+    wanted = {str(value).strip() for value in (required_ids or []) if str(value).strip()}
+    if not wanted:
+        return ""
+    rows: list[str] = []
+    for item in search_result.get("results") or []:
+        if not isinstance(item, dict):
+            continue
+        context_id = str(item.get("id") or "").strip()
+        if context_id not in wanted:
+            continue
+        rows.append(
+            json.dumps({
+                "id": context_id,
+                "category": str(item.get("category") or ""),
+                "subject": str(item.get("subject") or ""),
+                "scope": str(item.get("scope") or ""),
+                "statement": str(item.get("statement") or ""),
+                "evidence_paths": [str(value) for value in (item.get("evidence_paths") or [])],
+                "status": str(item.get("status") or "active"),
+                "confidence": item.get("confidence"),
+                "required_continuation_record": True,
+                "must_revalidate_against_current_live_repository": True,
+            }, ensure_ascii=False)
+        )
+    if not rows:
+        return ""
+    return (
+        "MANDATORY REQUIRED REPOSITORY CONTEXT RECORDS (transported by exact ID; live code remains authoritative):\n"
+        + "\n".join(rows)
+    )
 
 
 def _teams_attach_repository_context(agent_input: str, active: dict) -> str:
@@ -2558,6 +2604,11 @@ def _teams_attach_repository_context(agent_input: str, active: dict) -> str:
                 "[TerrabotDiag] event=repository_context_prefetch_failed repo=%s/%s error=%s",
                 owner, repo, exc,
             )
+    required_ids = [
+        str(value).strip()
+        for value in (active.get("required_repository_context_ids") or payload.get("required_repository_context_ids") or [])
+        if str(value).strip()
+    ]
     try:
         if prefetched is not None:
             branch = str(prefetched.get("branch") or preferred_branch or "main")
@@ -2571,11 +2622,6 @@ def _teams_attach_repository_context(agent_input: str, active: dict) -> str:
                 query=prompt_for_relevance,
                 current_commit_sha=current_sha,
             )
-        required_ids = [
-            str(value).strip()
-            for value in (active.get("required_repository_context_ids") or payload.get("required_repository_context_ids") or [])
-            if str(value).strip()
-        ]
         if required_ids:
             merged_results = [dict(item) for item in (search_result.get("results") or []) if isinstance(item, dict)]
             present_ids = {str(item.get("id") or "").strip() for item in merged_results}
@@ -2613,6 +2659,13 @@ def _teams_attach_repository_context(agent_input: str, active: dict) -> str:
             search_result = dict(search_result or {})
             search_result["results"] = merged_results
         context_block = shared_repository_context.format_repository_context_for_agent(search_result)
+        required_context_block = _teams_required_repository_context_block(search_result, required_ids)
+        if required_context_block:
+            context_block = (context_block.rstrip() + "\n\n" + required_context_block).strip() if context_block else required_context_block
+            LOGGER.info(
+                "[TerrabotDiag] event=repository_context_required_records_forced_into_attachment repo=%s/%s required_ids=%s",
+                owner, repo, ",".join(required_ids)[:800],
+            )
         LOGGER.info(
             "[TerrabotDiag] event=repository_context_search_complete repo=%s/%s query=%r results=%s ids=%s",
             owner, repo, prompt_for_relevance[:180], len(search_result.get("results") or []),
@@ -2687,6 +2740,9 @@ def _teams_attach_repository_context(agent_input: str, active: dict) -> str:
     if context_block:
         payload["shared_repository_context"] = context_block
         payload["shared_repository_context_record_ids"] = selected_ids
+        if required_ids:
+            payload["required_repository_context_ids"] = list(required_ids)
+            payload["required_repository_context_reuse"] = True
         LOGGER.info(
             "[TerrabotDiag] event=repository_context_attachment_complete repo=%s/%s attached=true context_ids=%s",
             owner, repo, ",".join(selected_ids)[:800],
@@ -2700,7 +2756,7 @@ def _teams_attach_repository_context(agent_input: str, active: dict) -> str:
             "conflicted_count": int(search_result.get("conflicted_count") or 0),
         }
         live_context_files = _teams_repository_context_live_files(
-            owner, repo, branch, search_result
+            owner, repo, branch, search_result, required_context_ids=required_ids
         )
         if live_context_files:
             payload["shared_repository_context_live_files"] = live_context_files
@@ -2709,6 +2765,7 @@ def _teams_attach_repository_context(agent_input: str, active: dict) -> str:
             "SHARED CONTEXT DECISION RULE: shared_repository_context is a semantic hint from prior validated repository work. Validate every mapping against shared_repository_context_live_files and the other current live repository evidence before using it.",
             "If a retrieved context item maps the current user phrase to a flag/module/resource and the CURRENT live file still proves that mapping, use that repository control directly; do not ask the user for its file path, variable name, module name, or permission.",
             "If the current live file disproves or no longer contains the mapped control, ignore the stale mapping and continue live repository discovery.",
+            "When required_repository_context_reuse=true, the required record IDs are a mandatory continuation input. Revalidate their evidence paths against CURRENT live repository content before target selection. If exactly one required mapping remains live-valid, use it directly and do not ask another target clarification.",
         ])
         payload["instructions"] = instructions
     else:

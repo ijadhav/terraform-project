@@ -33,6 +33,8 @@ _SUCCESS_STATUSES = {"FINISHED", "COMPLETED", "SUCCEEDED", "SUCCESS"}
 _FAILURE_STATUSES = {"ERROR", "FAILED", "CANCELLED", "CANCELED", "EXPIRED"}
 _SCHEMA_VERSION = "terrabot.cursor.test-prompts.v1"
 _CLARIFICATION_SCHEMA_VERSION = "terrabot.cursor.clarification.v1"
+_REPO_QUESTION_SCHEMA_VERSION = "terrabot.cursor.repository-questions.v1"
+_REPO_ANSWER_SCHEMA_VERSION = "terrabot.cursor.repository-answer-validation.v1"
 
 
 class CursorPromptError(RuntimeError):
@@ -40,7 +42,10 @@ class CursorPromptError(RuntimeError):
 
 
 def _enabled() -> bool:
-    value = os.getenv("TERRABOT_CURSOR_PROMPT_GENERATION_ENABLED", "false")
+    # Automated testing is now intentionally Cursor-additive by default. If no
+    # Cursor key is configured the provider still fails open through the
+    # existing fallback path, so normal backend-derived tests remain usable.
+    value = os.getenv("TERRABOT_CURSOR_PROMPT_GENERATION_ENABLED", "true")
     return value.strip().lower() in _TRUE_VALUES
 
 
@@ -168,7 +173,9 @@ def _build_cursor_instruction(cases: Sequence[Any], run_id: str) -> str:
             "4. The candidate target metadata below is immutable. Do not change path, flag, environment, values, repository, or case IDs.",
             "5. Produce only two concise, realistic Teams-style user prompts per case. Phase 2 must be a semantic paraphrase of Phase 1.",
             "6. The prompts should describe the requested behavior naturally. Avoid exposing the expected file path or implementation details unless natural user language requires them.",
-            "7. Return JSON only. Do not wrap it in Markdown and do not add commentary.",
+            "7. Vary infrastructure language across cases so Terrabot is exercised like a real infra team: creation/provisioning, enablement, disablement/decommissioning/deletion wording, and targeted modification/update wording. Keep each prompt consistent with the immutable desired transition and repository semantics; do not ask for destructive deletion when the immutable test is only a reversible Boolean toggle unless repository evidence shows that users naturally describe that toggle as decommissioning/removal.",
+            "8. Prefer developer-style descriptions of the resource behavior over Terraform identifier wording. Use repository vocabulary and nearby module/resource semantics, not a direct humanization of the flag name.",
+            "9. Return JSON only. Do not wrap it in Markdown and do not add commentary.",
             "",
             "Primary Terraform authoring context:",
             f"- context sha256: {context_sha or 'unavailable'}",
@@ -893,6 +900,7 @@ def resolve_repository_clarification(
     original_prompt: str,
     clarification_text: str,
     candidates: Sequence[dict[str, Any]] | None = None,
+    expected_target_hint: dict[str, Any] | None = None,
     run_id: str = "",
     case_id: str = "",
     session: Any | None = None,
@@ -929,7 +937,7 @@ def resolve_repository_clarification(
     request_timeout = _float_setting("TERRABOT_CURSOR_REQUEST_TIMEOUT_SECONDS", 30.0, 5.0, 120.0)
     run_timeout = _float_setting(
         "TERRABOT_CURSOR_CLARIFICATION_RUN_TIMEOUT_SECONDS",
-        _float_setting("TERRABOT_CURSOR_RUN_TIMEOUT_SECONDS", 180.0, 15.0, 1800.0),
+        _float_setting("TERRABOT_CURSOR_RUN_TIMEOUT_SECONDS", 90.0, 15.0, 1800.0),
         15.0,
         600.0,
     )
@@ -940,6 +948,7 @@ def resolve_repository_clarification(
         "Accept": "application/json",
     }
     candidate_payload = [dict(item) for item in (candidates or []) if isinstance(item, dict)]
+    oracle_hint = dict(expected_target_hint or {}) if isinstance(expected_target_hint, dict) else {}
     instruction = "\n".join([
         "You are resolving one Terrabot infrastructure clarification using only the pinned repository.",
         "This is a read-only repository-analysis task. Do not edit, commit, push, create branches, or open PRs.",
@@ -949,6 +958,10 @@ def resolve_repository_clarification(
         f"Terrabot clarification: {clarification_text}",
         "Terrabot structured candidates:",
         json.dumps(candidate_payload, ensure_ascii=False, indent=2),
+        "Automated-test oracle hint (test-only; NOT backend authority):",
+        json.dumps(oracle_hint, ensure_ascii=False, indent=2),
+        "When an automated-test oracle hint is supplied, treat it only as the target that the test author intended when creating this prompt. Independently verify its exact path/flag/current value against the pinned repository before returning it. If live repository evidence disproves it, reject the hint and resolve from repository evidence instead. Never blindly echo the hint.",
+        "FAST TEST-ORACLE MODE: when the oracle hint contains a path+flag, inspect that exact file first and verify the literal assignment immediately. Do not perform a broad repository scan unless the hinted live file disproves the test oracle. This clarification should normally finish after one targeted repository read.",
         "Inspect the complete relevant Terraform environment files and repository guidance before answering.",
         "Use an analytical repository traversal: (1) identify the behavior/resource concept in the user's words, (2) inspect every Boolean assignment in the resolved environment file(s), (3) trace plausible flags into their module/resource arguments and nearby comments, (4) reject controls for different behavior, and (5) choose a control only when one is uniquely supported.",
         "Do not require literal word overlap between the user phrase and the Terraform identifier; infer meaning from wiring and nearby repository context.",
@@ -1172,3 +1185,240 @@ def resolve_repository_clarification(
             "answer": "",
             "error": re.sub(r"\s+", " ", str(exc)).strip()[:1600],
         }
+
+
+def generate_repository_questions(
+    *,
+    owner: str,
+    repo: str,
+    commit_sha: str,
+    run_id: str,
+    count: int = 1,
+    session: Any | None = None,
+    log_event: Callable[..., None] | None = None,
+) -> list[dict[str, Any]]:
+    """Ask Cursor to design repository/workflow questions from live code.
+
+    This is deliberately separate from infrastructure mutation cases. Cursor
+    inspects the pinned repository and creates questions that a developer could
+    naturally ask the infra team about repository behavior, placement, modules,
+    environments, validation, or workflow conventions. Terrabot's answer is
+    later independently checked by Cursor against the same pinned repository.
+    """
+    count = max(1, min(int(count or 1), 4))
+    api_key = _api_key()
+    if not api_key:
+        _emit(
+            "cursor_repository_question_generation_skipped",
+            level="warning",
+            log_event=log_event,
+            run_id=run_id,
+            repo=f"{owner}/{repo}",
+            reason="TERRABOT_CURSOR_API_KEY/CURSOR_API_KEY is not configured",
+        )
+        return []
+    http = session or requests.Session()
+    base_url = _base_url()
+    request_timeout = _float_setting("TERRABOT_CURSOR_REQUEST_TIMEOUT_SECONDS", 30.0, 5.0, 120.0)
+    run_timeout = _float_setting("TERRABOT_CURSOR_REPOSITORY_QUESTION_TIMEOUT_SECONDS", 180.0, 30.0, 600.0)
+    poll_interval = _float_setting("TERRABOT_CURSOR_POLL_INTERVAL_SECONDS", 2.0, 0.2, 30.0)
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    instruction = "\n".join([
+        "Design realistic read-only Terrabot repository/workflow questions for developers.",
+        f"Repository: https://github.com/{owner}/{repo}",
+        f"Exact commit: {commit_sha}",
+        f"Generate exactly {count} question(s).",
+        "Inspect the repository before writing questions: Terraform files, environment folders, modules, README/module READMEs, pipeline files, .github guidance/templates, and .serena/.Serena when present.",
+        "Questions must be answerable from the repository itself and should resemble simple developer language, not exam questions.",
+        "Cover useful infrastructure-team doubts such as: where/how a capability is configured, which environment/value file controls it, what a module does, how creation/modification flows are structured, what validations/pipelines apply, or how repository conventions work.",
+        "Do not ask for secrets, credentials, external production state, or facts that cannot be proven from the pinned repository.",
+        "For every question provide a concise expected_answer and 1-5 exact evidence_paths that support it. Do not invent paths.",
+        "Return raw JSON only.",
+        json.dumps({
+            "schema_version": _REPO_QUESTION_SCHEMA_VERSION,
+            "repository_commit_sha": commit_sha,
+            "questions": [{
+                "question_id": "q1",
+                "question": "plain-language developer question",
+                "expected_answer": "concise repository-grounded answer",
+                "evidence_paths": ["repo/relative/path.tf"],
+            }],
+        }, ensure_ascii=False),
+    ])
+    repos = [{"url": f"https://github.com/{owner}/{repo}", "startingRef": commit_sha}]
+    remote_before = cursor_readonly_guard.snapshot_remote_branches(repos)
+    payload = {
+        "name": f"Terrabot repository questions {run_id} {repo}"[:100],
+        "mode": "plan",
+        "prompt": {"text": instruction},
+        "repos": repos,
+        "workOnCurrentBranch": False,
+        "autoCreatePR": False,
+        "skipReviewerRequest": True,
+    }
+    _emit(
+        "cursor_repository_question_generation_started",
+        log_event=log_event,
+        run_id=run_id,
+        repo=f"{owner}/{repo}",
+        count=count,
+        prompt_chars=len(instruction),
+    )
+    created = _http_json(http, "POST", f"{base_url}/v1/agents", headers=headers, timeout=request_timeout, payload=payload)
+    agent_id, cursor_run_id, initial_run = _extract_agent_and_run(created)
+    try:
+        cursor_run_id = _resolve_run_id(http, agent_id, cursor_run_id, base_url=base_url, headers=headers, timeout=request_timeout)
+        result_text, terminal = _wait_for_result(
+            http, agent_id, cursor_run_id, initial_run,
+            base_url=base_url, headers=headers, request_timeout=request_timeout,
+            run_timeout=run_timeout, poll_interval=poll_interval,
+            run_label=f"{run_id}:repository-questions", log_event=log_event,
+        )
+        remote_after = cursor_readonly_guard.snapshot_remote_branches(repos)
+        mutations = cursor_readonly_guard.cursor_reported_remote_mutations(terminal, remote_before, remote_after)
+        if mutations:
+            raise CursorPromptError("Cursor changed a verified remote GitHub branch while generating repository questions.")
+        parsed = _parse_result_text(result_text)
+        if str(parsed.get("schema_version") or "").strip() != _REPO_QUESTION_SCHEMA_VERSION:
+            raise CursorPromptError(f"Cursor repository-question schema_version must be {_REPO_QUESTION_SCHEMA_VERSION}.")
+        if str(parsed.get("repository_commit_sha") or "").strip() != commit_sha:
+            raise CursorPromptError("Cursor repository-question commit did not match the pinned commit.")
+        questions: list[dict[str, Any]] = []
+        for index, item in enumerate(parsed.get("questions") or [], start=1):
+            if not isinstance(item, dict):
+                continue
+            question = re.sub(r"\s+", " ", str(item.get("question") or "")).strip()
+            expected = re.sub(r"\s+", " ", str(item.get("expected_answer") or "")).strip()
+            paths = [str(value).strip().strip("/") for value in (item.get("evidence_paths") or []) if str(value).strip()]
+            if question and expected and paths:
+                questions.append({
+                    "question_id": str(item.get("question_id") or f"q{index}"),
+                    "question": question,
+                    "expected_answer": expected,
+                    "evidence_paths": paths[:5],
+                    "owner": owner,
+                    "repo": repo,
+                    "commit_sha": commit_sha,
+                })
+            if len(questions) >= count:
+                break
+        _emit(
+            "cursor_repository_question_generation_completed",
+            log_event=log_event,
+            run_id=run_id,
+            repo=f"{owner}/{repo}",
+            generated=len(questions),
+        )
+        return questions
+    except Exception as exc:
+        _emit(
+            "cursor_repository_question_generation_failed",
+            level="warning",
+            log_event=log_event,
+            run_id=run_id,
+            repo=f"{owner}/{repo}",
+            error=exc,
+        )
+        return []
+    finally:
+        _archive_agent_best_effort(
+            http, agent_id, base_url=base_url, headers=headers,
+            timeout=request_timeout, run_label=f"{run_id}:repository-questions",
+            log_event=log_event,
+        )
+
+
+def validate_repository_answer(
+    *,
+    owner: str,
+    repo: str,
+    commit_sha: str,
+    question: str,
+    terrabot_answer: str,
+    expected_answer: str,
+    evidence_paths: Sequence[str],
+    run_id: str,
+    question_id: str,
+    session: Any | None = None,
+    log_event: Callable[..., None] | None = None,
+) -> dict[str, Any]:
+    """Independently validate a Terrabot repository-Q&A answer with Cursor."""
+    api_key = _api_key()
+    if not api_key:
+        return {"completed": False, "correct": False, "error": "Cursor API key is not configured."}
+    http = session or requests.Session()
+    base_url = _base_url()
+    request_timeout = _float_setting("TERRABOT_CURSOR_REQUEST_TIMEOUT_SECONDS", 30.0, 5.0, 120.0)
+    run_timeout = _float_setting("TERRABOT_CURSOR_REPOSITORY_ANSWER_TIMEOUT_SECONDS", 180.0, 30.0, 600.0)
+    poll_interval = _float_setting("TERRABOT_CURSOR_POLL_INTERVAL_SECONDS", 2.0, 0.2, 30.0)
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    instruction = "\n".join([
+        "Validate one Terrabot repository/workflow answer against the pinned repository.",
+        "This is read-only. Do not edit, commit, push, branch, or open PRs.",
+        f"Repository: https://github.com/{owner}/{repo}",
+        f"Exact commit: {commit_sha}",
+        f"Question: {question}",
+        f"Terrabot answer: {terrabot_answer}",
+        f"Cursor-authored expected answer: {expected_answer}",
+        "Expected supporting evidence paths:",
+        json.dumps(list(evidence_paths), ensure_ascii=False),
+        "Inspect the repository yourself. Mark correct=true only if the Terrabot answer is materially correct and repository-grounded. It need not use identical wording to expected_answer.",
+        "Return raw JSON only with schema_version, correct, reason, evidence.",
+        json.dumps({"schema_version": _REPO_ANSWER_SCHEMA_VERSION, "correct": True, "reason": "short reason", "evidence": ["path: proof"]}, ensure_ascii=False),
+    ])
+    repos = [{"url": f"https://github.com/{owner}/{repo}", "startingRef": commit_sha}]
+    remote_before = cursor_readonly_guard.snapshot_remote_branches(repos)
+    payload = {
+        "name": f"Terrabot repository answer validation {run_id} {question_id}"[:100],
+        "mode": "plan",
+        "prompt": {"text": instruction},
+        "repos": repos,
+        "workOnCurrentBranch": False,
+        "autoCreatePR": False,
+        "skipReviewerRequest": True,
+    }
+    _emit("cursor_repository_answer_validation_started", log_event=log_event, run_id=run_id, question_id=question_id, repo=f"{owner}/{repo}")
+    try:
+        created = _http_json(http, "POST", f"{base_url}/v1/agents", headers=headers, timeout=request_timeout, payload=payload)
+        agent_id, cursor_run_id, initial_run = _extract_agent_and_run(created)
+        try:
+            cursor_run_id = _resolve_run_id(http, agent_id, cursor_run_id, base_url=base_url, headers=headers, timeout=request_timeout)
+            result_text, terminal = _wait_for_result(
+                http, agent_id, cursor_run_id, initial_run,
+                base_url=base_url, headers=headers, request_timeout=request_timeout,
+                run_timeout=run_timeout, poll_interval=poll_interval,
+                run_label=f"{run_id}:{question_id}:repository-answer", log_event=log_event,
+            )
+            remote_after = cursor_readonly_guard.snapshot_remote_branches(repos)
+            mutations = cursor_readonly_guard.cursor_reported_remote_mutations(terminal, remote_before, remote_after)
+            if mutations:
+                raise CursorPromptError("Cursor changed a verified remote GitHub branch during repository answer validation.")
+            parsed = _parse_result_text(result_text)
+            if str(parsed.get("schema_version") or "").strip() != _REPO_ANSWER_SCHEMA_VERSION:
+                raise CursorPromptError(f"Cursor repository-answer schema_version must be {_REPO_ANSWER_SCHEMA_VERSION}.")
+            correct = parsed.get("correct")
+            if not isinstance(correct, bool):
+                raise CursorPromptError("Cursor repository-answer correct must be Boolean.")
+            result = {
+                "completed": True,
+                "correct": correct,
+                "reason": re.sub(r"\s+", " ", str(parsed.get("reason") or "")).strip()[:1200],
+                "evidence": [re.sub(r"\s+", " ", str(value)).strip()[:500] for value in (parsed.get("evidence") or [])[:6]],
+                "error": "",
+            }
+            _emit("cursor_repository_answer_validation_completed", log_event=log_event, run_id=run_id, question_id=question_id, correct=correct)
+            return result
+        finally:
+            _archive_agent_best_effort(http, agent_id, base_url=base_url, headers=headers, timeout=request_timeout, run_label=f"{run_id}:{question_id}:repository-answer", log_event=log_event)
+    except Exception as exc:
+        _emit("cursor_repository_answer_validation_failed", level="warning", log_event=log_event, run_id=run_id, question_id=question_id, error=exc)
+        return {"completed": False, "correct": False, "reason": "", "evidence": [], "error": str(exc)[:1600]}
+

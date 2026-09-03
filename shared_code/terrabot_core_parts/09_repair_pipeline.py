@@ -342,6 +342,7 @@ def _teams_build_backend_repair_payload(
             "retain_semantic_target_and_clarifications": True,
             "repository_truth_precedence": "repair_files[].existing_live_content",
         },
+        "resolved_repository_target": dict((flow_context or (_ACTIVE_TEAMS_FLOW_CONTEXT.get() or {})).get("resolved_repository_target_contract") or {}),
         "hard_validation_contract": hard_validation_contract,
         "exact_edit_hints": exact_edit_hints,
         "expected_cloud": current_result.get("cloud"),
@@ -595,6 +596,18 @@ def _teams_get_valid_backend_repair(
             _teams_validate_repair_candidate_against_payload(
                 repaired_result, working_payload
             )
+            # Apply the SAME aggregate hard validator used for first generation
+            # before accepting this internal repair response. This prevents a
+            # repair from fixing preservation but only discovering semantic/shape
+            # failures in the next outer validation round.
+            hard_validator = globals().get("_teams_run_generation_hard_validations")
+            if callable(hard_validator):
+                repaired_result = hard_validator(
+                    repaired_result,
+                    str(working_payload.get("original_user_request") or ""),
+                    str(repair_conversation_id or conversation_id or ""),
+                    list(working_payload.get("retrieved_value_context") or []),
+                )
             _teams_diag_log(
                 "backend_repair_response_validated",
                 response_attempt=f"{response_attempt}/{max_response_attempts}",
@@ -663,15 +676,24 @@ def commit_terraform_files_to_branch_for_teams_with_self_correction(
     # Restore the original bounded outer self-correction depth. Every outer
     # attempt re-runs all backend validators (including the concurrent precommit
     # validation batch) before another private Foundry repair is requested.
-    effective_max_attempts = min(5, max(1, int(max_attempts or MAX_TEAMS_SELF_CORRECTION_ATTEMPTS or 5)))
+    configured_attempts = min(5, max(1, int(max_attempts or MAX_TEAMS_SELF_CORRECTION_ATTEMPTS or 5)))
+    active_repair_context = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
+    immutable_target = active_repair_context.get("resolved_repository_target_contract")
+    # A live-verified single Boolean already has an exact target and transition.
+    # One generation pass + one surgical repair pass is sufficient; additional
+    # outer passes only repeat the same candidate after the internal repair loop
+    # has already exhausted protocol/validation corrections. Complex non-Boolean
+    # requests retain the historical configured outer bound.
+    effective_max_attempts = min(configured_attempts, 2) if isinstance(immutable_target, dict) and immutable_target else configured_attempts
     _teams_diag_log(
         "commit_pipeline_start",
         thread=thread_id,
         prompt=str(prompt or "")[:120],
         max_attempts=effective_max_attempts,
-        configured_max_attempts=max_attempts,
+        configured_max_attempts=configured_attempts,
         repair_rounds=effective_max_attempts - 1,
-        internal_repair_attempts=3,
+        internal_repair_attempts=2 if isinstance(immutable_target, dict) and immutable_target else 3,
+        immutable_target=bool(isinstance(immutable_target, dict) and immutable_target),
     )
 
     for attempt in range(1, effective_max_attempts + 1):
@@ -816,7 +838,7 @@ def commit_terraform_files_to_branch_for_teams_with_self_correction(
                 current_result = _teams_get_valid_backend_repair(
                     repair_payload,
                     current_result,
-                    max_response_attempts=3,
+                    max_response_attempts=(2 if isinstance(immutable_target, dict) and immutable_target else 3),
                     conversation_id=thread_id,
                 )
                 _teams_diag_log(
@@ -838,9 +860,20 @@ def commit_terraform_files_to_branch_for_teams_with_self_correction(
                     attempt=f"{attempt}/{effective_max_attempts}",
                     error=str(repair_call_error)[:200],
                 )
-                # Keep retrying with the same current_result in case this was a
-                # transient issue calling/parsing the agent, until attempts run out.
-                continue
+                # _teams_get_valid_backend_repair already performs its bounded
+                # internal response retries. Re-validating the unchanged rejected
+                # current_result in another OUTER pass cannot improve the diff and
+                # caused the repeated identical failures seen in E2E logs. Stop the
+                # correction chain here; transport/API retries belong inside the
+                # agent call helper, not as another Terraform validation round.
+                _teams_diag_log(
+                    "repair_chain_stopped_no_new_candidate",
+                    level="warning",
+                    thread=thread_id,
+                    attempt=f"{attempt}/{effective_max_attempts}",
+                    reason="internal_repair_exhausted_without_valid_new_candidate",
+                )
+                break
 
     _teams_diag_log(
         "commit_pipeline_exhausted",

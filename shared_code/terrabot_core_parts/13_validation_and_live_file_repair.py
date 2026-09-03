@@ -1439,6 +1439,33 @@ def _teams_shared_context_for_repository_decision(prompt: str) -> tuple[str, lis
             search_result = dict(search_result or {})
             search_result["results"] = merged
         block = shared_repository_context.format_repository_context_for_agent(search_result)
+        # Required continuation records must reach semantic target resolution
+        # even when the general formatter suppresses a conflicted/historical
+        # record. They remain hints only: current live repository evidence below
+        # is still mandatory before any target can be selected.
+        required_rows: list[str] = []
+        if required_ids:
+            wanted = set(required_ids)
+            for item in search_result.get("results") or []:
+                if not isinstance(item, dict) or str(item.get("id") or "").strip() not in wanted:
+                    continue
+                required_rows.append(json.dumps({
+                    "id": str(item.get("id") or ""),
+                    "category": str(item.get("category") or ""),
+                    "subject": str(item.get("subject") or ""),
+                    "scope": str(item.get("scope") or ""),
+                    "statement": str(item.get("statement") or ""),
+                    "evidence_paths": list(item.get("evidence_paths") or []),
+                    "status": str(item.get("status") or "active"),
+                    "required_continuation_record": True,
+                    "must_revalidate_against_current_live_repository": True,
+                }, ensure_ascii=False))
+        if required_rows:
+            required_block = (
+                "MANDATORY REQUIRED REPOSITORY CONTEXT RECORDS (live verification required):\n"
+                + "\n".join(required_rows)
+            )
+            block = (block.rstrip() + "\n\n" + required_block).strip() if block else required_block
         LOGGER.info(
             "[TerrabotDiag] event=repository_context_semantic_selection_complete repo=%s/%s results=%s ids=%s",
             owner, repo, len(search_result.get("results") or []),
@@ -1450,7 +1477,9 @@ def _teams_shared_context_for_repository_decision(prompt: str) -> tuple[str, lis
             owner, repo, exc,
         )
         return "", [], {}
-    live_files = _teams_repository_context_live_files(owner, repo, branch, search_result)
+    live_files = _teams_repository_context_live_files(
+        owner, repo, branch, search_result, required_context_ids=required_ids
+    )
     metadata = {
         "repository": f"{owner}/{repo}",
         "branch": branch,
