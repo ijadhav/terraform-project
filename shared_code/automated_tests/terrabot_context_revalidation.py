@@ -22,7 +22,7 @@ def revalidate_repository_context(
         query="*",
         current_commit_sha=current_commit_sha,
         top_k=top_k,
-        include_conflicted=False,
+        include_conflicted=True,
     )
     stats = {"checked": 0, "refreshed": 0, "invalidated": 0, "unchanged": 0}
 
@@ -30,7 +30,10 @@ def revalidate_repository_context(
         return core.github_get_file_content_by_repo(owner, repo, path, ref=ref)
 
     for item in result.get("results") or []:
-        if not isinstance(item, dict) or not item.get("stale"):
+        if not isinstance(item, dict):
+            continue
+        status = str(item.get("status") or "active").strip().lower()
+        if not item.get("stale") and status != "conflicted":
             continue
         stats["checked"] += 1
         evidence = [entry for entry in (item.get("evidence") or []) if isinstance(entry, dict)]

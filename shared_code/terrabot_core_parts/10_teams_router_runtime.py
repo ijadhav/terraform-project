@@ -146,6 +146,34 @@ def _build_agent_input_for_infra_safe(
             "hard_boundary": True,
         }
 
+    selected_targets = []
+    for item in selected_context.get("matched_files") or []:
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("path") or item.get("filename") or "").strip().strip("/")
+        content = str(item.get("content") or "")
+        feature_match = item.get("feature_flag_match") or {}
+        selected_targets.append({
+            "path": path,
+            "live_nonblank_line_count": len([line for line in content.splitlines() if line.strip()]),
+            "feature_flag_match": feature_match if isinstance(feature_match, dict) else {},
+            "must_return_complete_final_file": bool(content),
+        })
+    payload["backend_hard_validation_contract"] = {
+        "applies_to_first_generation_and_every_repair": True,
+        "selected_targets": selected_targets,
+        "rules": [
+            "Use exact live repository content as the baseline for every existing file.",
+            "Return only repository-grounded allowed paths for the current request.",
+            "Boolean mode: change exactly the selected literal value and preserve every other byte/line.",
+            "Modify mode: keep a small localized semantic delta; no formatting-only or unrelated churn.",
+            "Create mode in an existing file: preserve existing repository bytes and add only the requested repository-pattern content.",
+            "Return complete final existing files; never excerpts, shortened reconstructions, placeholders, or ellipses.",
+            "HCL must be complete/balanced and pass semantic relevance, Terraform shape, agent self-validation, preservation, and diff checks before response.",
+            "Do not rely on a later repair round to restore omitted live content; self-check the diff before the first response.",
+        ],
+    }
+
     instructions = list(payload.get("instructions") or [])
     instructions.extend([
         "TEAMS TARGET SCOPE: when teams_target_scope is present, inspect and propose modification targets only inside that root. Do not list or edit matches from other hubs/environments.",
@@ -2139,18 +2167,58 @@ def _teams_compact_agent_input(agent_input: str, max_chars: int = 90000) -> str:
                     # contents the backend already read from GitHub. Bound
                     # only by a generous hard ceiling per file.
                     matched = copy.get("matched_files")
+                    authoritative_paths = set()
                     if isinstance(matched, list):
                         bounded_matched = []
                         for entry in matched:
                             if isinstance(entry, dict):
                                 entry_copy = dict(entry)
+                                entry_path = str(entry_copy.get("path") or entry_copy.get("filename") or "").strip().strip("/")
+                                if entry_path:
+                                    authoritative_paths.add(entry_path)
                                 entry_content = str(entry_copy.get("content") or "")
                                 if len(entry_content) > 160_000:
                                     entry_copy["content"] = entry_content[:160_000]
+                                    entry_copy["content_truncated_for_transport"] = True
                                 bounded_matched.append(entry_copy)
                             else:
                                 bounded_matched.append(entry)
                         copy["matched_files"] = bounded_matched
+
+                    authoritative_paths.update(
+                        str(value or "").strip().strip("/")
+                        for value in (copy.get("companion_write_paths") or [])
+                        if str(value or "").strip()
+                    )
+                    selected_path = str(copy.get("selected_path") or "").strip().strip("/")
+                    if selected_path:
+                        authoritative_paths.add(selected_path)
+
+                    # Avoid duplicating complete environment files inside one
+                    # authoritative context. Selected/write-target paths stay full;
+                    # auxiliary environment evidence is bounded. This prevents a
+                    # 400-line target plus many duplicate full files from inflating
+                    # a generation request to 600k+ characters and causing the model
+                    # to emit shortened reconstructions.
+                    environment_files = copy.get("environment_files")
+                    if isinstance(environment_files, list):
+                        bounded_environment = []
+                        for entry in environment_files[:30]:
+                            if not isinstance(entry, dict):
+                                continue
+                            entry_copy = dict(entry)
+                            entry_path = str(entry_copy.get("path") or entry_copy.get("filename") or "").strip().strip("/")
+                            entry_content = str(entry_copy.get("content") or "")
+                            if entry_path in authoritative_paths:
+                                if len(entry_content) > 160_000:
+                                    entry_copy["content"] = entry_content[:160_000]
+                                    entry_copy["content_truncated_for_transport"] = True
+                            elif len(entry_content) > 6000:
+                                entry_copy["content"] = entry_content[:6000] + "\n# [Terrabot auxiliary evidence truncated]\n"
+                                entry_copy["auxiliary_context_excerpt"] = True
+                            bounded_environment.append(entry_copy)
+                        copy["environment_files"] = bounded_environment
+
                     own_content = copy.get("content")
                     if isinstance(own_content, str) and len(own_content) > 160_000:
                         copy["content"] = own_content[:160_000]

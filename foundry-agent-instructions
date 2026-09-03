@@ -6045,9 +6045,59 @@ or a verified Cursor handoff, perform this repository analysis before asking:
 4. CLARIFICATION OUTPUT MUST BE MACHINE-USABLE
 When clarification is genuinely required, return only relevant semantic choices.
 Each choice must identify the repository resource/module/control and a concise
-repository-derived description. Never list unrelated Terraform files, backend
+repository-derived dexscription. Never list unrelated Terraform files, backend
 files, providers, or generic flags. This allows the test harness's read-only
 Cursor resolver to independently inspect the pinned repository, choose the
 correct control, and hand it back for backend live verification without
 bypassing deterministic validation.
 
+FINAL REPAIR CONVERGENCE / SAME-TASK CONTINUITY OVERRIDE
+
+This section is highest priority for every Teams infrastructure generation and every backend validation repair.
+
+1. SAME TASK, SAME SEMANTIC TARGET
+ A `SELF-CORRECTION LOOP:` payload is a continuation of the generation that immediately preceded it. It is not a fresh infrastructure request.
+ Retain the already-resolved repository, environment, resource/module, selected Boolean/control, user clarification, and requested transition unless CURRENT live repository evidence explicitly contradicts them.
+ Conversation memory may help interpret the task, but `repair_files[].existing_live_content` and the current payload always override remembered file content.
+ Never reopen target ambiguity during repair merely because unrelated controls exist in the file.
+
+2. HARD VALIDATION CONTRACT APPLIES BEFORE EVERY RETURN
+When `hard_validation_contract` is present, treat every rule in it as a mandatory pre-return gate. A response is invalid unless all rules can pass simultaneously. In particular:
+ path must be allowed;
+ HCL must be complete/balanced;
+ semantic relevance must match the CURRENT request;
+Boolean mode changes only the selected literal value;
+modification mode is a small targeted delta from exact live content;
+ creation in an existing file preserves the required repository bytes and adds only the requested repository-pattern content;
+ no unrelated formatting, ordering, comments, blank lines, blocks, or files may change.
+ Do not return a candidate that fixes only the latest error while violating another hard rule.
+ 3. EXISTING-FILE REPAIR MUST USE SURGICAL `repair_edits[]`
+ If `repair_mode = "exact_live_file_surgical_edit"` and the repair file has non-empty `existing_live_content`:
+ return `repair_edits[]` only for that existing file;
+ `old_text` must be copied byte-for-byte from CURRENT `existing_live_content` and occur exactly once;
+`new_text` is ONLY the replacement for that `old_text` span. It is never a complete-file replacement;
+ for a literal Boolean change, normally set `old_text` to the exact live assignment line and `new_text` to the same line with only `true`/`false` changed;
+ when `exact_edit_hints[].exact_live_line` is populated and matches the already-resolved request, use that exact line rather than reconstructing it from memory or rejected output.
+
+4. NEVER USE REJECTED OUTPUT AS REPOSITORY TRUTH
+`rejected_agent_result`, `previous_generated_files`, and `rejected_generated_content` exist only to explain what failed. Do not copy `old_text` from them. Do not rebuild a file by repairing the rejected shortened candidate. Always begin from `existing_live_content`.
+
+5. INTERNAL RETRY MUST IMPROVE THE SAME CANDIDATE
+When `prior_repair_feedback` or `repair_response_violation` is present:
+correct that exact protocol/validation defect while preserving the same task and selected target;
+ do not repeat the same edit/candidate;
+ do not ask a user question;
+ do not switch to another resource/path/flag;
+ run the full hard-validation contract again before returning.
+
+6. MINIMIZE MODEL ROUNDS
++The first generation should already satisfy the same preservation and diff constraints used by backend validation. Before returning any existing file, compare it against the supplied exact live file and internally verify that only the requested delta exists. Repair rounds are a fallback for genuine defects, not a normal way to discover preservation requirements.
+
+28. IMMUTABLE LIVE-VERIFIED TARGET / WORKFLOW CONTINUITY — FINAL OVERRIDE
+
+ When `resolved_repository_target` is present, it is a backend live-verified request contract derived from current repository evidence. Treat its `workflow`, `path`, `flag`, `line_number`, `current_value`, and `new_value` as immutable for the current request.
+ Do not reinterpret an already-resolved existing-infrastructure Boolean change as module creation, module consumption, generic resource creation, or a different modification workflow. A paraphrase/follow-up does not change the operation class when the backend carries the previously resolved workflow forward.
+ Do not substitute another path/flag/resource because of stronger lexical similarity. Re-open target resolution only if the backend explicitly reports that current live repository verification invalidated the contract.
+ Repository context is reusable only after the mapped record is attached to the current target-resolution/generation call and revalidated against current live repository code. Retrieval alone is not reuse.
+ For a resolved Boolean target, generation and every repair attempt must operate on the exact same target contract and complete live file baseline; only the requested Boolean literal may differ.
+ These rules are generic. Never infer repository behavior from backend hardcoded resource names, aliases, or flag tables; use the supplied live Terraform, validated repository context, and repository wiring.

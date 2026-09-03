@@ -917,6 +917,44 @@ def _handle_teams_chat_request_base(data: dict):  # pyright: ignore[reportGenera
         existing_ui_state=durable_ui_state,
     )
 
+
+
+def _teams_run_generation_hard_validations(
+    agent_result: dict,
+    prompt: str,
+    thread_id: str,
+    retrieved_value_context: list | None,
+) -> dict:
+    """Run every deterministic hard guard before accepting a generation/repair.
+
+    The same validator set is used on the first Foundry response and on every
+    repaired candidate. This prevents a repair from fixing one preservation
+    error only to fail semantic/shape/self-validation in a later outer round.
+    No validator mutates Terraform.
+    """
+    failures: list[str] = []
+    result = agent_result
+    try:
+        result = enforce_modification_uses_backend_matched_files(
+            result, retrieved_value_context
+        )
+    except ValueError as exc:
+        failures.append(str(exc))
+
+    parallel_validator = globals().get("_run_parallel_precommit_validations")
+    if callable(parallel_validator):
+        try:
+            parallel_validator(result, prompt, thread_id)
+        except ValueError as exc:
+            failures.append(str(exc))
+
+    if failures:
+        unique = list(dict.fromkeys(item for item in failures if item))
+        raise ValueError(
+            "BACKEND_GENERATION_HARD_VALIDATION_FAILED: " + " | ".join(unique)
+        )
+    return result
+
 def handle_chat_request(data: dict):
     data = data or {}
 
@@ -3338,8 +3376,11 @@ def handle_chat_request(data: dict):
                     )
                     for repair_attempt in range(1, generation_validation_passes + 1):
                         try:
-                            agent_result = enforce_modification_uses_backend_matched_files(
-                                agent_result, retrieved_value_context
+                            agent_result = _teams_run_generation_hard_validations(
+                                agent_result,
+                                effective_prompt,
+                                conversation_id,
+                                retrieved_value_context,
                             )
                             validation_error = None
                             break
@@ -3531,6 +3572,7 @@ def handle_chat_request(data: dict):
                             repaired_result = None
                             repaired_reply = ""
                             repaired_conversation_id = conversation_id
+                            repair_conversation_id = conversation_id
                             internal_repair_error = None
                             for internal_attempt in range(1, 4):
                                 working_repair_payload = dict(repair_payload)
@@ -3538,9 +3580,19 @@ def handle_chat_request(data: dict):
                                     working_repair_payload["prior_repair_feedback"] = str(internal_repair_error)
                                     working_repair_payload["repair_response_violation"] = (
                                         "The immediately previous internal repair response was rejected. "
-                                        "Correct that exact response error and return executable repair_edits[] "
-                                        "or complete files[] now; do not ask the user anything."
+                                        f"Response error: {internal_repair_error}. Continue the SAME task and SAME resolved target. "
+                                        "Re-read repair_files[].existing_live_content, satisfy hard_validation_contract in full, "
+                                        "and return a NEW executable repair_edits[] response. Do not ask the user anything and "
+                                        "do not repeat the rejected edit."
                                     )
+                                    working_repair_payload["mandatory_next_output"] = {
+                                        "json_only": True,
+                                        "questions": [],
+                                        "existing_file_output": "repair_edits_only",
+                                        "old_text_source": "repair_files[].existing_live_content",
+                                        "new_text_scope": "replacement span only, never whole file",
+                                        "all_hard_validation_rules_must_pass_before_return": True,
+                                    }
                                 _teams_diag_log(
                                     "generation_validation_internal_repair_start",
                                     thread=conversation_id,
@@ -3549,8 +3601,11 @@ def handle_chat_request(data: dict):
                                 )
                                 try:
                                     repaired_conversation_id, repaired_reply = _teams_call_agent_for_backend_repair(
-                                        working_repair_payload
+                                        working_repair_payload,
+                                        conversation_id=repair_conversation_id or None,
                                     )
+                                    if repaired_conversation_id:
+                                        repair_conversation_id = repaired_conversation_id
                                     repaired_reply = _teams_apply_agent_identity(
                                         repaired_reply,
                                         target_cloud,
@@ -3594,6 +3649,12 @@ def handle_chat_request(data: dict):
                                     _teams_validate_repair_candidate_against_payload(
                                         candidate_result, working_repair_payload
                                     )
+                                    candidate_result = _teams_run_generation_hard_validations(
+                                        candidate_result,
+                                        effective_prompt,
+                                        conversation_id,
+                                        retrieved_value_context,
+                                    )
                                     repaired_result = candidate_result
                                     _teams_diag_log(
                                         "generation_validation_internal_repair_success",
@@ -3619,13 +3680,18 @@ def handle_chat_request(data: dict):
                                 LOGGER.warning(
                                     "Foundry generation-validation repair responses failed on "
                                     "outer attempt %s/%s (thread=%s) after 3 internal repairs: %s. "
-                                    "Keeping the failure private and continuing the outer loop.",
+                                    "No new candidate exists, so repeating the same outer validation would only "
+                                    "replay the identical failure. Stopping this repair chain.",
                                     repair_attempt,
                                     generation_validation_passes,
                                     conversation_id,
                                     internal_repair_error,
                                 )
-                                continue
+                                validation_error = ValueError(
+                                    "Foundry repair did not produce a new candidate satisfying the hard validation contract: "
+                                    + str(internal_repair_error)
+                                )
+                                break
 
                             conversation_id = repaired_conversation_id
                             agent_reply = repaired_reply

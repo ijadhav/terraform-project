@@ -917,7 +917,13 @@ def resolve_repository_clarification(
             repo=f"{owner}/{repo}",
             reason="TERRABOT_CURSOR_API_KEY/CURSOR_API_KEY is not configured",
         )
-        return {}
+        return {
+            "attempted": True,
+            "resolved": False,
+            "resolution_type": "unresolved",
+            "answer": "",
+            "error": "TERRABOT_CURSOR_API_KEY/CURSOR_API_KEY is not configured",
+        }
     session = session or requests.Session()
     base_url = _base_url()
     request_timeout = _float_setting("TERRABOT_CURSOR_REQUEST_TIMEOUT_SECONDS", 30.0, 5.0, 120.0)
@@ -1114,6 +1120,9 @@ def resolve_repository_clarification(
         if resolution_type != "unresolved" and not answer:
             raise CursorPromptError("Cursor clarification did not return a usable answer.")
         result = {
+            "attempted": True,
+            "resolved": resolution_type in {"candidate", "repository_control"},
+            "error": "",
             "answer": answer,
             "resolution_type": resolution_type,
             "candidates_relevant": candidates_relevant,
@@ -1156,4 +1165,10 @@ def resolve_repository_clarification(
             test_case_id=case_id,
             error=exc,
         )
-        return {}
+        return {
+            "attempted": True,
+            "resolved": False,
+            "resolution_type": "unresolved",
+            "answer": "",
+            "error": re.sub(r"\s+", " ", str(exc)).strip()[:1600],
+        }

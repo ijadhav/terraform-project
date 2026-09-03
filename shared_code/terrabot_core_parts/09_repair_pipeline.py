@@ -277,6 +277,59 @@ def _teams_build_backend_repair_payload(
     existing_targets = [item for item in live_files if str((item or {}).get("existing_live_content") or "")]
     all_existing = bool(live_files) and len(existing_targets) == len(live_files)
     protocol = _modular_repair_protocol(all_existing)
+
+    selected_context = _get_backend_existing_infra_context(retrieved_value_context or [])
+    selected_context = dict(selected_context or {}) if isinstance(selected_context, dict) else {}
+    exact_edit_hints: list[dict] = []
+    for item in selected_context.get("matched_files") or []:
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("path") or item.get("filename") or "").strip().strip("/")
+        match = item.get("feature_flag_match") or {}
+        if not path or not isinstance(match, dict) or not match:
+            continue
+        flag = str(match.get("flag") or "").strip()
+        current = str(match.get("current_value") or "").strip().lower()
+        target = str(match.get("new_value") or "").strip().lower()
+        try:
+            line_number = int(match.get("line_number") or match.get("line") or 0)
+        except (TypeError, ValueError):
+            line_number = 0
+        live_entry = next((entry for entry in live_files if str(entry.get("path") or "") == path), None)
+        live_text = str((live_entry or {}).get("existing_live_content") or "")
+        exact_line = ""
+        if line_number > 0 and live_text:
+            lines = live_text.replace("\r\n", "\n").splitlines()
+            if line_number <= len(lines):
+                exact_line = lines[line_number - 1]
+        if path and flag and current in {"true", "false"} and target in {"true", "false"}:
+            exact_edit_hints.append({
+                "path": path,
+                "line_number": line_number,
+                "flag": flag,
+                "current_value": current,
+                "new_value": target,
+                "exact_live_line": exact_line,
+                "rule": "If this is the requested control, old_text should normally be exact_live_line and new_text should be the same line with only the Boolean literal changed.",
+            })
+
+    hard_validation_contract = {
+        "applies_to_every_repair_response": True,
+        "allowed_paths": [str(item.get("path") or "") for item in live_files],
+        "baseline_source": "repair_files[].existing_live_content",
+        "baseline_sha256": {str(item.get("path") or ""): str(item.get("existing_sha256") or "") for item in live_files},
+        "rules": [
+            "Use current exact live GitHub content as the only baseline; memory and rejected output are context, never repository truth.",
+            "Return strict JSON and no questions for an internal repair.",
+            "For existing files prefer repair_edits[]; old_text must occur exactly once in existing_live_content.",
+            "repair_edits[].new_text is ONLY the replacement for old_text, never a whole-file replacement.",
+            "Do not add/remove/reorder/reformat unrelated lines, comments, blocks, or blank lines.",
+            "Preserve allowed path boundaries and do not introduce unrelated files.",
+            "Resulting HCL must be complete/balanced and satisfy semantic relevance, Terraform-shape, agent-self-validation, preservation, and minimal-diff checks before return.",
+            "For a repository-validated Boolean change, only the selected literal value may differ from the live file.",
+            "Never repeat a repair candidate or repair edit that was already rejected in this repair chain.",
+        ],
+    }
     return {
         "task": "SELF-CORRECTION LOOP: surgically repair the rejected Terraform against exact live repository files.",
         "channel": "teams",
@@ -284,6 +337,13 @@ def _teams_build_backend_repair_payload(
         "original_user_request": str(original_user_request or ""),
         "backend_validation_error": str(backend_error),
         "prior_repair_feedback": str(prior_repair_feedback or ""),
+        "repair_chain_context": {
+            "same_task_continuation": True,
+            "retain_semantic_target_and_clarifications": True,
+            "repository_truth_precedence": "repair_files[].existing_live_content",
+        },
+        "hard_validation_contract": hard_validation_contract,
+        "exact_edit_hints": exact_edit_hints,
         "expected_cloud": current_result.get("cloud"),
         "expected_workflow": current_result.get("workflow"),
         "expected_repo_target": current_result.get("repo_target"),
@@ -323,7 +383,7 @@ def _teams_build_backend_repair_payload(
             "repair_edits": [{
                 "path": "repo/relative/file.tfvars",
                 "old_text": "smallest exact unique text copied from existing_live_content",
-                "new_text": "complete replacement implementing only original_user_request",
+                "new_text": "replacement text for old_text span only; never the full file",
             }],
         },
     }
@@ -467,21 +527,27 @@ def _teams_repair_reply_has_executable_change(agent_reply: str) -> bool:
     )
 
 
-def _teams_call_agent_for_backend_repair(repair_payload: dict) -> tuple[str, str]:
-    """Make exactly one isolated Foundry repair call for one validation batch.
+def _teams_call_agent_for_backend_repair(
+    repair_payload: dict,
+    conversation_id: str | None = None,
+) -> tuple[str, str]:
+    """Run one Foundry repair turn in the SAME generation conversation.
 
-    The repair payload already contains the aggregated backend failure plus exact
-    live repository baselines. A malformed/non-executable response is rejected
-    locally instead of triggering another model round trip.
+    Repair is a continuation of the generation task, not a new independent job.
+    Reusing the conversation preserves the agent's semantic target resolution,
+    prior repository reasoning, and the user's clarification history. The payload
+    still repeats exact live-file baselines and hard validation rules so current
+    repository truth remains authoritative over memory.
     """
     raw = json.dumps(repair_payload, ensure_ascii=False, separators=(",", ":"))
     _teams_diag_log(
-        "backend_repair_isolated_call",
+        "backend_repair_contextual_call",
         input_chars=len(raw),
         repair_files=len(repair_payload.get("repair_files") or []),
-        strategy="bounded_internal_repair",
+        strategy="same_conversation_exact_live_repair",
+        conversation_id=str(conversation_id or ""),
     )
-    return _TEAMS_MULTICLOUD_PREVIOUS_CALL_AGENT(None, raw)
+    return _TEAMS_MULTICLOUD_PREVIOUS_CALL_AGENT(conversation_id or None, raw)
 
 
 
@@ -489,6 +555,7 @@ def _teams_get_valid_backend_repair(
     repair_payload: dict,
     current_result: dict,
     max_response_attempts: int = 3,
+    conversation_id: str | None = None,
 ) -> dict:
     """Try up to three private Foundry repair responses for one outer attempt.
 
@@ -498,15 +565,19 @@ def _teams_get_valid_backend_repair(
     """
     working_payload = dict(repair_payload or {})
     last_error: Exception | None = None
+    repair_conversation_id = str(conversation_id or "").strip()
     for response_attempt in range(1, max(1, int(max_response_attempts or 1)) + 1):
         _teams_diag_log(
             "backend_internal_repair_attempt_start",
             response_attempt=f"{response_attempt}/{max_response_attempts}",
         )
         try:
-            _conversation_id, repaired_reply = _teams_call_agent_for_backend_repair(
-                working_payload
+            returned_conversation_id, repaired_reply = _teams_call_agent_for_backend_repair(
+                working_payload,
+                conversation_id=repair_conversation_id or None,
             )
+            if returned_conversation_id:
+                repair_conversation_id = str(returned_conversation_id).strip()
             _teams_diag_log(
                 "backend_internal_repair_agent_response_received",
                 response_attempt=f"{response_attempt}/{max_response_attempts}",
@@ -553,6 +624,8 @@ def _teams_get_valid_backend_repair(
                 "existing_file_output": "repair_edits_only",
                 "must_not_return_full_existing_files": True,
                 "must_copy_old_text_from": "repair_files[].existing_live_content",
+                "new_text_scope": "replacement for old_text span only, never a full-file replacement",
+                "must_satisfy_all_hard_validation_rules_before_return": True,
             }
     raise ValueError(
         "Foundry did not produce a backend-valid surgical repair response after "
@@ -744,6 +817,7 @@ def commit_terraform_files_to_branch_for_teams_with_self_correction(
                     repair_payload,
                     current_result,
                     max_response_attempts=3,
+                    conversation_id=thread_id,
                 )
                 _teams_diag_log(
                     "agent_repair_response_received",

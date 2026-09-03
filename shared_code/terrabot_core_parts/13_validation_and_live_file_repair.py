@@ -692,6 +692,20 @@ def _teams_is_path_request_question(text: str) -> bool:
 
 def _selected_feature_flag_match_from_active_context(path: str = "") -> dict:
     active = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
+    immutable = active.get("resolved_repository_target_contract")
+    if isinstance(immutable, dict) and immutable:
+        wanted_path = str(path or "").strip().strip("/")
+        immutable_path = str(immutable.get("path") or "").strip().strip("/")
+        if not wanted_path or wanted_path == immutable_path:
+            return {
+                "path": immutable_path,
+                "line_number": immutable.get("line_number"),
+                "flag": immutable.get("flag"),
+                "current_value": immutable.get("current_value"),
+                "new_value": immutable.get("new_value"),
+                "repository_context_id": immutable.get("repository_context_id"),
+                "resolution_source": immutable.get("resolution_source"),
+            }
     wanted_path = str(path or "").strip().strip("/")
     for ctx in active.get("retrieved_value_context") or []:
         if not isinstance(ctx, dict) or ctx.get("source") != "backend_existing_infra_code_match":
@@ -1787,6 +1801,58 @@ def _teams_resolve_repository_boolean_strategy(
     return last_strategy, [], last_phase
 
 
+def _teams_lock_resolved_repository_boolean_target(
+    context: dict,
+    candidate: dict,
+    *,
+    cloud: str,
+    workflow: str,
+) -> dict:
+    """Publish one live-verified Boolean as the immutable target for this request.
+
+    The contract is derived entirely from current repository evidence / validated
+    repository context. It contains no resource-specific backend vocabulary and
+    does not generate Terraform. Downstream generation, self-validation and repair
+    must honor the same path/flag/value/workflow until the request ends.
+    """
+    path = str(candidate.get("path") or "").strip().strip("/")
+    flag = str(candidate.get("flag") or "").strip()
+    current = str(candidate.get("current_value") or "").strip().lower()
+    target = str(candidate.get("new_value") or "").strip().lower()
+    try:
+        line_number = int(candidate.get("line_number") or 0)
+    except (TypeError, ValueError):
+        line_number = 0
+    if not path or not flag or line_number <= 0 or current not in {"true", "false"} or target not in {"true", "false"} or current == target:
+        return context
+
+    active = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
+    repo_target = str(active.get("repo_target") or "").strip()
+    contract = {
+        "cloud": str(cloud or "").strip(),
+        "repo_target": repo_target,
+        "workflow": str(workflow or "").strip(),
+        "path": path,
+        "line_number": line_number,
+        "flag": flag,
+        "current_value": current,
+        "new_value": target,
+        "repository_context_id": str(candidate.get("repository_context_id") or "").strip(),
+        "resolution_source": str(candidate.get("resolution_source") or candidate.get("classification_reason") or "live_repository_boolean_resolution").strip(),
+    }
+    if isinstance(active, dict):
+        active["resolved_repository_target_contract"] = dict(contract)
+        active["resolved_workflow"] = contract["workflow"]
+    context = dict(context or {})
+    context["resolved_repository_target"] = dict(contract)
+    context["resolved_workflow"] = contract["workflow"]
+    LOGGER.info(
+        "[TerrabotFlow] step=resolved_target_contract actor=backend result=locked workflow=%s path=%s flag=%s old=%s new=%s context_id=%s",
+        contract["workflow"], path, flag, current, target, contract["repository_context_id"],
+    )
+    return context
+
+
 def build_backend_existing_infra_modification_context(
     prompt: str,
     thread_id: str,
@@ -1913,6 +1979,12 @@ def build_backend_existing_infra_modification_context(
     if len(matched) == 1:
         context["selection_state"] = "selected"
         context["selected_path"] = _teams_context_file_identity(matched[0])
+        context = _teams_lock_resolved_repository_boolean_target(
+            context,
+            dict(matched[0].get("feature_flag_match") or {}),
+            cloud=cloud,
+            workflow=workflow,
+        )
     else:
         context["selection_state"] = "candidate_selection_required"
         context["selected_path"] = ""
