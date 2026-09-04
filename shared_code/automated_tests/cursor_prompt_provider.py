@@ -280,6 +280,8 @@ def _build_cursor_instruction(cases: Sequence[Any], run_id: str) -> str:
             "8. Prefer developer-style descriptions of the resource behavior over Terraform identifier wording. Use repository vocabulary and nearby module/resource semantics, not a direct humanization of the flag name.",
             "9. Return JSON only. Do not wrap it in Markdown and do not add commentary.",
             "",
+            *_json_contract_lines(_SCHEMA_VERSION),
+            "",
             "Primary Terraform authoring context:",
             f"- context sha256: {context_sha or 'unavailable'}",
             "- authority: repository conventions only; live selected-commit repository evidence wins on conflict.",
@@ -507,44 +509,136 @@ def _wait_for_result(
         )
 
 
+# Cursor Cloud Agents (especially in "plan" mode on large repositories) often
+# wrap their final answer in prose, summaries, or partial markdown, which made
+# the old "first { .. last }" extraction fail ~5/6 of the time. Every Terrabot
+# instruction now asks Cursor to print the JSON between these unique sentinel
+# markers, and the parser prefers marker extraction, then fenced blocks, then
+# a balanced-brace scan that picks the JSON object containing schema_version.
+_JSON_BEGIN_MARKER = "BEGIN_TERRABOT_JSON"
+_JSON_END_MARKER = "END_TERRABOT_JSON"
+
+
+def _json_contract_lines(schema_version: str) -> list[str]:
+    """Shared final-response contract appended to every Cursor instruction."""
+    return [
+        "FINAL RESPONSE CONTRACT (MANDATORY):",
+        f"1. Print the line {_JSON_BEGIN_MARKER} on its own line.",
+        "2. On the next line print exactly one raw JSON object (no markdown fences, no comments).",
+        f"3. Print the line {_JSON_END_MARKER} on its own line.",
+        f"4. schema_version inside the JSON must be exactly {schema_version}.",
+        "5. Any analysis or notes must appear BEFORE the begin marker, never between or after the markers.",
+        "6. Never finish without the two marker lines and the JSON object between them.",
+    ]
+
+
+def _scan_balanced_json_objects(text: str) -> list[dict[str, Any]]:
+    """Return every parseable top-level JSON object found in free text."""
+    objects: list[dict[str, Any]] = []
+    depth = 0
+    start = -1
+    in_string = False
+    escaped = False
+    for index, char in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+            continue
+        if char == "{":
+            if depth == 0:
+                start = index
+            depth += 1
+        elif char == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start >= 0:
+                    candidate = text[start : index + 1]
+                    try:
+                        value = json.loads(candidate)
+                    except json.JSONDecodeError:
+                        value = None
+                    if isinstance(value, dict):
+                        objects.append(value)
+                    start = -1
+    return objects
+
+
 def _parse_result_text(result_text: str) -> dict[str, Any]:
     text = str(result_text or "").strip()
-    if text.startswith("```"):
-        lines = text.splitlines()
+
+    # 1) Sentinel markers — the strongest signal, immune to surrounding prose.
+    if _JSON_BEGIN_MARKER in text and _JSON_END_MARKER in text:
+        begin = text.find(_JSON_BEGIN_MARKER) + len(_JSON_BEGIN_MARKER)
+        end = text.find(_JSON_END_MARKER, begin)
+        if end > begin:
+            marked = text[begin:end].strip()
+            if marked.startswith("```"):
+                marked = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", marked)
+                marked = re.sub(r"\s*```$", "", marked).strip()
+            try:
+                data = json.loads(marked)
+                if isinstance(data, dict):
+                    return data
+            except json.JSONDecodeError:
+                pass  # fall through to the other strategies
+
+    # 2) A fenced ```json block anywhere in the text.
+    for fence in re.finditer(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL):
+        try:
+            data = json.loads(fence.group(1))
+            if isinstance(data, dict):
+                return data
+        except json.JSONDecodeError:
+            continue
+
+    # 3) The whole text (optionally after stripping one outer fence).
+    stripped = text
+    if stripped.startswith("```"):
+        lines = stripped.splitlines()
         if lines and lines[0].strip().startswith("```"):
             lines = lines[1:]
         if lines and lines[-1].strip() == "```":
             lines = lines[:-1]
-        text = "\n".join(lines).strip()
+        stripped = "\n".join(lines).strip()
     try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        start = text.find("{")
-        end = text.rfind("}")
-        if start < 0 or end <= start:
-            # Surface what Cursor actually returned. Previously this raised
-            # with no visibility into the raw text, so a Cursor agent that
-            # answered in prose (common in "plan" mode on large repositories)
-            # was indistinguishable from a genuine API/timeout failure in the
-            # logs, making this class of failure impossible to diagnose or
-            # fix from Function App logs alone.
-            preview = re.sub(r"\s+", " ", text)[:800]
-            LOGGER.warning(
-                "[TerrabotCursor] event=cursor_result_not_json level=warning "
-                "result_preview=%s",
-                preview,
-            )
-            raise CursorPromptError(
-                "Cursor result did not contain a JSON object. "
-                f"result_preview={preview!r}"
-            )
-        try:
-            data = json.loads(text[start : end + 1])
-        except json.JSONDecodeError as exc:
-            raise CursorPromptError(f"Cursor result JSON was invalid: {exc}") from exc
-    if not isinstance(data, dict):
+        data = json.loads(stripped)
+        if isinstance(data, dict):
+            return data
         raise CursorPromptError("Cursor result must be a JSON object.")
-    return data
+    except json.JSONDecodeError:
+        pass
+
+    # 4) Balanced-brace scan across the prose: prefer an object that carries
+    # schema_version (the Terrabot payload) over incidental JSON snippets that
+    # Cursor may quote while explaining its analysis.
+    candidates = _scan_balanced_json_objects(stripped)
+    schema_candidates = [item for item in candidates if "schema_version" in item]
+    if schema_candidates:
+        return schema_candidates[-1]
+    if candidates:
+        return candidates[-1]
+
+    # Surface what Cursor actually returned. Previously this raised with no
+    # visibility into the raw text, so a Cursor agent that answered in prose
+    # (common in "plan" mode on large repositories) was indistinguishable from
+    # a genuine API/timeout failure in the logs.
+    preview = re.sub(r"\s+", " ", text)[:800]
+    LOGGER.warning(
+        "[TerrabotCursor] event=cursor_result_not_json level=warning "
+        "result_preview=%s",
+        preview,
+    )
+    raise CursorPromptError(
+        "Cursor result did not contain a JSON object. "
+        f"result_preview={preview!r}"
+    )
 
 
 def _validated_prompts(
@@ -926,13 +1020,12 @@ def _repair_clarification_protocol(
             "Do not inspect a repository, edit files, commit, push, create branches, or open PRs.",
             "Do not change the semantic meaning of the prior result and do not invent a path, flag, value, or evidence.",
             f"The previous response failed validation with: {validation_error}",
-            "Return exactly one raw JSON object; first character { and last character }. No markdown or prose.",
             f"schema_version must be exactly {_CLARIFICATION_SCHEMA_VERSION}.",
             "Required keys: schema_version, answer, resolution_type, candidates_relevant, selected_index, selected_path, selected_flag, selected_current_value, selected_new_value, reason, evidence.",
             "If the prior result did not actually identify a unique repository control, preserve that meaning by returning resolution_type=unresolved, selected_index=null, selected_path=\"\", selected_flag=\"\", selected_current_value=null, selected_new_value=null, answer=\"\", evidence=[].",
             "Prior Cursor result:",
             prior,
-            "FINAL: emit the JSON object itself and nothing else.",
+            *_json_contract_lines(_CLARIFICATION_SCHEMA_VERSION),
         ])
         payload = {
             "name": f"Terrabot clarification protocol repair {run_id} {case_id}"[:100],
@@ -1191,8 +1284,20 @@ def resolve_repository_clarification(
         "For unresolved, set selected_current_value=null, selected_new_value=null, selected_path=\"\", selected_flag=\"\", and evidence=[].",
         "evidence must contain at most 4 short repository-grounded strings identifying the live file/assignment or wiring that proves the choice.",
         "The answer must be concise and directly usable as the clarification reply. Never invent a path, flag, current value, or target value.",
-        "FINAL RESPONSE CONTRACT: output exactly one raw JSON object. The first character must be { and the last character must be }. Do not emit markdown, prose, or a sentence saying that JSON is required; actually emit the JSON object.",
-        f"Use this exact schema_version literal: {_CLARIFICATION_SCHEMA_VERSION}.",
+        json.dumps({
+            "schema_version": _CLARIFICATION_SCHEMA_VERSION,
+            "answer": "1 or Use <flag> in <path>.",
+            "resolution_type": "candidate | repository_control | unresolved",
+            "candidates_relevant": True,
+            "selected_index": 1,
+            "selected_path": "repo/relative/path.tf",
+            "selected_flag": "enable_example",
+            "selected_current_value": True,
+            "selected_new_value": False,
+            "reason": "short reason",
+            "evidence": ["path: proof"],
+        }, ensure_ascii=False),
+        *_json_contract_lines(_CLARIFICATION_SCHEMA_VERSION),
     ])
     repos = [{"url": f"https://github.com/{owner}/{repo}", "startingRef": commit_sha}]
     remote_before = cursor_readonly_guard.snapshot_remote_branches(repos)
@@ -1215,60 +1320,98 @@ def resolve_repository_clarification(
             candidate_count=len(candidate_payload),
             prompt_chars=len(instruction),
         )
-        created = _http_json(
-            session,
-            "POST",
-            f"{base_url}/v1/agents",
-            headers=headers,
-            timeout=request_timeout,
-            payload=create_payload,
-        )
-        agent_id, cursor_run_id, initial_run = _extract_agent_and_run(created)
-        cursor_run_id = _resolve_run_id(
-            session, agent_id, cursor_run_id,
-            base_url=base_url, headers=headers, timeout=request_timeout,
-        )
-        result_text, terminal = _wait_for_result(
-            session, agent_id, cursor_run_id, initial_run,
-            base_url=base_url,
-            headers=headers,
-            request_timeout=request_timeout,
-            run_timeout=run_timeout,
-            poll_interval=poll_interval,
-            run_label=run_id or case_id or "clarification",
-            log_event=log_event,
-        )
-        remote_after = cursor_readonly_guard.snapshot_remote_branches(repos)
-        mutations = cursor_readonly_guard.cursor_reported_remote_mutations(
-            terminal, remote_before, remote_after
-        )
-        if mutations:
-            raise CursorPromptError(
-                "Cursor changed a verified remote GitHub branch while resolving a clarification: "
-                + json.dumps(mutations, ensure_ascii=False)[:1000]
+        max_attempts = _int_setting("TERRABOT_CURSOR_CLARIFICATION_MAX_ATTEMPTS", 2, 1, 3)
+        parsed: dict[str, Any] = {}
+        last_error: CursorPromptError | None = None
+        agent_id = ""
+        cursor_run_id = ""
+        for attempt in range(1, max_attempts + 1):
+            attempt_instruction = instruction
+            if attempt > 1 and last_error is not None:
+                attempt_instruction = "\n".join([
+                    instruction,
+                    "",
+                    "RETRY NOTICE: your previous response for this exact task failed "
+                    f"format validation with: {str(last_error)[:600]}",
+                    "You may reuse your previous repository analysis; the ONLY change "
+                    "required is emitting the response in the mandated marker+JSON format.",
+                ])
+            create_payload["prompt"] = {"text": attempt_instruction}
+            created = _http_json(
+                session,
+                "POST",
+                f"{base_url}/v1/agents",
+                headers=headers,
+                timeout=request_timeout,
+                payload=create_payload,
             )
-        try:
-            parsed = _parse_result_text(result_text)
-            schema_version = str(parsed.get("schema_version") or "").strip()
-            if schema_version != _CLARIFICATION_SCHEMA_VERSION:
-                raise CursorPromptError(
-                    f"Cursor clarification schema_version must be {_CLARIFICATION_SCHEMA_VERSION}."
-                )
-        except CursorPromptError as protocol_error:
-            parsed = _repair_clarification_protocol(
-                session=session,
+            agent_id, cursor_run_id, initial_run = _extract_agent_and_run(created)
+            cursor_run_id = _resolve_run_id(
+                session, agent_id, cursor_run_id,
+                base_url=base_url, headers=headers, timeout=request_timeout,
+            )
+            result_text, terminal = _wait_for_result(
+                session, agent_id, cursor_run_id, initial_run,
                 base_url=base_url,
                 headers=headers,
                 request_timeout=request_timeout,
+                run_timeout=run_timeout,
                 poll_interval=poll_interval,
-                invalid_result=result_text,
-                validation_error=str(protocol_error),
-                run_id=run_id,
-                case_id=case_id,
+                run_label=run_id or case_id or "clarification",
                 log_event=log_event,
             )
-            if not parsed:
-                raise
+            remote_after = cursor_readonly_guard.snapshot_remote_branches(repos)
+            mutations = cursor_readonly_guard.cursor_reported_remote_mutations(
+                terminal, remote_before, remote_after
+            )
+            if mutations:
+                raise CursorPromptError(
+                    "Cursor changed a verified remote GitHub branch while resolving a clarification: "
+                    + json.dumps(mutations, ensure_ascii=False)[:1000]
+                )
+            try:
+                parsed = _parse_result_text(result_text)
+                schema_version = str(parsed.get("schema_version") or "").strip()
+                if schema_version != _CLARIFICATION_SCHEMA_VERSION:
+                    raise CursorPromptError(
+                        f"Cursor clarification schema_version must be {_CLARIFICATION_SCHEMA_VERSION}."
+                    )
+                last_error = None
+                break
+            except CursorPromptError as protocol_error:
+                # First try the cheap no-repository protocol repair on this
+                # attempt's raw text before burning a full repository re-read.
+                repaired = _repair_clarification_protocol(
+                    session=session,
+                    base_url=base_url,
+                    headers=headers,
+                    request_timeout=request_timeout,
+                    poll_interval=poll_interval,
+                    invalid_result=result_text,
+                    validation_error=str(protocol_error),
+                    run_id=run_id,
+                    case_id=case_id,
+                    log_event=log_event,
+                )
+                if repaired:
+                    parsed = repaired
+                    last_error = None
+                    break
+                last_error = protocol_error
+                _emit(
+                    "cursor_clarification_format_retry",
+                    level="warning",
+                    log_event=log_event,
+                    run_id=run_id,
+                    test_case_id=case_id,
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    error=protocol_error,
+                )
+        if last_error is not None or not parsed:
+            raise last_error or CursorPromptError(
+                "Cursor clarification produced no parseable result."
+            )
         answer = re.sub(r"\s+", " ", str(parsed.get("answer") or "")).strip()
         resolution_type = str(parsed.get("resolution_type") or "").strip().lower()
         if resolution_type not in {"candidate", "repository_control", "unresolved"}:
@@ -1464,6 +1607,7 @@ def generate_repository_questions(
                 "evidence_paths": ["repo/relative/path.tf"],
             }],
         }, ensure_ascii=False),
+        *_json_contract_lines(_REPO_QUESTION_SCHEMA_VERSION),
     ])
     repos = [{"url": f"https://github.com/{owner}/{repo}", "startingRef": commit_sha}]
     remote_before = cursor_readonly_guard.snapshot_remote_branches(repos)
@@ -1589,6 +1733,7 @@ def validate_repository_answer(
         "Inspect the repository yourself. Mark correct=true only if the Terrabot answer is materially correct and repository-grounded. It need not use identical wording to expected_answer.",
         "Return raw JSON only with schema_version, correct, reason, evidence.",
         json.dumps({"schema_version": _REPO_ANSWER_SCHEMA_VERSION, "correct": True, "reason": "short reason", "evidence": ["path: proof"]}, ensure_ascii=False),
+        *_json_contract_lines(_REPO_ANSWER_SCHEMA_VERSION),
     ])
     repos = [{"url": f"https://github.com/{owner}/{repo}", "startingRef": commit_sha}]
     remote_before = cursor_readonly_guard.snapshot_remote_branches(repos)

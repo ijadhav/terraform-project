@@ -717,6 +717,127 @@ _TEAMS_SIBLING_FLAG_LINE_RE = re.compile(
     r"(?m)^([ \t]*)[a-z0-9_]+_enabled[ \t]*=[ \t]*(?:true|false)[ \t]*$"
 )
 
+# Matches automated clarification resolutions of the shape produced by the
+# Cursor clarification assistant ("Use <flag> in <path>." — see
+# cursor_prompt_provider.resolve_repository_clarification). These arrive as a
+# normal continuation message; without this parser the generic picker only
+# understood a bare option number or an exact flag/module name, so a fully
+# correct Cursor answer bounced back into another clarification loop.
+_TEAMS_CURSOR_RESOLUTION_RE = re.compile(
+    r"(?i)\buse\s+(?P<flag>[A-Za-z0-9_.-]+)\s+in\s+(?P<path>[A-Za-z0-9_./-]+)"
+)
+
+
+def _teams_parse_cursor_clarification_resolution(reply: str) -> dict:
+    """Extract a flag/path resolution from a Cursor-style clarification reply.
+
+    Understands both the sentence form ``Use <flag> in <path>.`` and a JSON
+    resolution object carrying ``selected_flag``/``selected_path`` (and
+    optionally ``selected_new_value``). Returns {} when the reply is not a
+    recognizable automated resolution, so ordinary user messages are untouched.
+    """
+    text = str(reply or "").strip()
+    if not text:
+        return {}
+    # JSON resolution payload (whole reply or embedded object).
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            payload = json.loads(text[start : end + 1])
+        except Exception:
+            payload = None
+        if isinstance(payload, dict):
+            flag = str(payload.get("selected_flag") or "").strip()
+            path = str(payload.get("selected_path") or "").strip().strip("/")
+            if flag or path:
+                resolution = {"flag": flag, "path": path}
+                if isinstance(payload.get("selected_new_value"), bool):
+                    resolution["new_value"] = payload["selected_new_value"]
+                return resolution
+    match = _TEAMS_CURSOR_RESOLUTION_RE.search(text)
+    if match:
+        return {
+            "flag": match.group("flag").strip(),
+            "path": match.group("path").strip().strip("/"),
+        }
+    return {}
+
+
+def _teams_select_candidate_from_cursor_resolution(reply: str, pending_selection: dict):
+    """Resolve a pending target picker from a Cursor clarification answer.
+
+    Returns the 0-based candidate index when the resolution's flag and/or path
+    uniquely identifies one pending candidate, otherwise None (preserving all
+    existing picker behavior for human replies).
+    """
+    resolution = _teams_parse_cursor_clarification_resolution(reply)
+    if not resolution:
+        return None
+    wanted_flag = str(resolution.get("flag") or "").strip().lower()
+    wanted_path = str(resolution.get("path") or "").strip().strip("/").lower()
+    candidates = (
+        (pending_selection.get("existing_infra_context") or {}).get("matched_files") or []
+    )
+    matches = []
+    for index, candidate in enumerate(candidates):
+        if not isinstance(candidate, dict):
+            continue
+        candidate_path = str(candidate.get("path") or "").strip().strip("/").lower()
+        flag_match = candidate.get("feature_flag_match") or {}
+        candidate_flag = str(
+            candidate.get("flag") or flag_match.get("flag") or ""
+        ).strip().lower()
+        flag_ok = bool(wanted_flag) and candidate_flag == wanted_flag
+        path_ok = bool(wanted_path) and bool(candidate_path) and (
+            candidate_path == wanted_path
+            or candidate_path.endswith("/" + wanted_path)
+            or wanted_path.endswith("/" + candidate_path)
+        )
+        if wanted_flag and wanted_path:
+            if flag_ok and (path_ok or not candidate_path):
+                matches.append(index)
+            elif flag_ok and not path_ok:
+                # Same flag name can gate different environments; only accept a
+                # flag-only match when the path does not contradict it.
+                continue
+        elif flag_ok or path_ok:
+            matches.append(index)
+    if len(matches) == 1:
+        LOGGER.info(
+            "[TerrabotDiag] event=cursor_clarification_resolution_matched_candidate "
+            "flag=%s path=%s candidate_index=%s",
+            wanted_flag, wanted_path, matches[0],
+        )
+        return matches[0]
+    if wanted_flag and not matches:
+        # Fall back to flag-only matching when the resolution path simply was
+        # not recorded on the candidate (older pickers omitted paths).
+        flag_only = [
+            index
+            for index, candidate in enumerate(candidates)
+            if isinstance(candidate, dict)
+            and str(
+                candidate.get("flag")
+                or (candidate.get("feature_flag_match") or {}).get("flag")
+                or ""
+            ).strip().lower() == wanted_flag
+        ]
+        if len(flag_only) == 1:
+            LOGGER.info(
+                "[TerrabotDiag] event=cursor_clarification_resolution_matched_flag_only "
+                "flag=%s candidate_index=%s",
+                wanted_flag, flag_only[0],
+            )
+            return flag_only[0]
+    if matches:
+        LOGGER.warning(
+            "[TerrabotDiag] event=cursor_clarification_resolution_ambiguous "
+            "flag=%s path=%s match_count=%s",
+            wanted_flag, wanted_path, len(matches),
+        )
+    return None
+
 
 def _handle_teams_chat_request_base(data: dict):  # pyright: ignore[reportGeneralTypeIssues]
     """Run Teams through the centrally installed GitHub App.
@@ -1694,6 +1815,13 @@ def handle_chat_request(data: dict):
             pending_infra_mod_selection = {}
         if pending_infra_mod_selection:
             selected_index = select_infra_modification_candidate_from_reply(prompt, pending_infra_mod_selection)
+            if selected_index is None:
+                # An automated (Cursor) clarification resolution such as
+                # "Use enable_x in path/to/env.tfvars." must select the pending
+                # target directly instead of bouncing into another picker loop.
+                selected_index = _teams_select_candidate_from_cursor_resolution(
+                    prompt, pending_infra_mod_selection
+                )
             if selected_index is None:
                 # Creation requests must not force the user to choose repository
                 # structure that Terrabot can resolve from live GitHub evidence.
