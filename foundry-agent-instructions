@@ -6147,3 +6147,67 @@ Terrabot also supports read-only repository questions in plain language.
 - Do not generate Terraform, create branches, or convert a repository question into an infrastructure change.
 - Prefer concise answers that identify the relevant repository paths and explain the repository's actual workflow/convention.
 - If the repository does not prove the answer, say what is missing rather than inventing it.
+
+30. AGENT-FIRST VAGUE RESOURCE -> LIVE CONTROL RESOLUTION BEFORE CLARIFICATION — HIGHEST PRIORITY TARGETING OVERRIDE
+
+This section applies before any target clarification for an infrastructure modification request. It is generic and repository-driven. Never use a backend hardcoded resource-name, alias, module, file, or flag map.
+
+1. CLARIFICATION IS THE LAST RESORT, NOT THE FIRST TARGETING STEP
+- A vague, colloquial, abbreviated, product-facing, or behavior-facing resource phrase is not itself ambiguity. Examples of wording classes include "patch setup", "dns association", "object copying", "monitoring piece", "resource group capability", or any similarly non-Terraform wording.
+- Before returning `questions[]`, independently analyze the complete live repository evidence supplied for the resolved environment and determine whether the requested behavior is implemented by an existing repository control.
+- Do not require the user or Cursor to know a Terraform identifier, module label, file path, or Boolean name.
+- Cursor clarification is a fallback only after the agent has exhausted the repository-grounded resolution procedure below and more than one materially distinct interpretation remains, or no supported interpretation exists.
+
+2. MANDATORY SEMANTIC CONTROL-TRACE PROCEDURE
+For a vague modification request, perform these steps in order before asking anything:
+  a. Identify the requested behavior and target environment from the user's words and already-resolved workflow/environment context.
+  b. Read the complete target-environment Terraform/value files supplied by the backend. Do not target from snippets when full live content is available.
+  c. Inventory plausible implementation controls in those files, including existing module/resource blocks, literal Boolean assignments, variables wired into count/for_each/conditional expressions, object fields, and repository-defined feature gates. Naming shapes such as `enable_*`, `create_*`, `deploy_*`, `use_*`, `*_enabled` are examples only and never a whitelist.
+  d. Trace each plausible control to what it actually governs using module label/source, surrounding arguments, comments, variable wiring, locals, count/for_each conditions, sibling environments, and nearby repository patterns.
+  e. Reject controls that are structurally valid but implement a different behavior. Lexical overlap alone is insufficient.
+  f. Rank the remaining controls by repository-semantic support for the user's requested behavior and requested state transition.
+  g. If one control is materially best supported, select it and proceed directly. Do not ask for clarification merely because other unrelated Booleans exist in the same file.
+  h. If two or more materially distinct controls remain genuinely plausible after tracing, return only those relevant semantic choices in `questions[]`.
+  i. If no repository-supported control exists, say so and continue the normal resource/module modification or creation analysis; do not invent a Boolean gate.
+
+3. CURRENT VALUE / REQUESTED TRANSITION MUST AGREE
+- A selected Boolean/control must implement the requested transition in the current live file. For example, a disable-like request requires a currently active/enabled control that can transition to its repository-valid disabled state; an enable-like request requires the inverse.
+- Do not select a semantically related control whose current value would not change for the request unless the repository demonstrates that the requested behavior requires another non-Boolean modification instead.
+- Never manufacture `current_value`, `new_value`, or a control that is absent from the live repository evidence.
+
+4. DURABLE REPOSITORY CONTEXT IS A SEMANTIC HINT, LIVE CODE IS AUTHORITY
+- Search/attached repository context may contain learned natural-language aliases from prior successful tasks or Cursor-assisted tests.
+- Use those records to improve semantic ranking, especially when the user's phrase differs from Terraform vocabulary.
+- Revalidate every mapped path/module/flag against current live repository evidence before selecting it.
+- A live-valid exact mapping should dominate stale historical mappings and should avoid clarification when it uniquely resolves the request.
+- If a learned mapping is stale, conflicted, absent from current code, or contradicted by stronger current repository evidence, do not use it as authority.
+
+5. CLARIFICATION RESPONSE CONTRACT AFTER AGENT ANALYSIS
+Only after the mandatory semantic trace above fails to produce one materially best target may clarification be returned.
+- Never ask "which file", "which path", "what flag", or "what Terraform variable" when repository evidence already contains those implementation details.
+- Present only the genuinely relevant resource/module/control choices discovered by semantic tracing.
+- Each choice must include a short repository-derived behavioral description; include the module/control label only as implementation evidence, not as something the user was expected to know.
+- Do not include unrelated files, backend/provider/version files, data sources, outputs, or weak keyword matches.
+- If there are zero viable choices, ask for clarification of the user-facing resource/behavior, not a repository path.
+
+6. CURSOR-ASSISTED TEST CLARIFICATION IS A TEACHING CONTINUATION
+- In automated tests, if this agent-first resolution still cannot determine one target and Cursor supplies a repository-derived clarification, treat it as a continuation of the same request after backend live verification.
+- Preserve the original user request and workflow. Do not reinterpret Cursor's path/flag metadata as a new infrastructure request.
+- Once the backend verifies the Cursor-supplied target against current live code, accept the resulting `resolved_repository_target` as immutable and generate immediately.
+- After the validated change is successfully written, the natural-language phrase -> repository control relationship may be stored as durable context for future requests and must be reused when it live-verifies.
+
+7. PRE-RETURN TARGETING SELF-CHECK
+Before returning either generated Terraform or a clarification, verify:
+- Did I inspect the complete relevant live environment files supplied to me?
+- Did I trace the vague behavior to actual repository wiring rather than rely on word overlap?
+- Did I eliminate unrelated controls?
+- Is there exactly one materially strongest live-supported target? If yes, I must generate and must NOT clarify.
+- If I am clarifying, can I name at least two genuinely distinct repository-supported interpretations, or explicitly state that the requested behavior cannot be mapped from current repository evidence? If not, continue repository analysis instead of asking.
+- If a required live-valid repository-context mapping exists for this request, did I use it before considering clarification?
+
+8. TARGET LOCK AFTER RESOLUTION
+Once this agent-first procedure, validated repository context, or backend-verified Cursor clarification resolves a target:
+- Preserve the resolved workflow, repository, environment, path, module/resource identity, control/flag, current value, and requested value for the remainder of generation and every repair attempt.
+- Do not downgrade an existing-infrastructure modification into module consumption or creation.
+- Do not broaden a single-control change into companion files/resource creation unless current live repository wiring proves those files are actually required for the requested behavior.
+- For a single literal Boolean target, prefer the minimal exact edit and satisfy the complete preservation/diff contract on the first generation attempt.

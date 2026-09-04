@@ -167,6 +167,12 @@ def github_put_file_if_changed_stage2(
     normalized_existing = (existing_content or "").replace("\r\n", "\n").strip()
     normalized_new = final_content.replace("\r\n", "\n").strip()
     if existing_content is not None and normalized_existing == normalized_new:
+        active = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
+        if active.get("active") and str(workflow or "").strip() in INFRA_MODIFICATION_WORKFLOWS:
+            raise UnsafeGeneratedChangeError(
+                f"Generated modification for {path} is identical to the current live GitHub file. "
+                "Foundry must return an actual requested change; an unchanged repository file is not a valid modification."
+            )
         return {"changed": False, "path": path, "result": None}
 
     if path.endswith((".tf", ".tfvars")):
@@ -809,9 +815,19 @@ def github_put_file_if_changed(
         workflow=workflow,
     )
     if existing_content is not None:
+        generated_content = str(content or "")
+        active = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
+        if active.get("active") and (
+            existing_content.replace("\r\n", "\n")
+            == generated_content.replace("\r\n", "\n")
+        ):
+            raise UnsafeGeneratedChangeError(
+                f"Generated output for {path} is identical to the current live repository file. "
+                "A modification request must contain a real repository delta; unchanged full-file output is rejected."
+            )
         _validate_selected_boolean_is_only_file_change(
             existing_content,
-            str(content or ""),
+            generated_content,
             path,
         )
     return _FINAL_BOOL_PREVIOUS_GITHUB_PUT(
@@ -1805,83 +1821,16 @@ def _teams_azure_boolean_resolution_phases(
     repository_evidence: list[dict],
     scope_root: str = "",
 ) -> list[list[dict]]:
-    """Return ordered evidence phases for Azure enable/disable resolution.
+    """Return repository evidence without backend semantic/file-precedence filtering.
 
-    A normal hub request must never let a sibling ``dr.tfvars`` compete with
-    ``hub.tfvars``.  Foundry still owns the semantic mapping from user wording
-    to a repository Boolean, but it receives the value files in repository
-    precedence order: hub -> tier -> common.  For an explicit DR/failover
-    request, dr.tfvars is the leaf value file instead.
-
-    Non-tfvars Terraform evidence is included in every phase so Foundry can
-    infer what a Boolean controls from module/resource wiring without asking
-    the user for a flag or file name.
+    Foundry owns the decision about which live Terraform/value file and Boolean
+    implement the request. The backend must not privilege hub.tfvars, dr.tfvars,
+    tier.tfvars, common.tfvars, or any operation vocabulary when resolving the
+    semantic target. This helper is retained for compatibility and now returns a
+    single complete evidence phase only.
     """
-    intent = _teams_feature_flag_intent(prompt)
-    if intent not in {"enable", "disable"}:
-        return [list(repository_evidence or [])]
-
-    evidence = [item for item in (repository_evidence or []) if isinstance(item, dict)]
-    non_values = [
-        item for item in evidence
-        if not _teams_context_file_identity(item).lower().endswith((".tfvars", ".tfvars.json"))
-    ]
-    value_items = [
-        item for item in evidence
-        if _teams_context_file_identity(item).lower().endswith((".tfvars", ".tfvars.json"))
-    ]
-    if not value_items:
-        return [evidence]
-
-    text = normalize_yes_no_reply(prompt)
-    dr_requested = bool(re.search(
-        r"(?<![a-z0-9])(dr|disaster recovery|failover|secondary)(?![a-z0-9])",
-        text,
-    ))
-    preferred_basenames = (
-        ("dr.tfvars", "tier.tfvars", "common.tfvars")
-        if dr_requested
-        else _TEAMS_FLAG_VALUES_BASENAME_PRIORITY
-    )
-
-    normalized_scope = str(scope_root or "").strip().strip("/")
-    phases: list[list[dict]] = []
-    used_paths: set[str] = set()
-
-    for basename in preferred_basenames:
-        matches: list[dict] = []
-        for item in value_items:
-            path = _teams_context_file_identity(item).strip().strip("/")
-            if not path or path in used_paths:
-                continue
-            if path.rsplit("/", 1)[-1].lower() != basename:
-                continue
-            if normalized_scope:
-                # Leaf hub/dr files belong to the exact environment folder.
-                # tier/common may be inherited from a direct parent/root and
-                # are therefore allowed outside the leaf scope.
-                if basename in {"hub.tfvars", "dr.tfvars"} and not path.startswith(normalized_scope.rstrip("/") + "/"):
-                    continue
-            matches.append(item)
-        if not matches:
-            continue
-        for item in matches:
-            used_paths.add(_teams_context_file_identity(item).strip().strip("/"))
-        phases.append(_teams_merge_repository_evidence(non_values, matches))
-
-    # Never reintroduce dr.tfvars into a normal environment request. If none of
-    # the preferred files were present, keep non-DR value evidence only.
-    if not phases:
-        allowed_values = []
-        for item in value_items:
-            path = _teams_context_file_identity(item).lower()
-            if not dr_requested and path.endswith("/dr.tfvars"):
-                continue
-            allowed_values.append(item)
-        phases.append(_teams_merge_repository_evidence(non_values, allowed_values))
-
-    return [phase for phase in phases if phase] or [evidence]
-
+    evidence = [dict(item) for item in (repository_evidence or []) if isinstance(item, dict)]
+    return [evidence] if evidence else [[]]
 
 def _teams_resolve_repository_boolean_strategy(
     prompt: str,
@@ -1905,59 +1854,6 @@ def _teams_resolve_repository_boolean_strategy(
         if candidates:
             return strategy, candidates, phase
 
-        # Foundry semantic classification is primary. If it declines a Boolean
-        # even though the preferred repository value file contains one unique,
-        # high-confidence prompt/identifier match, use the existing generic
-        # backend selector as a safety fallback. This selector is resource-
-        # agnostic, tie-safe, and operates only on literal live-repository
-        # assignments; it never invents a flag or path. The fallback prevents
-        # "tell me the exact variable/file" questions for self-answerable
-        # requests such as disabling a homepage application whose repo flag is
-        # named aca_app_homepage_bff_enabled.
-        fallback_context = {
-            "matched_files": list(phase),
-            "environment_files": list(phase),
-            "selection_state": "candidate_selection_required",
-        }
-        selected = _teams_auto_select_feature_flag_context_stage1(
-            fallback_context,
-            prompt,
-        )
-        selected_files = list((selected or {}).get("matched_files") or [])
-        if (selected or {}).get("feature_flag_selection") and len(selected_files) == 1:
-            selected_item = selected_files[0]
-            match = dict(selected_item.get("feature_flag_match") or {})
-            path = _teams_context_file_identity(selected_item)
-            flag = str(match.get("flag") or "").strip()
-            current = str(match.get("current_value") or "").strip().lower()
-            target = str(match.get("new_value") or "").strip().lower()
-            try:
-                line_number = int(match.get("line") or 0)
-            except (TypeError, ValueError):
-                line_number = 0
-            if path and flag and line_number > 0 and current in {"true", "false"} and target in {"true", "false"} and current != target:
-                candidate = {
-                    "path": path,
-                    "line_number": line_number,
-                    "flag": flag,
-                    "current_value": current,
-                    "new_value": target,
-                    "confidence": 1.0,
-                    "context": str(match.get("context") or "").strip(),
-                    "description": "Unique live-repository Boolean matched by prompt semantics after Foundry declined a Boolean strategy.",
-                    "classification_reason": "deterministic repository Boolean fallback after semantic classifier returned no candidate",
-                    "operation": _teams_feature_flag_intent(prompt),
-                }
-                fallback_strategy = {
-                    "operation": _teams_feature_flag_intent(prompt),
-                    "boolean_applicable": True,
-                    "reason": (
-                        "Foundry returned no Boolean candidate, but live repository evidence contained one unique "
-                        "high-confidence literal Boolean matching the requested feature in the preferred values file."
-                    ),
-                    "fallback": "unique_literal_boolean_semantic_match",
-                }
-                return fallback_strategy, [candidate], phase
     return last_strategy, [], last_phase
 
 
@@ -2291,10 +2187,13 @@ def _teams_active_repository_change_strategy() -> dict:
 
 
 def _teams_validation_change_mode(path: str, workflow: str | None) -> str:
-    """Choose validation mode without resource-, repo-, path-, or flag-name maps.
+    """Choose only the backend safety policy for an already-routed write.
 
-    Semantic resource/flag selection remains Foundry-owned. The backend uses
-    only the validated Boolean evidence and the already-resolved operation.
+    The backend must not infer create/enable/disable/delete semantics from a
+    hardcoded action vocabulary. Foundry/Cursor own semantic intent and target
+    resolution. Backend validation only distinguishes a live-verified Boolean
+    target from a normal existing-infrastructure modification so it can enforce
+    preservation and minimal-diff safety.
     """
     if _selected_feature_flag_match_from_active_context(path):
         return "boolean"
@@ -2302,17 +2201,6 @@ def _teams_validation_change_mode(path: str, workflow: str | None) -> str:
     active = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
     if not active.get("active"):
         return "legacy"
-
-    strategy = _teams_active_repository_change_strategy()
-    operation = str(strategy.get("operation") or "").strip().lower()
-    if operation in {"create", "creation", "add", "provision", "deploy"}:
-        return "create"
-    if operation in {"modify", "modification", "update", "delete", "deletion", "remove"}:
-        return "modify"
-
-    effective_prompt = str(active.get("effective_prompt") or "").strip()
-    if effective_prompt and _teams_is_existing_invocation_creation(effective_prompt):
-        return "create"
 
     if str(workflow or "").strip() in INFRA_MODIFICATION_WORKFLOWS:
         return "modify"
@@ -2392,18 +2280,29 @@ def _validate_foundry_targeted_existing_file_delta(
                 )
 
     existing_line_count = max(1, len(old_lines))
-    changed_total = changed_existing + changed_generated
-    # Dynamic safety budgets scale with file size; they are not tied to any
-    # repository, environment, resource family, or feature-flag name.
-    line_budget = max(20, int(math.ceil(existing_line_count * 0.20)))
-    hunk_budget = max(3, int(math.ceil(existing_line_count / 250.0)))
+    generated_line_count = max(1, len(new_lines))
+    unchanged_ratio = matcher.ratio()
+    removed_lines = max(0, existing_line_count - generated_line_count)
 
-    if changed_total > line_budget or hunks > hunk_budget:
+    # Backend safety is intentionally coarse. It rejects destructive/truncated
+    # rewrites, not legitimate repository-semantic edits. Cursor/Foundry own
+    # correctness of the requested resource change. There is deliberately no
+    # resource/action/flag vocabulary and no small fixed diff budget here.
+    large_omission = (
+        removed_lines > max(20, int(math.ceil(existing_line_count * 0.30)))
+        or generated_line_count < max(1, int(math.floor(existing_line_count * 0.70)))
+    )
+    broad_rewrite = (
+        unchanged_ratio < 0.70
+        and changed_existing > max(30, int(math.ceil(existing_line_count * 0.35)))
+    )
+
+    if large_omission or broad_rewrite:
         raise UnsafeGeneratedChangeError(
-            f"Modification output for {path} is not a small targeted delta "
-            f"({changed_total} changed line entries across {hunks} diff regions). "
-            "Foundry must start from the exact live file and alter only the lines required "
-            "for the requested existing resource."
+            f"Modification output for {path} appears to omit or rewrite a large portion of the live file "
+            f"(similarity={unchanged_ratio:.3f}, live_lines={existing_line_count}, "
+            f"generated_lines={generated_line_count}, changed_regions={hunks}). "
+            "Foundry must return the complete live file with only the requested repository change applied."
         )
 
 
@@ -2766,12 +2665,6 @@ def _repository_context_unique_boolean_match(
             len(search.get("results") or []),
         )
 
-    wanted_value = {
-        "create": "true",
-        "enable": "true",
-        "disable": "false",
-        "delete": "false",
-    }.get(str(operation or "").strip().lower(), "")
     matches: list[dict] = []
     seen: set[tuple[str, int, str]] = set()
     for record in search.get("results") or []:
@@ -2799,16 +2692,16 @@ def _repository_context_unique_boolean_match(
             ):
                 continue
             current = str(item.get("current_value") or "").strip().lower()
-            target = wanted_value or ("false" if current == "true" else "true")
-            if target == current:
-                continue
             key = (path_value, int(item.get("line_number") or 0), flag)
             if key in seen:
                 continue
             seen.add(key)
             matches.append({
                 **item,
-                "new_value": target,
+                # Repository context may identify the live path/flag relationship,
+                # but it must never infer the requested Boolean transition. The
+                # requested new_value remains Foundry/Cursor-owned and is attached
+                # only after that semantic result is independently validated.
                 "confidence": max(float(record.get("confidence") or 0.0), 0.99),
                 "context": str(record.get("statement") or "").strip(),
                 "description": str(record.get("statement") or "").strip(),
@@ -3043,25 +2936,38 @@ def _validated_repository_boolean_strategy(
 
     validated = _validated(strategy) if strategy.get("boolean_applicable") else []
 
-    # Durable context gets first chance to resolve a previously learned alias.
+    # Durable context may identify a previously learned live path/flag, but it
+    # cannot decide the requested transition. Only a Foundry/Cursor candidate
+    # that independently supplies and validates new_value may become the target.
     context_matches = _repository_context_unique_boolean_match(prompt, inventory, operation)
-    if len(context_matches) == 1:
-        strategy["boolean_applicable"] = True
-        strategy["requires_user_choice"] = False
-        strategy["resolution_source"] = "validated_repository_context"
-        strategy["validated_candidate_count"] = 1
-        strategy["adjudicated_candidate_count"] = 1
-        LOGGER.info(
-            "[TerrabotDiag] event=repository_context_usage_observed source=boolean_resolver context_id=%s path=%s flag=%s",
-            context_matches[0].get("repository_context_id") or "",
-            context_matches[0].get("path") or "",
-            context_matches[0].get("flag") or "",
+
+    def _apply_context_identity(candidates: list[dict]) -> list[dict]:
+        if len(context_matches) != 1:
+            return candidates
+        ctx = context_matches[0]
+        ctx_key = (
+            str(ctx.get("path") or "").strip().strip("/"),
+            int(ctx.get("line_number") or 0),
+            str(ctx.get("flag") or "").strip(),
         )
-        _mark_repository_context_used(
-            [str(context_matches[0].get("repository_context_id") or "")],
-            "semantic_target_resolution",
-        )
-        return strategy, context_matches
+        matched_candidates: list[dict] = []
+        for candidate in candidates or []:
+            key = (
+                str(candidate.get("path") or "").strip().strip("/"),
+                int(candidate.get("line_number") or 0),
+                str(candidate.get("flag") or "").strip(),
+            )
+            if key != ctx_key:
+                continue
+            item = dict(candidate)
+            item["repository_context_id"] = str(ctx.get("repository_context_id") or "").strip()
+            item["resolution_source"] = "validated_repository_context"
+            item["context"] = str(ctx.get("context") or item.get("context") or "").strip()
+            item["description"] = str(ctx.get("description") or item.get("description") or "").strip()
+            matched_candidates.append(item)
+        return matched_candidates or candidates
+
+    validated = _apply_context_identity(validated)
 
     # First-time aliases still get one Boolean-only semantic retry before any
     # user question. This is especially important for Cursor-generated synonyms.
@@ -3074,11 +2980,15 @@ def _validated_repository_boolean_strategy(
             operation = retry_operation
             strategy["operation"] = retry_operation
         if retry.get("boolean_applicable"):
-            validated = _validated(retry)
+            validated = _apply_context_identity(_validated(retry))
             if validated:
                 strategy["boolean_applicable"] = True
                 strategy["reason"] = str(retry.get("reason") or strategy.get("reason") or "")
-                strategy["resolution_source"] = "environment_boolean_retry"
+                strategy["resolution_source"] = (
+                    "validated_repository_context"
+                    if any(str(item.get("repository_context_id") or "").strip() for item in validated)
+                    else "environment_boolean_retry"
+                )
 
     if not validated:
         strategy["validated_candidate_count"] = 0
@@ -3089,6 +2999,13 @@ def _validated_repository_boolean_strategy(
     adjudicated = _foundry_adjudicate_repository_boolean_candidates(
         prompt, repository_evidence, validated
     )
+    if len(adjudicated) == 1 and str(adjudicated[0].get("repository_context_id") or "").strip():
+        context_id = str(adjudicated[0].get("repository_context_id") or "").strip()
+        LOGGER.info(
+            "[TerrabotDiag] event=repository_context_usage_observed source=boolean_resolver context_id=%s path=%s flag=%s",
+            context_id, adjudicated[0].get("path") or "", adjudicated[0].get("flag") or "",
+        )
+        _mark_repository_context_used([context_id], "semantic_target_resolution")
     strategy["validated_candidate_count"] = len(validated)
     strategy["adjudicated_candidate_count"] = len(adjudicated)
     strategy["requires_user_choice"] = len(adjudicated) > 1
@@ -3174,5 +3091,3 @@ TERRABOT_AZURE_ENVIRONMENT_ALIASES = {
     "us5": "prd-us5",
     "us6": "prd-us6",
 }
-
-
