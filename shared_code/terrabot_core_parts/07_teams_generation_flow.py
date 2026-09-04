@@ -245,6 +245,14 @@ def _teams_auto_commit_preview(data: dict, preview: dict, status_code: int):
     if preview.get("mode") != "infra_preview" or not preview.get("pending_change_id"):
         return preview, status_code
 
+    # Automated repository-context tests must observe and validate the exact
+    # production preview before the harness deliberately pushes it to an
+    # isolated test branch. Do not let the normal Teams auto-commit path consume
+    # that preview first. This is transport isolation only; generation, target
+    # resolution and backend validation remain identical to production.
+    if _teams_truthy((data or {}).get("test_mode")):
+        return preview, status_code
+
     commit_request = dict(data or {})
     commit_request.update({
         "action": "commit_branch",
@@ -974,7 +982,9 @@ def _teams_semantic_operation_classification(prompt: str, target_cloud: str) -> 
         "rules": [
             "Return JSON only.",
             "existing_modification means the request changes, enables, disables, decommissions, deletes, or updates infrastructure described as already present; do not infer the exact implementation.",
+            "Treat colloquial on/off wording as existing_modification when it refers to an existing capability or setup, even if the user does not use the literal words enable/disable and even if the Terraform implementation later proves to be a create_/deploy_ Boolean.",
             "creation_or_consumer means the request clearly asks for a new infrastructure instance/module/consumer rather than changing an existing repository-controlled capability.",
+            "Phrases such as one more, another, additional, new instance, provision another, add a second, or create an extra resource are creation_or_consumer when they request an additional instance rather than toggling the existing one.",
             "When wording could mean either, return unclear so live repository analysis can decide later.",
             "Never return resource names, Terraform identifiers, paths, flags, or module names.",
         ],

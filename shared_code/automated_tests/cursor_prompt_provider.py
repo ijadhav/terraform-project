@@ -1138,7 +1138,7 @@ def resolve_repository_clarification(
     request_timeout = _float_setting("TERRABOT_CURSOR_REQUEST_TIMEOUT_SECONDS", 30.0, 5.0, 120.0)
     run_timeout = _float_setting(
         "TERRABOT_CURSOR_CLARIFICATION_RUN_TIMEOUT_SECONDS",
-        _float_setting("TERRABOT_CURSOR_RUN_TIMEOUT_SECONDS", 90.0, 15.0, 1800.0),
+        _float_setting("TERRABOT_CURSOR_RUN_TIMEOUT_SECONDS", 180.0, 15.0, 1800.0),
         15.0,
         600.0,
     )

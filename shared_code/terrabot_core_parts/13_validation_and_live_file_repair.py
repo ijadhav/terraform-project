@@ -2990,6 +2990,58 @@ def _validated_repository_boolean_strategy(
                     else "environment_boolean_retry"
                 )
 
+    if not validated and len(context_matches) == 1 and context_matches[0].get("required_continuation_record"):
+        # Phase-2 exact-ID context already proved the live path/flag identity.
+        # If the general semantic pass did not return a candidate, ask Foundry
+        # only for the requested transition on that fixed live control instead
+        # of rediscovering the repository target or asking the user again.
+        # The backend still validates the returned value against the literal
+        # current assignment and never invents the Boolean transition itself.
+        fixed = dict(context_matches[0])
+        transition_request = {
+            "task": "Resolve only the requested Boolean transition for an already live-verified repository control. Do not choose another target and do not generate Terraform.",
+            "user_request": str(prompt or "").strip(),
+            "fixed_repository_control": {
+                "path": str(fixed.get("path") or ""),
+                "line_number": int(fixed.get("line_number") or 0),
+                "flag": str(fixed.get("flag") or ""),
+                "current_value": str(fixed.get("current_value") or ""),
+                "repository_context_id": str(fixed.get("repository_context_id") or ""),
+            },
+            "required_output": {
+                "new_value": "true|false|unknown",
+                "reason": "short semantic reason",
+            },
+            "rules": [
+                "Return JSON only.",
+                "The path and flag are immutable live repository truth; never substitute another control.",
+                "Infer only whether the user wants this existing control true or false.",
+                "If the request does not establish a transition, return unknown.",
+            ],
+        }
+        try:
+            _conversation, raw = call_named_agent(AGENT_NAME, None, json.dumps(transition_request, ensure_ascii=False))
+            parsed = extract_json_from_text(raw)
+            target = str((parsed or {}).get("new_value") or "").strip().lower() if isinstance(parsed, dict) else ""
+            current = str(fixed.get("current_value") or "").strip().lower()
+            if target in {"true", "false"} and current in {"true", "false"} and target != current:
+                fixed["new_value"] = target
+                fixed["confidence"] = max(float(fixed.get("confidence") or 0.0), 0.99)
+                fixed["classification_reason"] = str((parsed or {}).get("reason") or "required repository context transition resolution")
+                fixed["resolution_source"] = "required_repository_context_transition_retry"
+                validated = [fixed]
+                strategy["boolean_applicable"] = True
+                strategy["resolution_source"] = "required_repository_context_transition_retry"
+                _mark_repository_context_used(
+                    [str(fixed.get("repository_context_id") or "")],
+                    "required_context_transition_resolution",
+                )
+        except Exception as exc:
+            LOGGER.warning(
+                "[TerrabotDiag] event=required_repository_context_transition_retry_failed context_id=%s error=%s",
+                str(fixed.get("repository_context_id") or ""), exc,
+            )
+
     if not validated:
         strategy["validated_candidate_count"] = 0
         strategy["adjudicated_candidate_count"] = 0

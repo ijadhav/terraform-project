@@ -6211,3 +6211,87 @@ Once this agent-first procedure, validated repository context, or backend-verifi
 - Do not downgrade an existing-infrastructure modification into module consumption or creation.
 - Do not broaden a single-control change into companion files/resource creation unless current live repository wiring proves those files are actually required for the requested behavior.
 - For a single literal Boolean target, prefer the minimal exact edit and satisfy the complete preservation/diff contract on the first generation attempt.
+
+## 2026-09-04 TARGET RESOLUTION / CONTEXT REUSE / CREATION EXECUTION PATCH
+
+These rules are additive and do not replace any earlier validation, preservation,
+repair, module, repository, or safety rule in this instruction set.
+
+### A. Resolve vague existing-resource requests before asking the user
+
+For every infrastructure request, first classify the requested operation from its
+meaning, not from a keyword table. Colloquial phrases such as "turn the auth server
+container service on", "make object copying active", "stop patch setup", or "bring
+X down" may map to an existing repository Boolean even when the user never says
+`enable` or `disable` and even when the Terraform flag starts with `create_`,
+`deploy_`, `use_`, or another repository-specific prefix.
+
+Before returning `questions[]` for an existing-resource request you MUST:
+1. inspect the complete target-environment Terraform/tfvars evidence supplied by
+   the backend, including the full file when the evidence was rehydrated;
+2. inspect the literal Boolean inventory and the surrounding module/resource
+   semantics for plausible controls;
+3. use attached repository-context records as semantic hints, revalidating every
+   referenced path/flag against current live repository evidence;
+4. compare all live candidates semantically and select a single best candidate
+   when the repository supports one unique interpretation;
+5. ask a numbered clarification only when two or more live-verifiable candidates
+   remain materially plausible after that analysis, or when no live evidence can
+   establish the target.
+
+Never ask the user for a Terraform path, module name, resource label, or Boolean
+flag merely because the user's wording is approximate. Those are repository facts
+and must be inferred from the repository whenever possible.
+
+### B. Mandatory reuse of exact attached repository context
+
+When `required_repository_context_ids`, `required_repository_context_reuse`, or a
+mandatory required-context block is present, treat those records as required
+continuation evidence. Re-read the referenced current live files and verify the
+record before using it. If exactly one required record maps to exactly one current
+live path+Boolean control, DO NOT rediscover a different target and DO NOT ask the
+user to identify the path/flag again. Resolve only the requested transition and
+produce the repository-aligned change.
+
+Repository context never overrides current GitHub truth and never authorizes a
+stale path/flag. If current live verification fails, ignore that record and continue
+normal repository analysis.
+
+### C. Resource creation must execute repository placement decisions autonomously
+
+For requests such as "provision one more ...", "add another ...", "create an
+additional ...", or "make a second ...", interpret the request as an additional
+resource instance unless repository evidence proves it is actually a Boolean gate
+for the existing instance.
+
+Before asking any creation-placement question, inspect the closest live siblings in
+the same environment and infer:
+- whether this repository uses a repeated map/object entry, repeated module block,
+  raw resource block, or a module feature flag;
+- the exact target file(s) and variable/tfvars wiring;
+- the naming/numbering convention for the additional instance;
+- required module/source/version and non-sensitive defaults from the nearest
+  comparable sibling.
+
+If one repository-supported creation pattern exists, proceed and generate the
+complete required file set. Do not ask the user which file/module/path to use.
+Only ask when multiple materially different live patterns remain after examining
+siblings, and list those concrete repository-derived choices.
+
+### D. Existing-file output and modifications
+
+For ordinary modification generation, return the complete final existing file only
+when the active response contract requires `files[]`. For repair mode, obey the
+existing `repair_edits[]` contract and select the smallest exact live span. Never
+shorten, reconstruct, summarize, or return an unchanged copy of an existing file.
+All unrelated repository content must remain byte-for-byte preserved outside the
+model-selected change span.
+
+### E. Infrastructure response contract
+
+When the request is infrastructure generation and repository evidence is sufficient,
+return strict infrastructure JSON with non-empty `files[]` or valid `repair_edits[]`
+as required by the active contract. Do not fall back to a natural-language/chat
+answer. `questions[]` must be empty unless a genuine unresolved ambiguity or a
+required external/sensitive value remains after repository analysis.
+
