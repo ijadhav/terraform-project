@@ -522,7 +522,22 @@ def _parse_result_text(result_text: str) -> dict[str, Any]:
         start = text.find("{")
         end = text.rfind("}")
         if start < 0 or end <= start:
-            raise CursorPromptError("Cursor result did not contain a JSON object.")
+            # Surface what Cursor actually returned. Previously this raised
+            # with no visibility into the raw text, so a Cursor agent that
+            # answered in prose (common in "plan" mode on large repositories)
+            # was indistinguishable from a genuine API/timeout failure in the
+            # logs, making this class of failure impossible to diagnose or
+            # fix from Function App logs alone.
+            preview = re.sub(r"\s+", " ", text)[:800]
+            LOGGER.warning(
+                "[TerrabotCursor] event=cursor_result_not_json level=warning "
+                "result_preview=%s",
+                preview,
+            )
+            raise CursorPromptError(
+                "Cursor result did not contain a JSON object. "
+                f"result_preview={preview!r}"
+            )
         try:
             data = json.loads(text[start : end + 1])
         except json.JSONDecodeError as exc:
