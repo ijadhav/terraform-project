@@ -1003,6 +1003,77 @@ def _teams_existing_modification_workflow_for_cloud(target_cloud: str) -> str:
     return candidates[0] if len(candidates) == 1 else ""
 
 
+def _teams_materialize_initial_immutable_boolean_response(
+    agent_reply: str,
+    *,
+    target_cloud: str,
+    effective_workflow: str,
+    effective_prompt: str,
+    retrieved_value_context: list | None,
+    retrieved_module_context: list | None,
+) -> str:
+    """Materialize Foundry's preferred first-pass exact edit onto live bytes.
+
+    Once target resolution has produced an immutable live-verified Boolean,
+    asking the model to retransmit a large existing file creates avoidable
+    truncation/reformat risk. Foundry may instead choose the exact old/new line;
+    the backend applies that model-selected span to the complete live GitHub
+    baseline and runs the ordinary hard validators. This does not select a
+    target, infer a flag, or synthesize Terraform semantics.
+    """
+    active = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
+    target = active.get("resolved_repository_target_contract")
+    if not isinstance(target, dict) or not target:
+        return agent_reply
+    try:
+        payload = extract_json_from_text(str(agent_reply or ""))
+    except Exception:
+        return agent_reply
+    if not isinstance(payload, dict) or not isinstance(payload.get("repair_edits"), list) or not payload.get("repair_edits"):
+        return agent_reply
+
+    target_path = str(target.get("path") or "").strip().strip("/")
+    if not target_path:
+        return agent_reply
+    pseudo_result = {
+        "cloud": target_cloud,
+        "workflow": effective_workflow,
+        "repo_target": normalize_repo_target(target_cloud, workflow=effective_workflow),
+        "title": str(payload.get("title") or "Terraform Boolean change"),
+        "summary": str(payload.get("summary") or "Apply the resolved Boolean infrastructure change."),
+        "files": [{"filename": target_path, "content": ""}],
+    }
+    try:
+        materialization_payload = _teams_build_backend_repair_payload(
+            current_result=pseudo_result,
+            original_user_request=effective_prompt,
+            backend_error="initial immutable Boolean response selected repair_edits materialization",
+            flow_context=active,
+            retrieved_value_context=list(retrieved_value_context or []),
+            retrieved_module_context=list(retrieved_module_context or []),
+        )
+        materialized = _teams_materialize_repair_edits_response(
+            agent_reply, materialization_payload
+        )
+        _teams_diag_log(
+            "initial_immutable_boolean_edit_materialized",
+            path=target_path,
+            flag=str(target.get("flag") or ""),
+            strategy="foundry_selected_exact_edit_on_live_baseline",
+        )
+        return materialized
+    except Exception as exc:
+        # Keep the existing parse/repair path as a compatibility fallback. The
+        # failure remains private and the model gets the exact protocol error.
+        _teams_diag_log(
+            "initial_immutable_boolean_edit_materialization_failed",
+            level="warning",
+            path=target_path,
+            error=str(exc)[:300],
+        )
+        return agent_reply
+
+
 def handle_chat_request(data: dict):
     data = data or {}
 
@@ -3029,22 +3100,34 @@ def handle_chat_request(data: dict):
             if effective_workflow in INFRA_MODIFICATION_WORKFLOWS:
                 existing_infra_context = _get_backend_existing_infra_context(retrieved_value_context)
 
-                # FINAL TEAMS MODIFICATION REFRESH:
-                # Broad backend_existing_infra_code_match context may have been populated
-                # earlier in the same request by repository-wide/environment discovery.
-                # Reusing that candidate set here bypasses the final target-main.tf +
-                # Foundry Boolean-control resolver and causes the legacy file picker
-                # (main.tf/backend.tf/outputs.tf/...) to be rendered.
-                #
-                # For a fresh Teams AWS modification turn, always rebuild the context
-                # unless this is already a user-selected pending target. The final
-                # resolver semantically classifies the complete target environment
-                # main.tf and validates any returned Boolean against literal live HCL.
-                # This is intentionally independent of hardcoded enable/disable words.
+                # FINAL TEAMS MODIFICATION RESOLUTION:
+                # Earlier repository/environment discovery can produce a broad context
+                # marked `agent_resolves_target`, which `_backend_existing...selected`
+                # considers generation-ready. Reusing that broad context skips the final
+                # live Boolean/context resolver entirely. That is the failure boundary
+                # behind P1/P2 clarification loops even when the required context record
+                # was attached. Rebuild for both clouds unless an exact Boolean target or
+                # explicit user-selected repository target is already locked.
+                active_flow = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
+                selected_items = list((existing_infra_context or {}).get("matched_files") or [])
+                exact_boolean_selected = bool(
+                    (existing_infra_context or {}).get("feature_flag_selection")
+                    and (existing_infra_context or {}).get("selection_state") == "selected"
+                    and (existing_infra_context or {}).get("selected_path")
+                )
+                explicit_user_selection = any(
+                    isinstance(item, dict) and item.get("selected_by_user")
+                    for item in selected_items
+                )
+                immutable_target_locked = bool(
+                    active_flow.get("resolved_repository_target_contract")
+                    or (existing_infra_context or {}).get("resolved_repository_target")
+                )
                 _teams_modification_refresh_required = bool(
-                    (_ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}).get("active")
-                    and str(target_cloud or "").strip().lower() == "aws"
-                    and not _backend_existing_infra_context_is_selected(existing_infra_context)
+                    active_flow.get("active")
+                    and not exact_boolean_selected
+                    and not explicit_user_selection
+                    and not immutable_target_locked
                 )
 
                 if not existing_infra_context or _teams_modification_refresh_required:
@@ -3355,6 +3438,18 @@ def handle_chat_request(data: dict):
                             agent_clarification = _teams_supplied_files_diagnostic(retrieved_value_context)
                     else:
                         agent_clarification = _teams_supplied_files_diagnostic(retrieved_value_context)
+
+            agent_reply = _teams_materialize_initial_immutable_boolean_response(
+                agent_reply,
+                target_cloud=target_cloud,
+                effective_workflow=effective_workflow,
+                effective_prompt=effective_prompt,
+                retrieved_value_context=retrieved_value_context,
+                retrieved_module_context=retrieved_module_context,
+            )
+            # Re-evaluate questions after materialization because an executable
+            # repair_edits response is now a normal full-file generation result.
+            agent_clarification = _teams_intercept_agent_questions(agent_reply)
             if agent_clarification is not None:
                 return {
                     "ok": False,
@@ -3441,18 +3536,35 @@ def handle_chat_request(data: dict):
                     # exposed to Teams. The backend validates only; it never repairs HCL.
                     validation_error = None
                     repair_feedback = ""
-                    # Restore the original bounded generation-validation depth.
-                    # Every pass validates the current candidate; failures remain private
-                    # and can trigger another Foundry repair until the configured five
-                    # outer attempts are exhausted.
-                    generation_validation_passes = max(
-                        1, int(MAX_TEAMS_SELF_CORRECTION_ATTEMPTS or 5)
+                    # Complex changes retain the configured bounded depth. A
+                    # live-verified immutable Boolean needs at most one initial
+                    # validation plus one exact-live surgical repair. Continuing
+                    # through five outer rounds only repeats protocol failures and
+                    # increases latency without changing the target or baseline.
+                    configured_validation_passes = min(
+                        5, max(1, int(MAX_TEAMS_SELF_CORRECTION_ATTEMPTS or 5))
                     )
+                    immutable_target = (_ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}).get(
+                        "resolved_repository_target_contract"
+                    )
+                    immutable_boolean = bool(
+                        isinstance(immutable_target, dict)
+                        and immutable_target.get("path")
+                        and immutable_target.get("flag")
+                    )
+                    generation_validation_passes = (
+                        min(configured_validation_passes, 2)
+                        if immutable_boolean
+                        else configured_validation_passes
+                    )
+                    internal_repair_attempts = 2 if immutable_boolean else 3
                     _teams_diag_log(
                         "generation_validation_loop_start",
                         thread=conversation_id,
                         outer_attempts=generation_validation_passes,
-                        internal_repair_attempts=3,
+                        configured_outer_attempts=configured_validation_passes,
+                        internal_repair_attempts=internal_repair_attempts,
+                        immutable_boolean=immutable_boolean,
                     )
                     for repair_attempt in range(1, generation_validation_passes + 1):
                         try:
@@ -3654,7 +3766,7 @@ def handle_chat_request(data: dict):
                             repaired_conversation_id = conversation_id
                             repair_conversation_id = conversation_id
                             internal_repair_error = None
-                            for internal_attempt in range(1, 4):
+                            for internal_attempt in range(1, internal_repair_attempts + 1):
                                 working_repair_payload = dict(repair_payload)
                                 if internal_repair_error is not None:
                                     working_repair_payload["prior_repair_feedback"] = str(internal_repair_error)
@@ -3677,7 +3789,7 @@ def handle_chat_request(data: dict):
                                     "generation_validation_internal_repair_start",
                                     thread=conversation_id,
                                     outer_attempt=f"{repair_attempt}/{generation_validation_passes}",
-                                    internal_attempt=f"{internal_attempt}/3",
+                                    internal_attempt=f"{internal_attempt}/{internal_repair_attempts}",
                                 )
                                 try:
                                     repaired_conversation_id, repaired_reply = _teams_call_agent_for_backend_repair(
@@ -3740,7 +3852,7 @@ def handle_chat_request(data: dict):
                                         "generation_validation_internal_repair_success",
                                         thread=conversation_id,
                                         outer_attempt=f"{repair_attempt}/{generation_validation_passes}",
-                                        internal_attempt=f"{internal_attempt}/3",
+                                        internal_attempt=f"{internal_attempt}/{internal_repair_attempts}",
                                         files_returned=len(repaired_result.get("files") or []),
                                     )
                                     break
@@ -3759,12 +3871,13 @@ def handle_chat_request(data: dict):
                             if repaired_result is None:
                                 LOGGER.warning(
                                     "Foundry generation-validation repair responses failed on "
-                                    "outer attempt %s/%s (thread=%s) after 3 internal repairs: %s. "
+                                    "outer attempt %s/%s (thread=%s) after %s internal repairs: %s. "
                                     "No new candidate exists, so repeating the same outer validation would only "
                                     "replay the identical failure. Stopping this repair chain.",
                                     repair_attempt,
                                     generation_validation_passes,
                                     conversation_id,
+                                    internal_repair_attempts,
                                     internal_repair_error,
                                 )
                                 validation_error = ValueError(

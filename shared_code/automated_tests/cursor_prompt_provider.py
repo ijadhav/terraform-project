@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
@@ -35,6 +36,16 @@ _SCHEMA_VERSION = "terrabot.cursor.test-prompts.v1"
 _CLARIFICATION_SCHEMA_VERSION = "terrabot.cursor.clarification.v1"
 _REPO_QUESTION_SCHEMA_VERSION = "terrabot.cursor.repository-questions.v1"
 _REPO_ANSWER_SCHEMA_VERSION = "terrabot.cursor.repository-answer-validation.v1"
+
+# One Cursor prompt-author run already inspected a pinned repository and bound
+# each generated natural-language prompt to the immutable repository-derived
+# test target. Keep that provenance in-process so a later Terrabot clarification
+# can be answered without launching another expensive repository agent. The
+# backend still performs the authoritative current-live-file verification before
+# accepting the path/flag/value transition.
+_PROMPT_AUTHOR_BINDINGS: dict[tuple[str, str], dict[str, Any]] = {}
+_PROMPT_AUTHOR_BINDINGS_LOCK = threading.RLock()
+_PROMPT_AUTHOR_BINDINGS_LIMIT = 2048
 
 
 class CursorPromptError(RuntimeError):
@@ -133,6 +144,98 @@ def _group_key(case: Any) -> tuple[str, str, str, str, str]:
         str(_case_value(case, "commit_sha")),
         str(_case_value(case, "cloud")),
     )
+
+
+def _remember_prompt_author_target_binding(
+    case: Any,
+    *,
+    run_id: str,
+    phase1_prompt: str,
+    phase2_prompt: str,
+    cursor_agent_id: str,
+    cursor_run_id: str,
+) -> None:
+    """Cache the exact target for prompts authored by one pinned Cursor run.
+
+    This record is test orchestration provenance, not repository authority. It is
+    accepted downstream only after Terrabot re-reads the exact current live file
+    and verifies that the literal assignment/value still exists exactly once.
+    """
+    case_id = str(_case_value(case, "case_id") or "").strip()
+    run_key = str(run_id or "").strip()
+    path_value = str(_case_value(case, "path") or "").strip().strip("/")
+    flag = str(_case_value(case, "flag") or "").strip()
+    current_value = _case_value(case, "current_value")
+    desired_value = _case_value(case, "desired_value")
+    if (
+        not run_key
+        or not case_id
+        or not path_value
+        or not flag
+        or not isinstance(current_value, bool)
+        or not isinstance(desired_value, bool)
+        or current_value == desired_value
+    ):
+        return
+
+    binding = {
+        "run_id": run_key,
+        "case_id": case_id,
+        "repository": f"{_case_value(case, 'owner')}/{_case_value(case, 'repo')}",
+        "commit_sha": str(_case_value(case, "commit_sha") or "").strip(),
+        "path": path_value,
+        "flag": flag,
+        "current_value": current_value,
+        "new_value": desired_value,
+        "environment": str(_case_value(case, "environment") or "").strip(),
+        "alias": str(_case_value(case, "alias") or "").strip(),
+        "phase1_prompt": re.sub(r"\s+", " ", str(phase1_prompt or "")).strip(),
+        "phase2_prompt": re.sub(r"\s+", " ", str(phase2_prompt or "")).strip(),
+        "evidence": [str(_case_value(case, "evidence_line") or "").strip()],
+        "cursor_agent_id": str(cursor_agent_id or "").strip(),
+        "cursor_run_id": str(cursor_run_id or "").strip(),
+        "provenance": "cursor_prompt_author_target_binding",
+    }
+    with _PROMPT_AUTHOR_BINDINGS_LOCK:
+        _PROMPT_AUTHOR_BINDINGS[(run_key, case_id)] = binding
+        while len(_PROMPT_AUTHOR_BINDINGS) > _PROMPT_AUTHOR_BINDINGS_LIMIT:
+            _PROMPT_AUTHOR_BINDINGS.pop(next(iter(_PROMPT_AUTHOR_BINDINGS)), None)
+
+
+def get_prompt_author_target_binding(
+    *,
+    run_id: str,
+    case: Any,
+    prompt: str = "",
+) -> dict[str, Any]:
+    """Return Cursor's cached prompt-to-target binding for one test turn.
+
+    The requested prompt must be one of the two prompts produced by that exact
+    Cursor run. Returning an empty dict preserves the existing repository-agent
+    clarification fallback when prompt generation failed open or used a legacy
+    provider response.
+    """
+    key = (str(run_id or "").strip(), str(_case_value(case, "case_id") or "").strip())
+    with _PROMPT_AUTHOR_BINDINGS_LOCK:
+        binding = dict(_PROMPT_AUTHOR_BINDINGS.get(key) or {})
+    if not binding:
+        return {}
+    normalized_prompt = re.sub(r"\s+", " ", str(prompt or "")).strip().casefold()
+    authored = {
+        str(binding.get("phase1_prompt") or "").casefold(),
+        str(binding.get("phase2_prompt") or "").casefold(),
+    }
+    if normalized_prompt and normalized_prompt not in authored:
+        return {}
+    if (
+        str(binding.get("repository") or "").lower()
+        != f"{_case_value(case, 'owner')}/{_case_value(case, 'repo')}".lower()
+        or str(binding.get("commit_sha") or "") != str(_case_value(case, "commit_sha") or "")
+        or str(binding.get("path") or "").strip("/") != str(_case_value(case, "path") or "").strip("/")
+        or str(binding.get("flag") or "") != str(_case_value(case, "flag") or "")
+    ):
+        return {}
+    return binding
 
 
 def _build_cursor_instruction(cases: Sequence[Any], run_id: str) -> str:
@@ -624,8 +727,15 @@ def _generate_for_group(
         for case in cases:
             case_id = str(_case_value(case, "case_id"))
             phase1, phase2 = prompts[case_id]
-            generated.append(
-                replace(case, phase1_prompt=phase1, phase2_prompt=phase2)
+            generated_case = replace(case, phase1_prompt=phase1, phase2_prompt=phase2)
+            generated.append(generated_case)
+            _remember_prompt_author_target_binding(
+                generated_case,
+                run_id=run_id,
+                phase1_prompt=phase1,
+                phase2_prompt=phase2,
+                cursor_agent_id=agent_id,
+                cursor_run_id=cursor_run_id,
             )
             _emit(
                 "cursor_prompt_case_generated",
@@ -901,6 +1011,7 @@ def resolve_repository_clarification(
     clarification_text: str,
     candidates: Sequence[dict[str, Any]] | None = None,
     expected_target_hint: dict[str, Any] | None = None,
+    prompt_author_target_binding: dict[str, Any] | None = None,
     run_id: str = "",
     case_id: str = "",
     session: Any | None = None,
@@ -914,6 +1025,96 @@ def resolve_repository_clarification(
     exposed by Terrabot. The result is an answer suitable for the same pending
     workflow plus optional path/flag evidence for test-side verification.
     """
+    binding = (
+        dict(prompt_author_target_binding or {})
+        if isinstance(prompt_author_target_binding, dict)
+        else {}
+    )
+    if binding:
+        selected_path = str(binding.get("path") or "").strip().strip("/")
+        selected_flag = str(binding.get("flag") or "").strip()
+        selected_current_value = binding.get("current_value")
+        selected_new_value = binding.get("new_value")
+        binding_repository = str(binding.get("repository") or "").strip().lower()
+        binding_commit = str(binding.get("commit_sha") or "").strip()
+        prompt_value = re.sub(r"\s+", " ", str(original_prompt or "")).strip().casefold()
+        authored_prompts = {
+            str(binding.get("phase1_prompt") or "").casefold(),
+            str(binding.get("phase2_prompt") or "").casefold(),
+        }
+        binding_valid = bool(
+            selected_path
+            and selected_flag
+            and isinstance(selected_current_value, bool)
+            and isinstance(selected_new_value, bool)
+            and selected_current_value != selected_new_value
+            and binding_repository == f"{owner}/{repo}".lower()
+            and binding_commit == str(commit_sha or "").strip()
+            and (not prompt_value or prompt_value in authored_prompts)
+        )
+        if binding_valid:
+            candidate_payload = [dict(item) for item in (candidates or []) if isinstance(item, dict)]
+            selected_index = None
+            for index, candidate in enumerate(candidate_payload, start=1):
+                candidate_path = str(candidate.get("path") or "").strip().strip("/")
+                candidate_flag = str(candidate.get("flag") or "").strip()
+                feature_match = candidate.get("feature_flag_match")
+                if isinstance(feature_match, dict):
+                    candidate_flag = candidate_flag or str(feature_match.get("flag") or "").strip()
+                if candidate_path == selected_path and candidate_flag == selected_flag:
+                    selected_index = index
+                    break
+            resolution_type = "candidate" if selected_index is not None else "repository_control"
+            answer = str(selected_index) if selected_index is not None else f"Use {selected_flag} in {selected_path}."
+            evidence = [
+                re.sub(r"\s+", " ", str(value or "")).strip()[:500]
+                for value in (binding.get("evidence") or [])[:4]
+                if str(value or "").strip()
+            ]
+            _emit(
+                "cursor_clarification_prompt_author_binding_used",
+                log_event=log_event,
+                run_id=run_id,
+                test_case_id=case_id,
+                repo=f"{owner}/{repo}",
+                selected_path=selected_path,
+                selected_flag=selected_flag,
+                resolution_type=resolution_type,
+                note="backend current-live-file verification remains mandatory",
+            )
+            return {
+                "attempted": True,
+                "resolved": True,
+                "error": "",
+                "answer": answer,
+                "resolution_type": resolution_type,
+                "candidates_relevant": selected_index is not None,
+                "use_structured_picker": selected_index is not None,
+                "selected_index": selected_index,
+                "selected_path": selected_path,
+                "selected_flag": selected_flag,
+                "selected_current_value": selected_current_value,
+                "selected_new_value": selected_new_value,
+                "reason": (
+                    "Cursor authored this exact test prompt for the pinned repository target; "
+                    "Terrabot must independently verify the current live assignment before generation."
+                ),
+                "evidence": evidence,
+                "agent_id": str(binding.get("cursor_agent_id") or ""),
+                "run_id": str(binding.get("cursor_run_id") or ""),
+                "api_call": False,
+                "verification_provenance": "cursor_prompt_author_target_binding",
+            }
+        _emit(
+            "cursor_clarification_prompt_author_binding_rejected",
+            level="warning",
+            log_event=log_event,
+            run_id=run_id,
+            test_case_id=case_id,
+            repo=f"{owner}/{repo}",
+            reason="binding identity or Boolean transition did not match the current test turn",
+        )
+
     api_key = _api_key()
     if not api_key:
         _emit(

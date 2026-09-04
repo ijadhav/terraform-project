@@ -1385,98 +1385,208 @@ def _repository_literal_boolean_inventory(repository_evidence: list[dict]) -> li
     return inventory
 
 
+def _repository_context_record_payload(record: Any, current_sha: str = "") -> dict:
+    """Normalize one durable context record for exact-ID transport."""
+    if record is None:
+        return {}
+    return {
+        "id": str(getattr(record, "id", "") or ""),
+        "category": str(getattr(record, "category", "") or ""),
+        "subject": str(getattr(record, "subject", "") or ""),
+        "scope": str(getattr(record, "scope", "") or ""),
+        "statement": str(getattr(record, "statement", "") or ""),
+        "evidence_paths": list(getattr(record, "evidence_paths", []) or []),
+        "evidence_commit_sha": str(getattr(record, "evidence_commit_sha", "") or ""),
+        "evidence_branch": str(getattr(record, "evidence_branch", "") or ""),
+        "status": str(getattr(record, "status", "active") or "active"),
+        "confidence": getattr(record, "confidence", 0.0),
+        "conflict_with_ids": list(getattr(record, "conflict_with_ids", []) or []),
+        "stale": bool(
+            current_sha
+            and getattr(record, "evidence_commit_sha", "")
+            and str(getattr(record, "evidence_commit_sha", "")) != str(current_sha)
+        ),
+        "required_continuation_record": True,
+        "must_revalidate_against_current_live_repository": True,
+    }
+
+
+def _repository_context_required_records(
+    owner: str,
+    repo: str,
+    required_ids: list[str],
+    current_sha: str = "",
+) -> list[dict]:
+    """Load mandatory continuation records independently of semantic ranking."""
+    rows: list[dict] = []
+    expected_repo = f"{owner}/{repo}".lower()
+    for context_id in required_ids or []:
+        try:
+            record = shared_repository_context.get_repository_context_by_id(context_id)
+        except Exception as exc:
+            LOGGER.warning(
+                "[TerrabotDiag] event=repository_context_required_id_lookup_failed repo=%s/%s context_id=%s error=%s",
+                owner, repo, context_id, exc,
+            )
+            continue
+        if record is None or str(getattr(record, "repo_full_name", "") or "").lower() != expected_repo:
+            LOGGER.warning(
+                "[TerrabotDiag] event=repository_context_required_id_rejected repo=%s/%s context_id=%s reason=missing_or_repository_mismatch",
+                owner, repo, context_id,
+            )
+            continue
+        item = _repository_context_record_payload(record, current_sha)
+        if item.get("id"):
+            rows.append(item)
+    return rows
+
+
+def _repository_context_merge_required_records(
+    search_result: dict | None,
+    required_records: list[dict],
+) -> dict:
+    """Put exact required records first and de-duplicate semantic results."""
+    result = dict(search_result or {})
+    required = [dict(item) for item in required_records or [] if isinstance(item, dict)]
+    required_ids = {str(item.get("id") or "") for item in required if str(item.get("id") or "")}
+    semantic = [
+        dict(item)
+        for item in (result.get("results") or [])
+        if isinstance(item, dict) and str(item.get("id") or "") not in required_ids
+    ]
+    result["results"] = required + semantic
+    return result
+
+
+def _mark_repository_context_used(context_ids: list[str], stage: str) -> None:
+    """Record that live-verified durable context selected the actual target."""
+    active = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
+    if not active.get("test_mode"):
+        return
+    ids = {str(value).strip() for value in context_ids or [] if str(value).strip()}
+    if not ids:
+        return
+    previous = active.get("repository_context_test_diagnostics")
+    diagnostics = dict(previous) if isinstance(previous, dict) else {}
+    used = {str(value).strip() for value in (diagnostics.get("used_context_ids") or []) if str(value).strip()}
+    used.update(ids)
+    stages = [str(value) for value in (diagnostics.get("usage_stages") or []) if str(value)]
+    if stage and stage not in stages:
+        stages.append(stage)
+    required = {
+        str(value).strip()
+        for value in (active.get("required_repository_context_ids") or [])
+        if str(value).strip()
+    }
+    diagnostics.update({
+        "used_context_ids": sorted(used),
+        "usage_stages": stages,
+        "reused": bool(required and required.issubset(used)),
+        "mandatory_reuse_satisfied": bool(required and required.issubset(used)),
+    })
+    active["repository_context_test_diagnostics"] = diagnostics
+    LOGGER.info(
+        "[TerrabotFlow] step=context_usage actor=backend stage=%s used_context_ids=%s required_context_ids=%s satisfied=%s",
+        stage,
+        ",".join(sorted(used))[:800],
+        ",".join(sorted(required))[:800],
+        diagnostics["mandatory_reuse_satisfied"],
+    )
+
+
 def _teams_shared_context_for_repository_decision(prompt: str) -> tuple[str, list[dict], dict]:
     """Retrieve durable context plus CURRENT live evidence for target selection.
 
-    Semantic flag/module selection happens before the ordinary generation
-    ``call_agent`` path, so relying only on call_agent's context injection meant
-    stored resource mappings were invisible during the decision that chooses a
-    Boolean/module. This helper makes the same repository context available to
-    the semantic decision call and re-reads every referenced evidence path from
-    the current repository branch.
+    Mandatory exact-ID continuation records are loaded independently from the
+    semantic Azure Search query. A transient/ranking/formatter failure therefore
+    cannot drop a Phase-2 record that the caller explicitly requires. Every
+    record remains only a hint until its evidence path and literal assignment are
+    re-read from the current repository branch.
     """
     active = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
+    normalized_prompt = str(prompt or "").strip()
+    cached = active.get("repository_context_decision_cache")
+    if isinstance(cached, dict) and cached.get("prompt") == normalized_prompt:
+        return (
+            str(cached.get("block") or ""),
+            [dict(item) for item in (cached.get("live_files") or []) if isinstance(item, dict)],
+            dict(cached.get("metadata") or {}),
+        )
+
     cloud = str(active.get("cloud") or "").strip()
     repo_target = str(active.get("repo_target") or "").strip()
-    workflow = str(active.get("workflow") or "").strip()
-    owner, repo = _repository_context_repo_identity(cloud, repo_target, workflow, str(active.get("repo_name") or ""))
+    workflow = str(active.get("workflow") or active.get("resolved_workflow") or "").strip()
+    owner, repo = _repository_context_repo_identity(
+        cloud, repo_target, workflow, str(active.get("repo_name") or "")
+    )
     if not owner or not repo:
         return "", [], {}
-    preferred_branch = str(active.get("context_branch") or active.get("existing_branch") or active.get("source_branch") or "").strip()
+    preferred_branch = str(
+        active.get("context_branch")
+        or active.get("existing_branch")
+        or active.get("source_branch")
+        or ""
+    ).strip()
     branch, current_sha = _repository_context_branch_and_sha(owner, repo, preferred_branch)
+    required_ids = [
+        str(value).strip()
+        for value in (active.get("required_repository_context_ids") or [])
+        if str(value).strip()
+    ]
+    required_records = _repository_context_required_records(
+        owner, repo, required_ids, current_sha
+    )
+
+    search_result: dict = {"results": []}
+    search_error = ""
     try:
         search_result = shared_repository_context.search_repository_context(
             repo_owner=owner,
             repo_name=repo,
-            query=str(prompt or "").strip(),
+            query=normalized_prompt,
             current_commit_sha=current_sha,
             top_k=8,
         )
-        required_ids = [
-            str(value).strip()
-            for value in (active.get("required_repository_context_ids") or [])
-            if str(value).strip()
-        ]
-        if required_ids:
-            merged = [dict(item) for item in (search_result.get("results") or []) if isinstance(item, dict)]
-            present = {str(item.get("id") or "").strip() for item in merged}
-            for context_id in required_ids:
-                if context_id in present:
-                    continue
-                record = shared_repository_context.get_repository_context_by_id(context_id)
-                if record is None or str(record.repo_full_name or "").lower() != f"{owner}/{repo}".lower():
-                    continue
-                merged.insert(0, {
-                    "id": record.id, "category": record.category, "subject": record.subject,
-                    "scope": record.scope, "statement": record.statement,
-                    "evidence_paths": list(record.evidence_paths or []),
-                    "evidence_commit_sha": record.evidence_commit_sha,
-                    "evidence_branch": record.evidence_branch, "status": record.status,
-                    "confidence": record.confidence,
-                    "conflict_with_ids": list(record.conflict_with_ids or []), "stale": False,
-                })
-                present.add(context_id)
-            search_result = dict(search_result or {})
-            search_result["results"] = merged
-        block = shared_repository_context.format_repository_context_for_agent(search_result)
-        # Required continuation records must reach semantic target resolution
-        # even when the general formatter suppresses a conflicted/historical
-        # record. They remain hints only: current live repository evidence below
-        # is still mandatory before any target can be selected.
-        required_rows: list[str] = []
-        if required_ids:
-            wanted = set(required_ids)
-            for item in search_result.get("results") or []:
-                if not isinstance(item, dict) or str(item.get("id") or "").strip() not in wanted:
-                    continue
-                required_rows.append(json.dumps({
-                    "id": str(item.get("id") or ""),
-                    "category": str(item.get("category") or ""),
-                    "subject": str(item.get("subject") or ""),
-                    "scope": str(item.get("scope") or ""),
-                    "statement": str(item.get("statement") or ""),
-                    "evidence_paths": list(item.get("evidence_paths") or []),
-                    "status": str(item.get("status") or "active"),
-                    "required_continuation_record": True,
-                    "must_revalidate_against_current_live_repository": True,
-                }, ensure_ascii=False))
-        if required_rows:
-            required_block = (
-                "MANDATORY REQUIRED REPOSITORY CONTEXT RECORDS (live verification required):\n"
-                + "\n".join(required_rows)
-            )
-            block = (block.rstrip() + "\n\n" + required_block).strip() if block else required_block
-        LOGGER.info(
-            "[TerrabotDiag] event=repository_context_semantic_selection_complete repo=%s/%s results=%s ids=%s",
-            owner, repo, len(search_result.get("results") or []),
-            ",".join(str(item.get("id") or "") for item in (search_result.get("results") or []) if isinstance(item, dict))[:800],
-        )
     except Exception as exc:
+        search_error = str(exc)
         LOGGER.warning(
-            "[TerrabotDiag] event=repository_context_semantic_decision_search_failed repo=%s/%s error=%s",
+            "[TerrabotDiag] event=repository_context_semantic_decision_search_failed repo=%s/%s error=%s required_ids=%s",
+            owner, repo, exc, ",".join(required_ids)[:800],
+        )
+    search_result = _repository_context_merge_required_records(search_result, required_records)
+    if not search_result.get("results"):
+        return "", [], {}
+
+    try:
+        block = shared_repository_context.format_repository_context_for_agent(search_result)
+    except Exception as exc:
+        block = ""
+        LOGGER.warning(
+            "[TerrabotDiag] event=repository_context_formatter_failed repo=%s/%s error=%s",
             owner, repo, exc,
         )
-        return "", [], {}
+
+    required_rows = [
+        json.dumps({
+            "id": str(item.get("id") or ""),
+            "category": str(item.get("category") or ""),
+            "subject": str(item.get("subject") or ""),
+            "scope": str(item.get("scope") or ""),
+            "statement": str(item.get("statement") or ""),
+            "evidence_paths": list(item.get("evidence_paths") or []),
+            "status": str(item.get("status") or "active"),
+            "required_continuation_record": True,
+            "must_revalidate_against_current_live_repository": True,
+        }, ensure_ascii=False)
+        for item in required_records
+    ]
+    if required_rows:
+        required_block = (
+            "MANDATORY REQUIRED REPOSITORY CONTEXT RECORDS (exact-ID transport; current live verification required):\n"
+            + "\n".join(required_rows)
+        )
+        block = (block.rstrip() + "\n\n" + required_block).strip() if block else required_block
+
     live_files = _teams_repository_context_live_files(
         owner, repo, branch, search_result, required_context_ids=required_ids
     )
@@ -1488,15 +1598,28 @@ def _teams_shared_context_for_repository_decision(prompt: str) -> tuple[str, lis
         "stale_count": int(search_result.get("stale_count") or 0),
         "conflicted_count": int(search_result.get("conflicted_count") or 0),
         "context_ids": [
-            str(item.get("id") or "") for item in (search_result.get("results") or [])
+            str(item.get("id") or "")
+            for item in (search_result.get("results") or [])
             if isinstance(item, dict) and str(item.get("id") or "").strip()
         ],
+        "required_context_ids": required_ids,
+        "required_context_ids_found": [str(item.get("id") or "") for item in required_records],
+        "semantic_search_error": search_error,
     }
+    LOGGER.info(
+        "[TerrabotDiag] event=repository_context_semantic_selection_complete repo=%s/%s results=%s ids=%s required_ids=%s",
+        owner, repo, metadata["result_count"],
+        ",".join(metadata["context_ids"])[:800],
+        ",".join(required_ids)[:800],
+    )
+
     if active.get("test_mode"):
         previous = active.get("repository_context_test_diagnostics")
         diagnostics = dict(previous) if isinstance(previous, dict) else {}
         existing_ids = {
-            str(value).strip() for value in (diagnostics.get("context_ids") or []) if str(value).strip()
+            str(value).strip()
+            for value in (diagnostics.get("context_ids") or [])
+            if str(value).strip()
         }
         existing_ids.update(metadata["context_ids"])
         stages = [str(value) for value in (diagnostics.get("attachment_stages") or []) if str(value)]
@@ -1511,17 +1634,25 @@ def _teams_shared_context_for_repository_decision(prompt: str) -> tuple[str, lis
             "result_count": max(int(diagnostics.get("result_count") or 0), metadata["result_count"]),
             "context_ids": sorted(existing_ids),
             "attachment_stages": stages,
+            "required_context_ids": required_ids,
+            "required_context_ids_found": metadata["required_context_ids_found"],
         })
         active["repository_context_test_diagnostics"] = diagnostics
         LOGGER.info(
-            "[TerrabotFlow] step=context_attachment actor=backend->foundry stage=semantic_target_resolution "
-            "case_id=%s attached=%s context_ids=%s",
+            "[TerrabotFlow] step=context_attachment actor=backend->foundry stage=semantic_target_resolution case_id=%s attached=%s context_ids=%s required_ids=%s",
             active.get("automated_test_case_id") or "",
             bool(block),
             ",".join(metadata["context_ids"])[:800],
+            ",".join(required_ids)[:800],
         )
-    return block, live_files, metadata
 
+    active["repository_context_decision_cache"] = {
+        "prompt": normalized_prompt,
+        "block": block,
+        "live_files": [dict(item) for item in live_files if isinstance(item, dict)],
+        "metadata": dict(metadata),
+    }
+    return block, live_files, metadata
 
 def _foundry_repository_change_strategy(
     prompt: str,
@@ -1872,6 +2003,11 @@ def _teams_lock_resolved_repository_boolean_target(
     if isinstance(active, dict):
         active["resolved_repository_target_contract"] = dict(contract)
         active["resolved_workflow"] = contract["workflow"]
+        if contract["repository_context_id"]:
+            _mark_repository_context_used(
+                [contract["repository_context_id"]],
+                "immutable_target_lock",
+            )
     context = dict(context or {})
     context["resolved_repository_target"] = dict(contract)
     context["resolved_workflow"] = contract["workflow"]
@@ -1930,6 +2066,13 @@ def build_backend_existing_infra_modification_context(
         list(context.get("matched_files") or []) + list(context.get("environment_files") or []),
         extra_environment_evidence,
     )
+    shared_context_block, shared_context_live_files, shared_context_metadata = (
+        _teams_shared_context_for_repository_decision(prompt)
+    )
+    evidence = _teams_merge_repository_evidence(evidence, shared_context_live_files)
+    if shared_context_block:
+        context["shared_repository_context"] = shared_context_block
+        context["shared_repository_context_metadata"] = shared_context_metadata
     if not evidence:
         return context
 
@@ -2571,80 +2714,64 @@ def _repository_context_unique_boolean_match(
     inventory: list[dict],
     operation: str,
 ) -> list[dict]:
-    """Resolve an exact durable context mapping against live environment Booleans.
+    """Resolve durable context against current live Boolean inventory.
 
-    Repository context is only a semantic index: a record is accepted here only
-    when it names both a live Boolean flag and its current live path. A unique
-    match is therefore safe to auto-select and must not trigger clarification.
+    Exact required IDs are loaded first and remain available even when semantic
+    search fails. No record can select a target unless its concrete path+flag is
+    present in the current live inventory, so mandatory reuse cannot override
+    repository truth.
     """
     active = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
     owner, repo = _repository_context_repo_identity(
         str(active.get("cloud") or ""),
         str(active.get("repo_target") or ""),
-        str(active.get("workflow") or ""),
+        str(active.get("workflow") or active.get("resolved_workflow") or ""),
         str(active.get("repo_name") or ""),
     )
     if not owner or not repo or not inventory:
         return []
+    branch, current_sha = _repository_context_branch_and_sha(
+        owner, repo, str(active.get("context_branch") or active.get("existing_branch") or "")
+    )
+    required_ids = [
+        str(value).strip()
+        for value in (active.get("required_repository_context_ids") or [])
+        if str(value).strip()
+    ]
+    required_records = _repository_context_required_records(
+        owner, repo, required_ids, current_sha
+    )
+    search: dict = {"results": []}
     try:
-        branch, current_sha = _repository_context_branch_and_sha(
-            owner, repo, str(active.get("context_branch") or active.get("existing_branch") or "")
-        )
         search = shared_repository_context.search_repository_context(
-            repo_owner=owner, repo_name=repo, query=str(prompt or "").strip(),
-            current_commit_sha=current_sha, top_k=8,
+            repo_owner=owner,
+            repo_name=repo,
+            query=str(prompt or "").strip(),
+            current_commit_sha=current_sha,
+            top_k=8,
         )
-        # Phase 2 can require a context record that was retrieved by the test
-        # harness but ranked outside this resolver's independent top-8 search.
-        # Merge those exact IDs before semantic matching.  The record still
-        # cannot select a target unless its path+flag exists in the CURRENT live
-        # Boolean inventory below, so durable context remains a hint rather than
-        # an authority over repository truth.
-        required_ids = [
-            str(value).strip()
-            for value in (active.get("required_repository_context_ids") or [])
-            if str(value).strip()
-        ]
-        if required_ids:
-            merged = [dict(item) for item in (search.get("results") or []) if isinstance(item, dict)]
-            present = {str(item.get("id") or "").strip() for item in merged}
-            for context_id in required_ids:
-                if context_id in present:
-                    continue
-                record = shared_repository_context.get_repository_context_by_id(context_id)
-                if record is None or str(record.repo_full_name or "").lower() != f"{owner}/{repo}".lower():
-                    continue
-                merged.insert(0, {
-                    "id": record.id,
-                    "category": record.category,
-                    "subject": record.subject,
-                    "scope": record.scope,
-                    "statement": record.statement,
-                    "evidence_paths": list(record.evidence_paths or []),
-                    "evidence_commit_sha": record.evidence_commit_sha,
-                    "evidence_branch": record.evidence_branch,
-                    "status": record.status,
-                    "confidence": record.confidence,
-                    "conflict_with_ids": list(record.conflict_with_ids or []),
-                    "stale": bool(current_sha and record.evidence_commit_sha and current_sha != record.evidence_commit_sha),
-                })
-                present.add(context_id)
-            search = dict(search or {})
-            search["results"] = merged
-            LOGGER.info(
-                "[TerrabotDiag] event=repository_context_boolean_required_ids_merged repo=%s/%s required_ids=%s results=%s",
-                owner, repo, ",".join(required_ids)[:800], len(merged),
-            )
     except Exception as exc:
         LOGGER.warning(
-            "[TerrabotDiag] event=repository_context_boolean_resolution_search_failed repo=%s/%s error=%s",
-            owner, repo, exc,
+            "[TerrabotDiag] event=repository_context_boolean_resolution_search_failed repo=%s/%s error=%s required_ids=%s",
+            owner, repo, exc, ",".join(required_ids)[:800],
         )
+    search = _repository_context_merge_required_records(search, required_records)
+    if not search.get("results"):
         return []
+    if required_ids:
+        LOGGER.info(
+            "[TerrabotDiag] event=repository_context_boolean_required_ids_merged repo=%s/%s required_ids=%s found_ids=%s results=%s",
+            owner, repo, ",".join(required_ids)[:800],
+            ",".join(str(item.get("id") or "") for item in required_records)[:800],
+            len(search.get("results") or []),
+        )
 
-    wanted_value = {"create": "true", "enable": "true", "disable": "false", "delete": "false"}.get(
-        str(operation or "").strip().lower(), ""
-    )
+    wanted_value = {
+        "create": "true",
+        "enable": "true",
+        "disable": "false",
+        "delete": "false",
+    }.get(str(operation or "").strip().lower(), "")
     matches: list[dict] = []
     seen: set[tuple[str, int, str]] = set()
     for record in search.get("results") or []:
@@ -2653,11 +2780,6 @@ def _repository_context_unique_boolean_match(
         status = str(record.get("status") or "active").strip().lower()
         if status not in {"active", "conflicted"}:
             continue
-        # A conflicted historical record may participate only through the same
-        # exact CURRENT live path+flag verification as an active record. If two
-        # conflicting mappings are both still live they produce multiple matches
-        # and are not auto-selected; a single surviving live mapping is safe to
-        # reuse because repository truth has disambiguated the conflict.
         record_text = " ".join([
             str(record.get("subject") or ""),
             str(record.get("scope") or ""),
@@ -2667,15 +2789,20 @@ def _repository_context_unique_boolean_match(
         for item in inventory:
             if not isinstance(item, dict):
                 continue
-            path = str(item.get("path") or "").strip().strip("/")
+            path_value = str(item.get("path") or "").strip().strip("/")
             flag = str(item.get("flag") or "").strip()
-            if not path or not flag or flag.lower() not in record_text or path.lower() not in record_text:
+            if (
+                not path_value
+                or not flag
+                or flag.lower() not in record_text
+                or path_value.lower() not in record_text
+            ):
                 continue
             current = str(item.get("current_value") or "").strip().lower()
             target = wanted_value or ("false" if current == "true" else "true")
             if target == current:
                 continue
-            key = (path, int(item.get("line_number") or 0), flag)
+            key = (path_value, int(item.get("line_number") or 0), flag)
             if key in seen:
                 continue
             seen.add(key)
@@ -2687,6 +2814,8 @@ def _repository_context_unique_boolean_match(
                 "description": str(record.get("statement") or "").strip(),
                 "repository_context_id": str(record.get("id") or "").strip(),
                 "operation": str(operation or "unknown").strip().lower(),
+                "resolution_source": "validated_repository_context",
+                "required_continuation_record": bool(record.get("required_continuation_record")),
             })
     LOGGER.info(
         "[TerrabotDiag] event=repository_context_boolean_resolution_complete repo=%s/%s operation=%s matches=%s context_ids=%s",
@@ -2694,7 +2823,6 @@ def _repository_context_unique_boolean_match(
         ",".join(str(item.get("repository_context_id") or "") for item in matches)[:800],
     )
     return matches
-
 
 def _foundry_repository_boolean_inventory_retry(
     prompt: str,
@@ -2928,6 +3056,10 @@ def _validated_repository_boolean_strategy(
             context_matches[0].get("repository_context_id") or "",
             context_matches[0].get("path") or "",
             context_matches[0].get("flag") or "",
+        )
+        _mark_repository_context_used(
+            [str(context_matches[0].get("repository_context_id") or "")],
+            "semantic_target_resolution",
         )
         return strategy, context_matches
 

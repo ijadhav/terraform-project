@@ -1006,12 +1006,18 @@ def _matching_context_record(case: TestCase, search_result: dict) -> dict | None
     return None
 
 
-def _search_phase2_context(case: TestCase) -> tuple[dict, dict | None]:
-    """Search Phase 2 by paraphrase with bounded index-consistency retries.
+def _search_phase2_context(
+    case: TestCase,
+    *,
+    required_context_id: str = "",
+) -> tuple[dict, dict | None]:
+    """Retrieve Phase 2 context by paraphrase, then by the learned exact ID.
 
-    The retry never uses the hidden expected flag/path as a query.  It therefore
-    preserves the semantic-reuse assertion while avoiding false negatives when
-    a verified mapping was indexed only milliseconds before Phase 2.
+    Semantic search remains the first assertion. When the record was created or
+    verified in Phase 1, its exact durable ID is also available to the fresh Phase
+    2 conversation. Falling back to that exact ID prevents search ranking or
+    index-consistency lag from dropping a mandatory continuation record. The
+    record still must map to the expected live path+flag before it is returned.
     """
     try:
         attempts = int(os.getenv("TERRABOT_TEST_PHASE2_CONTEXT_SEARCH_ATTEMPTS", "3"))
@@ -1045,6 +1051,53 @@ def _search_phase2_context(case: TestCase) -> tuple[dict, dict | None]:
             return last, match
         if attempt < attempts:
             time.sleep(min(0.5 * attempt, 1.5))
+
+    context_id = str(required_context_id or "").strip()
+    if context_id:
+        try:
+            record = repository_context.get_repository_context_by_id(context_id)
+        except Exception as exc:
+            _diag(
+                "phase2_required_context_exact_id_lookup_failed",
+                level="warning",
+                test_case_id=case.case_id,
+                context_id=context_id,
+                error=exc,
+            )
+            record = None
+        if record is not None:
+            exact = {
+                "id": str(getattr(record, "id", "") or ""),
+                "category": str(getattr(record, "category", "") or ""),
+                "subject": str(getattr(record, "subject", "") or ""),
+                "scope": str(getattr(record, "scope", "") or ""),
+                "statement": str(getattr(record, "statement", "") or ""),
+                "evidence_paths": list(getattr(record, "evidence_paths", []) or []),
+                "evidence_commit_sha": str(getattr(record, "evidence_commit_sha", "") or ""),
+                "evidence_branch": str(getattr(record, "evidence_branch", "") or ""),
+                "status": str(getattr(record, "status", "active") or "active"),
+                "confidence": getattr(record, "confidence", 0.0),
+                "stale": False,
+                "required_continuation_record": True,
+            }
+            repo_full_name = str(getattr(record, "repo_full_name", "") or "").lower()
+            if (
+                repo_full_name == f"{case.owner}/{case.repo}".lower()
+                and _matching_context_record(case, {"results": [exact]}) is not None
+            ):
+                _diag(
+                    "phase2_context_retrieved_by_exact_id",
+                    test_case_id=case.case_id,
+                    context_id=context_id,
+                    semantic_search_result_count=len(last.get("results") or []),
+                )
+                merged = dict(last or {})
+                merged_results = [exact] + [
+                    item for item in (last.get("results") or [])
+                    if isinstance(item, dict) and str(item.get("id") or "") != context_id
+                ]
+                merged["results"] = merged_results
+                return merged, exact
     return last, None
 
 
@@ -1370,11 +1423,17 @@ def _resolve_automated_clarifications(
             candidate_count=len(candidates),
             clarification=clarification_text[:500],
         )
+        original_user_prompt = case.phase1_prompt if phase == 1 else case.phase2_prompt
+        prompt_author_binding = cursor_prompt_provider.get_prompt_author_target_binding(
+            run_id=run_id,
+            case=case,
+            prompt=original_user_prompt,
+        )
         cursor_resolution = cursor_prompt_provider.resolve_repository_clarification(
             owner=case.owner,
             repo=case.repo,
             commit_sha=case.commit_sha,
-            original_prompt=case.phase1_prompt if phase == 1 else case.phase2_prompt,
+            original_prompt=original_user_prompt,
             clarification_text=clarification_text,
             candidates=candidates,
             # Cursor authored/validated the test prompt from this immutable test
@@ -1394,23 +1453,27 @@ def _resolve_automated_clarifications(
                 if case.case_type == "boolean_context"
                 else None
             ),
+            prompt_author_target_binding=prompt_author_binding,
             run_id=run_id,
             case_id=case.case_id,
             log_event=_diag,
         )
-        cursor_attempted = True
+        cursor_attempted = bool((cursor_resolution or {}).get("attempted", True))
+        cursor_resolved = bool((cursor_resolution or {}).get("resolved"))
         cursor_error = str((cursor_resolution or {}).get("error") or "").strip()
+        if cursor_attempted and not cursor_resolved and not cursor_error:
+            cursor_error = "Cursor did not resolve the repository clarification to one live-verifiable target."
         if phase == 1:
-            row.phase1_cursor_clarification_attempted = True
-            row.phase1_cursor_clarification_failed = bool(cursor_error)
+            row.phase1_cursor_clarification_attempted = cursor_attempted
+            row.phase1_cursor_clarification_failed = bool(cursor_attempted and not cursor_resolved)
             row.phase1_cursor_clarification_error = cursor_error
         else:
-            row.phase2_cursor_clarification_attempted = True
-            row.phase2_cursor_clarification_failed = bool(cursor_error)
+            row.phase2_cursor_clarification_attempted = cursor_attempted
+            row.phase2_cursor_clarification_failed = bool(cursor_attempted and not cursor_resolved)
             row.phase2_cursor_clarification_error = cursor_error
 
 
-        resolution_type = str(cursor_resolution.get("resolution_type") or "").strip().lower()
+        resolution_type = str((cursor_resolution or {}).get("resolution_type") or "").strip().lower()
         structured_picker = bool(candidates) and bool(cursor_resolution.get("use_structured_picker"))
         selection = str(cursor_resolution.get("answer") or "").strip()
 
@@ -1488,9 +1551,10 @@ def _resolve_automated_clarifications(
             cursor_selected_flag=cursor_resolution.get("selected_flag") if cursor_resolution else "",
             process="cursor_repo_analysis->backend_continuation",
         )
+        continuation_prompt = selection if structured_picker else original_user_prompt
         followup = {
-            "prompt": selection,
-            "original_prompt": case.phase1_prompt if phase == 1 else case.phase2_prompt,
+            "prompt": continuation_prompt,
+            "original_prompt": original_user_prompt,
             "thread_id": str(current.get("thread_id") or ""),
             "teams_conversation_id": conversation_id,
             "memory_conversation_id": phase_request["memory_conversation_id"],
@@ -1501,10 +1565,13 @@ def _resolve_automated_clarifications(
             "automated_test_phase": phase,
             "automated_test_case_id": case.case_id,
             "automated_test_case_type": case.case_type,
-            # This is a continuation of the same pending infrastructure request,
-            # not a new generation.  Keeping this false preserves the pending
-            # target/workflow state that Terrabot created before clarification.
-            "fresh_infra_generation": False,
+            # A structured picker continues the pending selection. A free-form
+            # Cursor repository-control answer replays the original semantic
+            # request with a live-verifiable structured resolution attached, so
+            # the final repository resolver runs instead of treating "Use X in
+            # path Y" as a brand-new vague infrastructure request.
+            "fresh_infra_generation": not structured_picker,
+            "resume_after_repository_clarification": not structured_picker,
             # Keep the already-resolved test branch strategy across target or
             # free-form clarification continuations. A clarification must not
             # reopen the normal user branch-choice stage.
@@ -1516,6 +1583,9 @@ def _resolve_automated_clarifications(
             "cloud": case.cloud,
             "requested_cloud": case.cloud,
             "required_repository_context_ids": list(phase_request.get("required_repository_context_ids") or []),
+            "repository_context_reuse_required": bool(
+                phase_request.get("repository_context_reuse_required")
+            ),
         }
         resolved_followup_workflow = str(
             current.get("workflow")
@@ -1540,6 +1610,11 @@ def _resolve_automated_clarifications(
                 "new_value": cursor_resolution.get("selected_new_value"),
                 "reason": str(cursor_resolution.get("reason") or "").strip(),
                 "evidence": list(cursor_resolution.get("evidence") or [])[:4],
+                "verification_provenance": str(
+                    cursor_resolution.get("verification_provenance")
+                    or "cursor_repository_agent"
+                ),
+                "cursor_api_call": bool(cursor_resolution.get("api_call", True)),
             }
             _diag(
                 "cursor_clarification_handoff_prepared",
@@ -1874,7 +1949,11 @@ def _run_case(core: Any, case: TestCase, run_id: str, requester_id: str) -> Test
 
         # Phase 2 retrieval is checked with the actual randomized paraphrase and
         # then exercised through a completely fresh Teams conversation.
-        phase2_search, phase2_match = _search_phase2_context(case)
+        final_context_id = str((final_context_match or {}).get("id") or "").strip()
+        phase2_search, phase2_match = _search_phase2_context(
+            case,
+            required_context_id=final_context_id,
+        )
         row.phase2_context_retrieved = phase2_match is not None
 
         phase2_request = _phase_request(case, case.phase2_prompt, p2_conversation, phase=2)
@@ -1912,10 +1991,21 @@ def _run_case(core: Any, case: TestCase, run_id: str, requester_id: str) -> Test
         first_phase2_mode = row.phase2_mode
         diagnostics = ((phase2_result.get("test_diagnostics") or {}).get("repository_context") or {})
         attached_ids = {str(value) for value in (diagnostics.get("context_ids") or []) if str(value)}
-        expected_context_id = str((phase2_match or {}).get("id") or "")
+        used_context_ids = {
+            str(value)
+            for value in (
+                diagnostics.get("used_context_ids")
+                or diagnostics.get("reused_context_ids")
+                or []
+            )
+            if str(value)
+        }
+        expected_context_id = str((phase2_match or {}).get("id") or "").strip()
         row.phase2_context_attached = bool(
-            diagnostics.get("attached")
-            and (not expected_context_id or expected_context_id in attached_ids)
+            row.phase2_context_retrieved
+            and expected_context_id
+            and diagnostics.get("attached")
+            and expected_context_id in attached_ids
         )
         row.phase2_context_backend_defect = bool(
             row.phase2_context_retrieved and not row.phase2_context_attached
@@ -1932,8 +2022,19 @@ def _run_case(core: Any, case: TestCase, run_id: str, requester_id: str) -> Test
         row.phase2_reused_without_clarification = bool(
             row.phase2_context_retrieved
             and row.phase2_context_attached
+            and expected_context_id in used_context_ids
             and first_phase2_mode != "clarification"
         )
+        if row.phase2_context_attached and expected_context_id not in used_context_ids:
+            _diag(
+                "phase2_context_attached_but_not_used",
+                level="error",
+                run_id=run_id,
+                test_case_id=case.case_id,
+                expected_context_id=expected_context_id,
+                attached_context_ids=sorted(attached_ids),
+                used_context_ids=sorted(used_context_ids),
+            )
 
         # Still continue a Phase 2 clarification so file-generation accuracy is
         # measured independently from context retrieval accuracy.
@@ -1998,6 +2099,7 @@ def _run_case(core: Any, case: TestCase, run_id: str, requester_id: str) -> Test
             "retrieved_record": _cursor_context_evidence(phase2_match),
             "context_attached": row.phase2_context_attached,
             "attached_context_ids": sorted(attached_ids),
+            "used_context_ids": sorted(used_context_ids),
             "expected_context_id": expected_context_id,
             "reused_without_clarification": row.phase2_reused_without_clarification,
             "target_ok": row.phase2_target_ok,
@@ -2590,6 +2692,16 @@ def format_test_run_report(run: TestRunResult) -> str:
             # assertions such as target/file/context failures.
             if item.error:
                 reasons.append("backend/harness error: " + item.error)
+            if item.phase1_cursor_clarification_failed:
+                reasons.append(
+                    "Phase 1 Cursor clarification failed: "
+                    + (item.phase1_cursor_clarification_error or "unresolved")
+                )
+            if item.phase2_cursor_clarification_failed:
+                reasons.append(
+                    "Phase 2 Cursor clarification failed: "
+                    + (item.phase2_cursor_clarification_error or "unresolved")
+                )
             if not item.expected_target_found:
                 reasons.append("expected target not detected")
             if not item.correct_flag_detected:

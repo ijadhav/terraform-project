@@ -996,6 +996,24 @@ def _build_agent_input_for_infra_teams_v1(
         "questions": [],
         "validation_commands": ["terraform fmt -check -recursive", "terraform validate"],
     }
+    if isinstance(immutable_target, dict) and immutable_target:
+        payload["immutable_boolean_output_contract"] = {
+            "preferred_response": "repair_edits",
+            "path": str(immutable_target.get("path") or ""),
+            "line_number": immutable_target.get("line_number"),
+            "flag": str(immutable_target.get("flag") or ""),
+            "current_value": str(immutable_target.get("current_value") or ""),
+            "new_value": str(immutable_target.get("new_value") or ""),
+            "repair_edits": [{
+                "path": str(immutable_target.get("path") or ""),
+                "old_text": "copy the exact unique complete live assignment line, including indentation/spacing/comment",
+                "new_text": "the same exact line with only the Boolean literal changed",
+            }],
+            "backend_materialization": (
+                "The backend applies the exact Foundry-selected edit to the complete current live file, "
+                "then runs the same hard validators and branch transport. It does not choose the target or value."
+            ),
+        }
 
     instructions = [
         instruction
@@ -1035,6 +1053,13 @@ def _build_agent_input_for_infra_teams_v1(
         "For such a creation, return the complete three-file set in the same response: (1) the existing resource-family definition file with only the new sibling invocation appended and wired to a new dedicated var.<root>.*, (2) the existing variables.tf with a new variable <root> declaration cloned from the nearest sibling type shape, and (3) the resolved target environment values file with a new <root> object assignment cloned from the nearest sibling concrete values. Never defer any of these files to another turn.",
         "If the requested resource name is new and the repository provides a clear nearest sibling, make all three decisions yourself. Do not return questions asking whether to use object-backed vs non-object-backed structure, whether variables.tf may be edited, which sibling to clone, or which target environment tfvars file to use.",
     ])
+    if isinstance(immutable_target, dict) and immutable_target:
+        instructions.extend([
+            "IMMUTABLE BOOLEAN FIRST-PASS EDIT (HARD): the backend has already live-verified one exact path/line/flag/current_value/new_value. Do not perform target discovery again and do not return a clarification.",
+            "Prefer immutable_boolean_output_contract.repair_edits over reconstructing a large full file. Copy old_text exactly from the supplied live target line and return new_text with only the Boolean literal changed. Do not include unrelated edits.",
+            "When returning repair_edits for this first generation response, files may be omitted; the backend will materialize the exact edit onto current live bytes and run all hard validators before any branch write.",
+            "Self-check old_text uniqueness, path equality, old/new polarity, and absence of any other change before returning. This is the primary generation response, not a corrective repair round.",
+        ])
     selected_generation_context = next((
         item for item in retrieved_value_context or []
         if isinstance(item, dict)
@@ -2053,8 +2078,9 @@ def _handle_teams_chat_request_safe(data: dict):
         "cloud": str(
             request_data.get("cloud") or request_data.get("requested_cloud") or state.get("cloud") or ""
         ).strip().lower(),
-        "repo_target": str(state.get("repo_target") or request_data.get("repo_target") or "").strip().lower(),
+        "repo_target": str(request_data.get("repo_target") or state.get("repo_target") or "").strip().lower(),
         "repo_name": str(request_data.get("repo_name") or state.get("repo") or "").strip(),
+        "workflow": str(request_data.get("workflow") or state.get("workflow") or "").strip(),
         "requester": str(request_data.get("teams_requester") or "").strip(),
         # Test-only observability. These fields do not alter routing/generation;
         # they let the isolated E2E harness prove that retrieved context was
@@ -2066,6 +2092,12 @@ def _handle_teams_chat_request_safe(data: dict):
             for value in (request_data.get("required_repository_context_ids") or [])
             if str(value).strip()
         ],
+        "repository_context_reuse_required": _teams_truthy(
+            request_data.get("repository_context_reuse_required")
+        ),
+        "resume_after_repository_clarification": _teams_truthy(
+            request_data.get("resume_after_repository_clarification")
+        ),
         # Automated tests may ask a read-only Cursor agent to resolve a genuine
         # repository clarification. This is only a hint until part 13 proves
         # the exact path/flag/value against the live repository evidence.
