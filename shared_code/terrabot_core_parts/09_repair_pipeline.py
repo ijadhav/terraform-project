@@ -541,6 +541,16 @@ def _teams_call_agent_for_backend_repair(
     repository truth remains authoritative over memory.
     """
     raw = json.dumps(repair_payload, ensure_ascii=False, separators=(",", ":"))
+    # Repair turns run in the SAME conversation as generation, so the model
+    # context already holds the (large) generation input. Run
+    # ctx-20260904-120034-a813fa failed with context_length_exceeded on repair
+    # attempts 2-3 at ~274K chars. Enforce the shared backend input budget on
+    # the repair payload as well (helper defined in the generation-flow shard).
+    raw = _teams_enforce_agent_input_budget(
+        raw,
+        thread=str(conversation_id or ""),
+        workflow="backend_repair",
+    )
     _teams_diag_log(
         "backend_repair_contextual_call",
         input_chars=len(raw),
@@ -622,6 +632,20 @@ def _teams_get_valid_backend_repair(
                 response_attempt=f"{response_attempt}/{max_response_attempts}",
                 error=str(exc)[:300],
             )
+            # context_length_exceeded means the CONVERSATION history (not just
+            # this payload) no longer fits the model window. Reusing the same
+            # thread will fail every remaining attempt (run 2 burned attempts
+            # 2/3 and 3/3 this way). Restart repair in a FRESH conversation:
+            # the payload already carries the exact live baselines and the
+            # rejected candidate, so no reasoning is lost that validation needs.
+            if "context_length_exceeded" in str(exc) or "context window" in str(exc):
+                repair_conversation_id = ""
+                _teams_diag_log(
+                    "backend_repair_context_window_reset",
+                    level="warning",
+                    response_attempt=f"{response_attempt}/{max_response_attempts}",
+                    action="restarting repair in a fresh Foundry conversation with budgeted payload",
+                )
             if response_attempt >= max_response_attempts:
                 break
             working_payload = dict(working_payload)

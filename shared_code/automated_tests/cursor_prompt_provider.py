@@ -509,6 +509,166 @@ def _wait_for_result(
         )
 
 
+def _agent_mode() -> str:
+    """Cursor agent mode for all Terrabot-created agents.
+
+    Run ctx-20260904-120034-a813fa showed that in "plan" mode Cursor frequently
+    ends the run at the *plan* stage ("Drafting the prompt plan next.",
+    "I'll record that as the clarification plan.") and never emits the final
+    JSON at all — sentinel markers and retries cannot help when the model
+    intentionally stops before producing the deliverable. Default to "ask",
+    which answers in a single read-only turn, while remaining overridable.
+    """
+    value = os.getenv("TERRABOT_CURSOR_AGENT_MODE", "ask").strip().lower()
+    return value if value in {"ask", "plan", "agent"} else "ask"
+
+
+def _wait_for_new_run(
+    session: Any,
+    agent_id: str,
+    previous_run_id: str,
+    *,
+    base_url: str,
+    headers: dict[str, str],
+    timeout: float,
+    poll_interval: float,
+    max_wait: float = 45.0,
+) -> str:
+    """After a followup message, wait until the agent starts a new run."""
+    started = time.monotonic()
+    while True:
+        agent = _http_json(
+            session,
+            "GET",
+            f"{base_url}/v1/agents/{agent_id}",
+            headers=headers,
+            timeout=timeout,
+        )
+        latest = str(agent.get("latestRunId") or "").strip()
+        if latest and latest != previous_run_id:
+            return latest
+        if time.monotonic() - started >= max_wait:
+            # Some API versions reuse the run record for followups; fall back
+            # to polling the same run id rather than failing outright.
+            return previous_run_id
+        time.sleep(min(poll_interval, 2.0))
+
+
+def _finalize_json_result(
+    session: Any,
+    *,
+    agent_id: str,
+    cursor_run_id: str,
+    base_url: str,
+    headers: dict[str, str],
+    request_timeout: float,
+    run_timeout: float,
+    poll_interval: float,
+    run_label: str,
+    log_event: Callable[..., None] | None,
+    result_text: str,
+    expected_schema_version: str | None = None,
+) -> dict[str, Any]:
+    """Parse the run result; on prose/plan output, ask the SAME agent to emit
+    the final JSON via a followup turn instead of discarding its analysis.
+
+    This closes the run-2 failure mode where Cursor returned only a plan
+    ("I'll lock the two prompt pairs...") and the whole flow fell back to
+    hand-rolled prompts / 400 clarifications.
+    """
+    max_followups = _int_setting("TERRABOT_CURSOR_FINAL_JSON_FOLLOWUPS", 2, 0, 3)
+    text = str(result_text or "")
+    last_run_id = cursor_run_id
+    last_error: CursorPromptError | None = None
+    for followup_attempt in range(max_followups + 1):
+        try:
+            parsed = _parse_result_text(text)
+            if expected_schema_version:
+                schema_version = str(parsed.get("schema_version") or "").strip()
+                if schema_version != expected_schema_version:
+                    raise CursorPromptError(
+                        f"Cursor result schema_version must be {expected_schema_version}, "
+                        f"got '{schema_version or 'missing'}'."
+                    )
+            return parsed
+        except CursorPromptError as exc:
+            last_error = exc
+            if followup_attempt >= max_followups:
+                break
+            followup_text = "\n".join(
+                [
+                    "FINALIZE NOW. Your previous message was a plan or prose summary, "
+                    "not the required deliverable.",
+                    "Do NOT plan further, do NOT re-analyze, and do NOT modify any file "
+                    "or branch.",
+                    "Using the analysis you already performed, your NEXT message must "
+                    "contain ONLY the final JSON object,",
+                    f"wrapped exactly between the literal lines {_JSON_BEGIN_MARKER} "
+                    f"and {_JSON_END_MARKER}, with no other text.",
+                    (
+                        f"schema_version must be exactly {expected_schema_version}."
+                        if expected_schema_version
+                        else "Include the schema_version field required by the original instruction."
+                    ),
+                    f"Format problem to fix: {str(exc)[:500]}",
+                ]
+            )
+            _emit(
+                "cursor_final_json_followup_sent",
+                level="warning",
+                log_event=log_event,
+                run_id=run_label,
+                cursor_agent_id=agent_id,
+                attempt=followup_attempt + 1,
+                max_attempts=max_followups,
+                error=exc,
+                result_preview=text[:200],
+            )
+            try:
+                _http_json(
+                    session,
+                    "POST",
+                    f"{base_url}/v1/agents/{agent_id}/followup",
+                    headers=headers,
+                    timeout=request_timeout,
+                    payload={"prompt": {"text": followup_text}},
+                )
+                new_run_id = _wait_for_new_run(
+                    session,
+                    agent_id,
+                    last_run_id,
+                    base_url=base_url,
+                    headers=headers,
+                    timeout=request_timeout,
+                    poll_interval=poll_interval,
+                )
+                text, _terminal = _wait_for_result(
+                    session,
+                    agent_id,
+                    new_run_id,
+                    {},
+                    base_url=base_url,
+                    headers=headers,
+                    request_timeout=request_timeout,
+                    run_timeout=run_timeout,
+                    poll_interval=poll_interval,
+                    run_label=run_label,
+                    log_event=log_event,
+                )
+                last_run_id = new_run_id
+            except CursorPromptError as followup_error:
+                _emit(
+                    "cursor_final_json_followup_failed",
+                    level="warning",
+                    log_event=log_event,
+                    run_id=run_label,
+                    cursor_agent_id=agent_id,
+                    error=followup_error,
+                )
+                break
+    raise last_error or CursorPromptError("Cursor result did not contain a JSON object.")
+
+
 # Cursor Cloud Agents (especially in "plan" mode on large repositories) often
 # wrap their final answer in prose, summaries, or partial markdown, which made
 # the old "first { .. last }" extraction fail ~5/6 of the time. Every Terrabot
@@ -731,7 +891,7 @@ def _generate_for_group(
     instruction = _build_cursor_instruction(cases, run_id)
     create_payload = {
         "name": f"Terrabot prompts {run_id} {repo}"[:100],
-        "mode": "plan",
+        "mode": _agent_mode(),
         "prompt": {"text": instruction},
         "repos": [
             {
@@ -829,7 +989,20 @@ def _generate_for_group(
                 repo=f"{owner}/{repo}",
                 reported_branches=len(pushed_branches),
             )
-        parsed = _parse_result_text(result_text)
+        parsed = _finalize_json_result(
+            session,
+            agent_id=agent_id,
+            cursor_run_id=cursor_run_id,
+            base_url=base_url,
+            headers=headers,
+            request_timeout=request_timeout,
+            run_timeout=run_timeout,
+            poll_interval=poll_interval,
+            run_label=run_id,
+            log_event=log_event,
+            result_text=result_text,
+            expected_schema_version=_SCHEMA_VERSION,
+        )
         prompts = _validated_prompts(parsed, cases, commit_sha)
 
         generated: list[Any] = []
@@ -1029,7 +1202,7 @@ def _repair_clarification_protocol(
         ])
         payload = {
             "name": f"Terrabot clarification protocol repair {run_id} {case_id}"[:100],
-            "mode": "plan",
+            "mode": _agent_mode(),
             "prompt": {"text": instruction},
             "workOnCurrentBranch": False,
             "autoCreatePR": False,
@@ -1303,7 +1476,7 @@ def resolve_repository_clarification(
     remote_before = cursor_readonly_guard.snapshot_remote_branches(repos)
     create_payload = {
         "name": f"Terrabot clarification {run_id} {case_id}"[:100],
-        "mode": "plan",
+        "mode": _agent_mode(),
         "prompt": {"text": instruction},
         "repos": repos,
         "workOnCurrentBranch": False,
@@ -1370,12 +1543,20 @@ def resolve_repository_clarification(
                     + json.dumps(mutations, ensure_ascii=False)[:1000]
                 )
             try:
-                parsed = _parse_result_text(result_text)
-                schema_version = str(parsed.get("schema_version") or "").strip()
-                if schema_version != _CLARIFICATION_SCHEMA_VERSION:
-                    raise CursorPromptError(
-                        f"Cursor clarification schema_version must be {_CLARIFICATION_SCHEMA_VERSION}."
-                    )
+                parsed = _finalize_json_result(
+                    session,
+                    agent_id=agent_id,
+                    cursor_run_id=cursor_run_id,
+                    base_url=base_url,
+                    headers=headers,
+                    request_timeout=request_timeout,
+                    run_timeout=run_timeout,
+                    poll_interval=poll_interval,
+                    run_label=run_id or case_id or "clarification",
+                    log_event=log_event,
+                    result_text=result_text,
+                    expected_schema_version=_CLARIFICATION_SCHEMA_VERSION,
+                )
                 last_error = None
                 break
             except CursorPromptError as protocol_error:
@@ -1613,7 +1794,7 @@ def generate_repository_questions(
     remote_before = cursor_readonly_guard.snapshot_remote_branches(repos)
     payload = {
         "name": f"Terrabot repository questions {run_id} {repo}"[:100],
-        "mode": "plan",
+        "mode": _agent_mode(),
         "prompt": {"text": instruction},
         "repos": repos,
         "workOnCurrentBranch": False,
@@ -1642,9 +1823,20 @@ def generate_repository_questions(
         mutations = cursor_readonly_guard.cursor_reported_remote_mutations(terminal, remote_before, remote_after)
         if mutations:
             raise CursorPromptError("Cursor changed a verified remote GitHub branch while generating repository questions.")
-        parsed = _parse_result_text(result_text)
-        if str(parsed.get("schema_version") or "").strip() != _REPO_QUESTION_SCHEMA_VERSION:
-            raise CursorPromptError(f"Cursor repository-question schema_version must be {_REPO_QUESTION_SCHEMA_VERSION}.")
+        parsed = _finalize_json_result(
+            http,
+            agent_id=agent_id,
+            cursor_run_id=cursor_run_id,
+            base_url=base_url,
+            headers=headers,
+            request_timeout=request_timeout,
+            run_timeout=run_timeout,
+            poll_interval=poll_interval,
+            run_label=f"{run_id}:repository-questions",
+            log_event=log_event,
+            result_text=result_text,
+            expected_schema_version=_REPO_QUESTION_SCHEMA_VERSION,
+        )
         if str(parsed.get("repository_commit_sha") or "").strip() != commit_sha:
             raise CursorPromptError("Cursor repository-question commit did not match the pinned commit.")
         questions: list[dict[str, Any]] = []
@@ -1739,7 +1931,7 @@ def validate_repository_answer(
     remote_before = cursor_readonly_guard.snapshot_remote_branches(repos)
     payload = {
         "name": f"Terrabot repository answer validation {run_id} {question_id}"[:100],
-        "mode": "plan",
+        "mode": _agent_mode(),
         "prompt": {"text": instruction},
         "repos": repos,
         "workOnCurrentBranch": False,
@@ -1762,9 +1954,20 @@ def validate_repository_answer(
             mutations = cursor_readonly_guard.cursor_reported_remote_mutations(terminal, remote_before, remote_after)
             if mutations:
                 raise CursorPromptError("Cursor changed a verified remote GitHub branch during repository answer validation.")
-            parsed = _parse_result_text(result_text)
-            if str(parsed.get("schema_version") or "").strip() != _REPO_ANSWER_SCHEMA_VERSION:
-                raise CursorPromptError(f"Cursor repository-answer schema_version must be {_REPO_ANSWER_SCHEMA_VERSION}.")
+            parsed = _finalize_json_result(
+                http,
+                agent_id=agent_id,
+                cursor_run_id=cursor_run_id,
+                base_url=base_url,
+                headers=headers,
+                request_timeout=request_timeout,
+                run_timeout=run_timeout,
+                poll_interval=poll_interval,
+                run_label=f"{run_id}:{question_id}:repository-answer",
+                log_event=log_event,
+                result_text=result_text,
+                expected_schema_version=_REPO_ANSWER_SCHEMA_VERSION,
+            )
             correct = parsed.get("correct")
             if not isinstance(correct, bool):
                 raise CursorPromptError("Cursor repository-answer correct must be Boolean.")

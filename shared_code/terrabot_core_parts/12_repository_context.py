@@ -657,6 +657,50 @@ def _extract_and_store_repository_context_after_commit(
     }
 
 
+def _normalize_agent_result_files(agent_result: dict, thread_id: str = "") -> None:
+    """Coerce agent_result["files"] entries into dicts in place.
+
+    Run ctx-20260904-120034-a813fa (aws-02-59153a): the output parser reported
+    files=1 but semantic_relevance immediately failed with "contains no
+    Terraform files" — the single entry was a JSON-encoded *string* of the file
+    object, which every validator drops via isinstance(item, dict). Foundry
+    occasionally double-encodes file objects; normalize once, centrally, before
+    any validator runs so the parser count and the validator view agree.
+    """
+    if not isinstance(agent_result, dict):
+        return
+    raw_files = agent_result.get("files")
+    if not isinstance(raw_files, list):
+        return
+    normalized: list = []
+    coerced = 0
+    dropped = 0
+    for item in raw_files:
+        if isinstance(item, dict):
+            normalized.append(item)
+            continue
+        if isinstance(item, str) and item.strip().startswith("{"):
+            try:
+                parsed = json.loads(item)
+            except Exception:
+                parsed = None
+            if isinstance(parsed, dict):
+                normalized.append(parsed)
+                coerced += 1
+                continue
+        dropped += 1
+    if coerced or dropped:
+        agent_result["files"] = normalized
+        _teams_diag_log(
+            "agent_result_files_normalized",
+            level="warning",
+            thread=thread_id,
+            coerced_json_strings=coerced,
+            dropped_non_dict_entries=dropped,
+            files_after=len(normalized),
+        )
+
+
 def _run_parallel_precommit_validations(agent_result: dict, prompt: str, thread_id: str = "") -> None:
     """Run independent pre-write validators concurrently and aggregate errors.
 
@@ -664,6 +708,7 @@ def _run_parallel_precommit_validations(agent_result: dict, prompt: str, thread_
     a copied ContextVar state so request-local repository evidence is preserved.
     Diagnostics expose submission, completion, duration and aggregate outcome.
     """
+    _normalize_agent_result_files(agent_result, thread_id)
     validators = (
         ("semantic_relevance", _prompt_guard_validate_semantic_relevance, (agent_result, prompt)),
         ("terraform_shape", _prompt_guard_validate_terraform_shape, (agent_result,)),
