@@ -519,8 +519,8 @@ def _agent_mode() -> str:
     intentionally stops before producing the deliverable. Default to "ask",
     which answers in a single read-only turn, while remaining overridable.
     """
-    value = os.getenv("TERRABOT_CURSOR_AGENT_MODE", "ask").strip().lower()
-    return value if value in {"ask", "plan", "agent"} else "ask"
+    value = os.getenv("TERRABOT_CURSOR_AGENT_MODE", "agent").strip().lower()
+    return value if value in {"plan", "agent"} else "agent"
 
 
 def _wait_for_new_run(
