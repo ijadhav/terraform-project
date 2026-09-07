@@ -242,6 +242,22 @@ class TestCaseResult:
     cursor_validation_duration_ms: int = 0
     cursor_verdict_evidence: list[str] = field(default_factory=list)
     cursor_evidence: dict[str, Any] = field(default_factory=dict, repr=False)
+    # Extended classification fields (req 16)
+    repo_qna_intent_failure: bool = False
+    boolean_inventory_exists: bool = False
+    generation_truncated: bool = False
+    repair_exhausted: bool = False
+    agent_self_validation_failed: bool = False
+    backend_preservation_failed: bool = False
+    surgical_edit_anchor_failed: bool = False
+    workflow_continuity_failure: bool = False
+    context_revalidation_failed: bool = False
+    creation_case_invalid: bool = False
+    failed_validation_branch_pushed: bool = False
+    diag_branch_name: str = ""
+    diag_branch_url: str = ""
+    candidate_fingerprints: list[str] = field(default_factory=list)
+    target_contract: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -679,6 +695,23 @@ def _derive_creation_case_for_repository(
         })
         rng.shuffle(environment_paths)
         rng.shuffle(module_names)
+        # Pre-filter module names: skip singletons (global/shared/state/backend/base)
+        # and modules whose name suggests they gate a unique resource (req 13).
+        _SINGLETON_PATTERNS = re.compile(
+            r"(?:^|_)(?:global|shared|base|backend|state|bootstrap|core|common|root)(?:_|$)",
+            re.IGNORECASE,
+        )
+
+        def _module_is_safe_creation_candidate(mname: str, all_paths: list[str]) -> bool:
+            """True if module exists in catalog and could be re-instantiated."""
+            if _SINGLETON_PATTERNS.search(mname):
+                return False
+            # Must have at least one .tf in its modules/ directory
+            module_prefix = f"terraform/modules/{mname}/"
+            return any(p.startswith(module_prefix) for p in all_paths)
+
+        safe_modules = [m for m in module_names if _module_is_safe_creation_candidate(m, paths)]
+
         for env_path in environment_paths[:12]:
             environment = _infer_environment(env_path, "aws")
             if not _candidate_environment_is_valid(core, spec, env_path, environment):
@@ -686,7 +719,7 @@ def _derive_creation_case_for_repository(
             content = core.github_get_file_content_by_repo(spec.owner, spec.repo, env_path, ref=spec.branch) or ""
             if not content:
                 continue
-            for module_name in module_names[:30]:
+            for module_name in safe_modules[:30]:
                 # Select a real reusable module that is not already consumed in
                 # this environment, avoiding an already-exists false failure.
                 if re.search(rf"modules/{re.escape(module_name)}(?:\b|\")", content, re.IGNORECASE):
@@ -1384,62 +1417,6 @@ def _safe_reset(core: Any, conversation_id: str, result: dict) -> None:
         _diag("synthetic_session_reset_failed", level="warning", error=exc)
 
 
-def _oracle_fallback_resolution(core: Any, case: TestCase) -> dict:
-    """Live-verified fallback when Cursor cannot return a usable resolution.
-
-    Run ctx-20260907-063855 lost 4/5 clarification assists to Cursor plan-mode
-    output that carried no parseable JSON, dead-ending every case at
-    clarification. This fallback never trusts the test oracle blindly: it
-    re-fetches the exact pinned file and confirms the literal assignment (or
-    the creation target file) against the live repository before using it.
-    Disable with TERRABOT_TEST_ORACLE_FALLBACK=false.
-    """
-    if str(os.getenv("TERRABOT_TEST_ORACLE_FALLBACK", "true")).strip().lower() in {"0", "false", "no"}:
-        return {}
-    try:
-        content = core.github_get_file_content_by_repo(
-            case.owner, case.repo, case.path, ref=case.commit_sha or case.branch
-        ) or ""
-    except Exception:
-        content = ""
-    if not content:
-        return {}
-    if case.case_type == "boolean_context":
-        current_literal = "true" if case.current_value else "false"
-        desired_literal = "true" if case.desired_value else "false"
-        assignment = re.search(
-            rf'(?m)^\s*"?{re.escape(case.flag)}"?\s*[:=]\s*{current_literal}\b',
-            content,
-        )
-        if not assignment:
-            return {}
-        answer = (
-            f"Use the existing Boolean control {case.flag} in {case.path}: "
-            f"set {case.flag} = {desired_literal} for environment {case.environment}. "
-            "Do not create a new variable and do not modify any other assignment."
-        )
-        return {
-            "answer": answer,
-            "resolution_type": "oracle_fallback",
-            "selected_path": case.path,
-            "selected_flag": case.flag,
-        }
-    if case.case_type == "resource_creation":
-        module_hint = str(case.evidence_line or "").strip()
-        answer = (
-            f"Create the {case.alias} consumer for environment {case.environment} "
-            f"in {case.path}, following the nearest live sibling pattern"
-            + (f" for {module_hint}." if module_hint else ".")
-        )
-        return {
-            "answer": answer,
-            "resolution_type": "oracle_fallback",
-            "selected_path": case.path,
-            "selected_flag": "",
-        }
-    return {}
-
-
 def _resolve_automated_clarifications(
     core: Any,
     case: TestCase,
@@ -1492,11 +1469,10 @@ def _resolve_automated_clarifications(
             original_prompt=original_user_prompt,
             clarification_text=clarification_text,
             candidates=candidates,
-            # Cursor authored/validated the test prompt from this immutable test
-            # target. Supplying the oracle back to Cursor makes clarification an
-            # additive teaching step rather than a blind second discovery task.
-            # Cursor must still verify it against the pinned live repository, and
-            # the backend independently verifies the returned path/flag again.
+            # REQ 6: oracle hints are DISABLED by default.
+            # The expected path/flag validates results AFTER generation but must
+            # not rescue production target discovery in normal acceptance tests.
+            # Enable only for explicit diagnostic runs: TERRABOT_TEST_ORACLE_HINT=true.
             expected_target_hint=(
                 {
                     "path": case.path,
@@ -1507,6 +1483,7 @@ def _resolve_automated_clarifications(
                     "alias": case.alias,
                 }
                 if case.case_type == "boolean_context"
+                and os.getenv("TERRABOT_TEST_ORACLE_HINT","false").strip().lower() in {"1","true","yes"}
                 else None
             ),
             expected_creation_hint=(
@@ -1517,6 +1494,7 @@ def _resolve_automated_clarifications(
                     "module_hint": case.evidence_line,
                 }
                 if case.case_type == "resource_creation"
+                and os.getenv("TERRABOT_TEST_ORACLE_HINT","false").strip().lower() in {"1","true","yes"}
                 else None
             ),
             prompt_author_target_binding=prompt_author_binding,
@@ -1543,7 +1521,6 @@ def _resolve_automated_clarifications(
         structured_picker = bool(candidates) and bool(cursor_resolution.get("use_structured_picker"))
         selection = str(cursor_resolution.get("answer") or "").strip()
 
-        oracle_used = False
         if not cursor_resolution or resolution_type == "unresolved" or not selection:
             # For Boolean-context tests, never silently fall back to the hidden
             # expected target. The purpose of this continuation is to prove that
@@ -1553,26 +1530,6 @@ def _resolve_automated_clarifications(
             if case.case_type == "resource_creation" and candidates:
                 selection = _pick_automated_candidate_reply(case, current)
                 structured_picker = bool(selection)
-            if not selection:
-                fallback = _oracle_fallback_resolution(core, case)
-                if fallback.get("answer"):
-                    # Keep the Cursor failure visible in scoring flags, but do
-                    # not dead-end the entire workflow on a Cursor transport /
-                    # formatting defect: continue with the live-verified target.
-                    oracle_used = True
-                    selection = str(fallback["answer"])
-                    resolution_type = "oracle_fallback"
-                    _diag(
-                        "oracle_fallback_used",
-                        level="warning",
-                        run_id=run_id,
-                        test_case_id=case.case_id,
-                        phase=phase,
-                        round=round_no,
-                        selected_path=fallback.get("selected_path") or "",
-                        selected_flag=fallback.get("selected_flag") or "",
-                        cursor_error=cursor_error[:300],
-                    )
             if not selection:
                 _diag(
                     "automated_clarification_unresolved",
@@ -1589,7 +1546,7 @@ def _resolve_automated_clarifications(
                 )
                 break
 
-        if not structured_picker and resolution_type not in {"creation_target", "oracle_fallback"}:
+        if not structured_picker and resolution_type != "creation_target":
             if phase == 1:
                 row.phase1_freeform_clarification = True
             else:
@@ -1640,9 +1597,9 @@ def _resolve_automated_clarifications(
         )
         if structured_picker:
             continuation_prompt = selection
-        elif (cursor_assist_used or oracle_used) and resolution_type in {"repository_control", "creation_target", "oracle_fallback"}:
+        elif cursor_assist_used and resolution_type in {"repository_control", "creation_target"}:
             # Previously the continuation re-sent the original ambiguous prompt,
-            # so a correct resolution never reached Foundry and the agent
+            # so a correct Cursor resolution never reached Foundry and the agent
             # simply asked the same question again. Carry the resolved
             # repository instruction with the user's intent instead.
             continuation_prompt = f"{original_user_prompt}\n\nResolved repository target: {selection}"
@@ -1854,6 +1811,22 @@ def _run_case(core: Any, case: TestCase, run_id: str, requester_id: str) -> Test
             and str(branch_result.get("mode") or "").lower() == "branch_created"
             and bool(row.branch_name or row.branch_url)
         )
+        # REQ 7: capture the immutable target contract from P1 for P2 continuity.
+        # Pull from backend diagnostics or from the phase1_result directly.
+        _p1_contract = (
+            ((phase1_result.get("test_diagnostics") or {}).get("resolved_repository_target_contract"))
+            or phase1_result.get("resolved_repository_target_contract")
+            or {}
+        )
+        if isinstance(_p1_contract, dict) and _p1_contract.get("path"):
+            row.target_contract = _p1_contract
+            _diag(
+                "phase1_target_contract_captured",
+                run_id=run_id,
+                test_case_id=case.case_id,
+                path=_p1_contract.get("path",""),
+                flag=_p1_contract.get("flag",""),
+            )
         row.cursor_evidence["phase1"].update({
             "backend_validation_ok": row.validation_ok,
             "backend_validation_error": row.validation_error,
@@ -2066,6 +2039,21 @@ def _run_case(core: Any, case: TestCase, run_id: str, requester_id: str) -> Test
         if phase2_match and str(phase2_match.get("id") or "").strip():
             phase2_request["required_repository_context_ids"] = [str(phase2_match.get("id"))]
             phase2_request["repository_context_reuse_required"] = True
+        # REQ 7: carry the P1 immutable target contract into P2.
+        # P2 must rebuild/revalidate from stored context + live GitHub without
+        # clarification. Including the P1 contract lets the backend short-circuit
+        # its target resolution directly to the verified contract instead of
+        # re-running the full Boolean inventory / Cursor flow.
+        if row.target_contract and isinstance(row.target_contract, dict):
+            phase2_request["p1_resolved_target_contract"] = dict(row.target_contract)
+            _diag(
+                "phase2_target_contract_injected",
+                run_id=run_id,
+                test_case_id=case.case_id,
+                path=row.target_contract.get("path",""),
+                flag=row.target_contract.get("flag",""),
+                workflow=row.target_contract.get("workflow",""),
+            )
         phase2_result, status = _invoke_backend(core, phase2_request, row)
         row.phase2_mode = str(phase2_result.get("mode") or "").lower()
         row.phase2_control_mentioned = _control_mentioned(case, phase2_result)
@@ -2320,7 +2308,20 @@ def _run_repository_question_checks(
                 response, status = core.handle_teams_chat_request(request)
                 answer = str((response or {}).get("reply") or "").strip()
                 backend_mode = str((response or {}).get("mode") or "").strip().lower()
-                backend_ok = bool(status < 400 and answer and backend_mode == "chat")
+                # req 1: repo Q&A questions must route to "chat" or "repo_qna" backend mode,
+                # never to infra generation. A question that returns an infra_preview or
+                # clarification is a REPO_QNA_INTENT_FAILURE.
+                infra_modes = {"infra", "infra_preview", "clarification", "branch_created", "pr_created"}
+                backend_ok = bool(status < 400 and answer and backend_mode not in infra_modes)
+                if status < 400 and backend_mode in infra_modes:
+                    _diag(
+                        "repository_question_routed_to_infra",
+                        level="warning",
+                        run_id=run_id,
+                        question_id=qid,
+                        backend_mode=backend_mode,
+                        classification="REPO_QNA_INTENT_FAILURE",
+                    )
             except Exception as exc:
                 response, status, answer, backend_mode, backend_ok = {}, 500, "", "", False
                 _diag("repository_question_backend_failed", level="warning", run_id=run_id, question_id=qid, error=exc)
@@ -2347,7 +2348,9 @@ def _run_repository_question_checks(
                 "terrabot_answer": answer,
                 "backend_status": status,
                 "backend_mode": backend_mode,
+                "backend_intent": "repo_qna" if backend_ok else ("infra_generation" if backend_mode in {"infra", "infra_preview", "clarification"} else "unknown"),
                 "backend_ok": backend_ok,
+                "classification": "PASS" if backend_ok else "REPO_QNA_INTENT_FAILURE",
                 "cursor_completed": bool(validation.get("completed")),
                 "cursor_correct": bool(validation.get("correct")),
                 "cursor_reason": str(validation.get("reason") or ""),
@@ -2647,9 +2650,16 @@ def format_test_run_report(run: TestRunResult) -> str:
         f"Average backend calls/case: **{avg_calls}** | Average case time: **{avg_seconds}s** | Total: **{round(run.duration_ms / 1000.0, 1)}s**",
     ]
     if repository_questions:
+        # req 15: Q&A metrics separate from mutation scoring
+        qna_intent_ok = sum(1 for q in repository_questions if q.get("backend_ok"))
+        qna_evidence_ok = sum(1 for q in repository_questions if q.get("evidence_paths"))
+        qna_plain_text_ok = sum(1 for q in repository_questions if q.get("backend_ok") and not q.get("classification","").startswith("REPO_QNA"))
+        qna_intent_failures = sum(1 for q in repository_questions if q.get("classification") == "REPO_QNA_INTENT_FAILURE")
         lines.append(
             f"Cursor repository/workflow Q&A checks: **{repository_questions_correct}/{len(repository_questions)}** correct "
-            "(read-only questions authored from the pinned repositories and independently validated by Cursor)"
+            f"| Intent correct: **{qna_intent_ok}/{len(repository_questions)}** "
+            f"| Evidence attached: **{qna_evidence_ok}/{len(repository_questions)}** "
+            f"| Intent failures (routed to infra): **{qna_intent_failures}**"
         )
     if cursor_cases:
         lines.append(
@@ -2666,8 +2676,8 @@ def format_test_run_report(run: TestRunResult) -> str:
         )
     lines.extend([
         "",
-        "| Test | Type | Cloud/Env | Phase 1 prompt | Expected target | P1 mode | P2 mode | Target found | Control/output | Control mentioned | P1 file | Validation | Branch pushed | Context | P2 retrieved | P2 attached | P2 useful | Cursor output | Cursor context | Cursor overall | Classification | Score |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---:|",
+        "| Test | Type | Cloud/Env | Phase 1 prompt | Expected target | P1 mode | P2 mode | Target found | Control/output | Control mentioned | P1 file | Validation | Branch URL | Branch pushed | Diag branch | Context | P2 retrieved | P2 attached | P2 useful | Cursor output | Cursor context | Cursor overall | Classification | Score |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---:|",
     ])
     for item in run.cases:
         case = item.case
@@ -2704,7 +2714,9 @@ def format_test_run_report(run: TestRunResult) -> str:
                     ),
                     _status(item.phase1_file_generated),
                     _status(item.validation_ok),
+                    _escape_table(item.branch_url or "N/A", 50),
                     _status(item.branch_pushed),
+                    _escape_table(item.diag_branch_url or "N/A", 50),
                     context_status,
                     p2_context_status,
                     _status(item.phase2_context_attached) if case.case_type == "boolean_context" else "N/A",
@@ -2845,7 +2857,24 @@ def format_test_run_report(run: TestRunResult) -> str:
                 reasons.append("Cursor error: " + item.cursor_validation_error)
             if not item.error and item.validation_error and not item.validation_ok:
                 reasons.append(item.validation_error)
-            branch_note = f" branch={item.branch_name}" if item.branch_name else ""
+            if item.repair_exhausted:
+                reasons.append("all repair attempts exhausted")
+            if item.generation_truncated:
+                reasons.append("agent returned truncated/placeholder file")
+            if item.surgical_edit_anchor_failed:
+                reasons.append("surgical edit: old_text not unique and no line anchor")
+            if item.failed_validation_branch_pushed:
+                diag_ref = item.diag_branch_url or item.diag_branch_name or "?"
+                reasons.append("diagnostic branch pushed (validation_ok=False): " + diag_ref)
+            if item.creation_case_invalid:
+                reasons.append("creation test case was invalid (singleton/gated module)")
+            branch_note = ""
+            if item.branch_url:
+                branch_note = f" branch=[{item.branch_name or 'view'}]({item.branch_url})"
+            elif item.branch_name:
+                branch_note = f" branch={item.branch_name}"
+            if item.diag_branch_url:
+                branch_note += f" diag=[{item.diag_branch_name or 'diag'}]({item.diag_branch_url})"
             lines.append(f"- `{item.case.case_id}`:{branch_note} {_escape_table('; '.join(reasons), 360)}")
 
     if run.discovery_errors:

@@ -1175,17 +1175,82 @@ def _handle_teams_chat_request_base(data: dict):  # pyright: ignore[reportGenera
 
 
 
+def _teams_build_hard_validation_contract(
+    *,
+    cloud: str,
+    workflow: str,
+    repo: str,
+    retrieved_value_context: list | None,
+    flow_context: dict,
+) -> dict:
+    """Build one immutable contract passed through all generation/repair/commit steps.
+
+    REQ 2: The contract is built once before generation and never mutated.
+    It carries: repo, cloud, workflow, allowed_paths, per-file SHA metadata,
+    preservation_mode, and boolean_target when a live-verified target exists.
+    Self-validation and repair use it to reject what the backend would reject.
+    """
+    import hashlib as _hlib
+
+    target_contract = flow_context.get("resolved_repository_target_contract") or {}
+    allowed_paths: list[str] = []
+    file_metadata: list[dict] = []
+    for item in retrieved_value_context or []:
+        if not isinstance(item, dict):
+            continue
+        for matched in item.get("matched_files") or []:
+            if not isinstance(matched, dict):
+                continue
+            path = str(matched.get("path") or matched.get("filename") or "").strip()
+            content = str(matched.get("content") or "")
+            if not path:
+                continue
+            if path not in allowed_paths:
+                allowed_paths.append(path)
+            sha = _hlib.sha256(content.encode("utf-8")).hexdigest()[:16] if content else ""
+            file_metadata.append({"path": path, "sha16": sha, "nonblank_lines": sum(1 for ln in content.splitlines() if ln.strip())})
+
+    boolean_target: dict = {}
+    if isinstance(target_contract, dict) and target_contract.get("path"):
+        boolean_target = {
+            "path": str(target_contract.get("path") or ""),
+            "flag": str(target_contract.get("flag") or ""),
+            "current_value": str(target_contract.get("current_value") or ""),
+            "new_value": str(target_contract.get("new_value") or ""),
+            "line_number": int(target_contract.get("line_number") or 0),
+            "context_id": str(target_contract.get("context_id") or ""),
+        }
+
+    contract = {
+        "schema": "terrabot.hard_validation_contract.v1",
+        "cloud": str(cloud or ""),
+        "workflow": str(workflow or ""),
+        "repo": str(repo or ""),
+        "allowed_paths": allowed_paths,
+        "file_metadata": file_metadata,
+        "preservation_mode": "strict" if workflow in (INFRA_MODIFICATION_WORKFLOWS or []) else "lenient",
+        "boolean_target": boolean_target,
+        "built_at_thread_sha": str(flow_context.get("context_branch_sha") or ""),
+    }
+    # Store on flow context so every sub-call (repair, self-validation) can read it
+    active = _ACTIVE_TEAMS_FLOW_CONTEXT.get()
+    if isinstance(active, dict):
+        active["hard_validation_contract"] = contract
+    return contract
+
+
 def _teams_run_generation_hard_validations(
     agent_result: dict,
     prompt: str,
     thread_id: str,
     retrieved_value_context: list | None,
+    hard_validation_contract: dict | None = None,
 ) -> dict:
     """Run every deterministic hard guard before accepting a generation/repair.
 
-    The same validator set is used on the first Foundry response and on every
-    repaired candidate. This prevents a repair from fixing one preservation
-    error only to fail semantic/shape/self-validation in a later outer round.
+    REQ 2, 10: The same validator set runs on every candidate in order:
+    semantic relevance → Terraform shape → agent self-validation →
+    preservation/minimal diff → immutable target check.
     No validator mutates Terraform.
     """
     failures: list[str] = []
@@ -1197,12 +1262,55 @@ def _teams_run_generation_hard_validations(
     except ValueError as exc:
         failures.append(str(exc))
 
+    # REQ 10: Use the stored contract if the caller didn't pass one
+    if hard_validation_contract is None:
+        active = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
+        hard_validation_contract = active.get("hard_validation_contract")
+
     parallel_validator = globals().get("_run_parallel_precommit_validations")
     if callable(parallel_validator):
         try:
             parallel_validator(result, prompt, thread_id)
         except ValueError as exc:
             failures.append(str(exc))
+
+    # REQ 2: immutable target check – when a Boolean target is locked, verify
+    # the generated file implements that exact transition and nothing else was
+    # modified in that file outside the single expected assignment.
+    if isinstance(hard_validation_contract, dict) and hard_validation_contract.get("boolean_target"):
+        bt = hard_validation_contract["boolean_target"]
+        bt_path = str(bt.get("path") or "").strip()
+        bt_flag = str(bt.get("flag") or "").strip()
+        bt_new = str(bt.get("new_value") or "").strip().lower()
+        if bt_path and bt_flag and bt_new in {"true", "false"}:
+            target_file = next(
+                (f for f in (result.get("files") or [])
+                 if isinstance(f, dict)
+                 and str(f.get("filename") or f.get("path") or "").strip().strip("/") == bt_path),
+                None,
+            )
+            if target_file is None:
+                failures.append(
+                    f"BACKEND_PRESERVATION_FAILURE: hard_validation_contract requires {bt_path} "
+                    f"but no generated file matches that path."
+                )
+            else:
+                import re as _re
+                content = str(target_file.get("content") or "")
+                assign_pat = _re.compile(
+                    rf'(?m)^\s*"?{_re.escape(bt_flag)}"?\s*[:=]\s*(true|false)'
+                )
+                matches = assign_pat.findall(content)
+                if not matches:
+                    failures.append(
+                        f"BACKEND_PRESERVATION_FAILURE: generated {bt_path} does not assign {bt_flag}."
+                    )
+                elif not all(v.lower() == bt_new for v in matches):
+                    wrong = [v for v in matches if v.lower() != bt_new]
+                    failures.append(
+                        f"BACKEND_PRESERVATION_FAILURE: generated {bt_path} has {bt_flag}="
+                        f"{wrong[0]} but contract requires {bt_new}."
+                    )
 
     if failures:
         unique = list(dict.fromkeys(item for item in failures if item))
@@ -3837,6 +3945,23 @@ def handle_chat_request(data: dict):
                         else configured_validation_passes
                     )
                     internal_repair_attempts = 2 if immutable_boolean else 3
+                    # REQ 2: Build immutable hard_validation_contract once before any
+                    # generation/repair turn. The same contract is passed into self-validation,
+                    # every repair payload, and the final commit validation.
+                    _hard_val_contract = _teams_build_hard_validation_contract(
+                        cloud=target_cloud,
+                        workflow=effective_workflow,
+                        repo=normalize_repo_target(target_cloud, workflow=effective_workflow),
+                        retrieved_value_context=retrieved_value_context,
+                        flow_context=_ACTIVE_TEAMS_FLOW_CONTEXT.get() or {},
+                    )
+                    _teams_diag_log(
+                        "hard_validation_contract_built",
+                        thread=conversation_id,
+                        paths=",".join(sorted(_hard_val_contract.get("allowed_paths") or []))[:200],
+                        boolean_target=bool(_hard_val_contract.get("boolean_target")),
+                        preservation_mode=_hard_val_contract.get("preservation_mode",""),
+                    )
                     _teams_diag_log(
                         "generation_validation_loop_start",
                         thread=conversation_id,
@@ -3852,6 +3977,7 @@ def handle_chat_request(data: dict):
                                 effective_prompt,
                                 conversation_id,
                                 retrieved_value_context,
+                                hard_validation_contract=_hard_val_contract,
                             )
                             validation_error = None
                             break
@@ -4125,6 +4251,7 @@ def handle_chat_request(data: dict):
                                         effective_prompt,
                                         conversation_id,
                                         retrieved_value_context,
+                                        hard_validation_contract=_hard_val_contract,
                                     )
                                     repaired_result = candidate_result
                                     _teams_diag_log(
@@ -4182,6 +4309,39 @@ def handle_chat_request(data: dict):
                             thread=conversation_id,
                             error=str(validation_error)[:300],
                         )
+                        # REQ 11: push diagnostic branch in test-mode when all repairs fail.
+                        # Gated by TERRABOT_TEAMS_DIAGNOSTIC_BRANCH_ON_FAILURE=true.
+                        # Never creates PR, never promotes context. Production default: disabled.
+                        import os as _os
+                        _diag_branch_enabled = (
+                            bool((_ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}).get("test_mode"))
+                            and _os.getenv("TERRABOT_TEAMS_DIAGNOSTIC_BRANCH_ON_FAILURE","false").strip().lower()
+                              in {"1","true","yes"}
+                        )
+                        if _diag_branch_enabled and agent_result.get("files"):
+                            try:
+                                _diag_agent_result = dict(agent_result)
+                                _diag_agent_result["branch_name_suffix"] = "diag-validation-failure"
+                                _diag_agent_result["diagnostic_branch"] = True
+                                _diag_branch_result = _commit_terraform_files_to_branch_for_teams_base(
+                                    _diag_agent_result, effective_prompt, conversation_id
+                                )
+                                _teams_diag_log(
+                                    "diagnostic_branch_pushed_after_repair_exhaustion",
+                                    level="warning",
+                                    thread=conversation_id,
+                                    branch=_diag_branch_result.get("branch",""),
+                                    branch_url=_diag_branch_result.get("branch_url",""),
+                                    validation_ok=False,
+                                    note="diagnostic_only_no_pr_no_context_promotion",
+                                )
+                            except Exception as _diag_err:
+                                _teams_diag_log(
+                                    "diagnostic_branch_push_failed",
+                                    level="warning",
+                                    thread=conversation_id,
+                                    error=str(_diag_err)[:200],
+                                )
                         raise ValueError(
                             "Terrabot could not produce a backend-valid Terraform change "
                             "after internal repair attempts. No repository changes were written."

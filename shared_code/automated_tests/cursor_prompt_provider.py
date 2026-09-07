@@ -279,7 +279,6 @@ def _build_cursor_instruction(cases: Sequence[Any], run_id: str) -> str:
             "7. Vary infrastructure language across cases so Terrabot is exercised like a real infra team: creation/provisioning, enablement, disablement/decommissioning/deletion wording, and targeted modification/update wording. Keep each prompt consistent with the immutable desired transition and repository semantics; do not ask for destructive deletion when the immutable test is only a reversible Boolean toggle unless repository evidence shows that users naturally describe that toggle as decommissioning/removal.",
             "8. Prefer developer-style descriptions of the resource behavior over Terraform identifier wording. Use repository vocabulary and nearby module/resource semantics, not a direct humanization of the flag name.",
             "9. Return JSON only. Do not wrap it in Markdown and do not add commentary.",
-            "10. PLAN-MODE OUTPUT (HARD): do NOT produce a plan document, checklist, or narrative as the run result. Your ENTIRE final message must be exactly the raw JSON object — first character {, last character }.",
             "",
             "Primary Terraform authoring context:",
             f"- context sha256: {context_sha or 'unavailable'}",
@@ -508,82 +507,7 @@ def _wait_for_result(
         )
 
 
-def _iter_balanced_json_objects(text: str, limit: int = 40):
-    """Yield parsed dicts for every balanced {...} span in text (string-aware)."""
-    raw = str(text or "")
-    found = 0
-    index = 0
-    length = len(raw)
-    while index < length and found < limit:
-        start = raw.find("{", index)
-        if start < 0:
-            return
-        depth = 0
-        in_string = False
-        escape = False
-        end = -1
-        for pos in range(start, length):
-            ch = raw[pos]
-            if in_string:
-                if escape:
-                    escape = False
-                elif ch == "\\":
-                    escape = True
-                elif ch == '"':
-                    in_string = False
-                continue
-            if ch == '"':
-                in_string = True
-            elif ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    end = pos
-                    break
-        if end < 0:
-            return
-        span = raw[start : end + 1]
-        try:
-            data = json.loads(span)
-            if isinstance(data, dict):
-                found += 1
-                yield data
-        except json.JSONDecodeError:
-            pass
-        index = start + 1
-
-
-def _deep_strings(value: Any, budget: int = 200):
-    """Yield string leaves inside a nested payload (bounded)."""
-    stack = [value]
-    seen = 0
-    while stack and seen < budget:
-        current = stack.pop()
-        if isinstance(current, str):
-            seen += 1
-            yield current
-        elif isinstance(current, dict):
-            stack.extend(current.values())
-        elif isinstance(current, (list, tuple)):
-            stack.extend(current)
-
-
-def _parse_result_text(
-    result_text: str,
-    terminal: dict[str, Any] | None = None,
-    schema_hint: str = "",
-) -> dict[str, Any]:
-    """Extract the protocol JSON object from a Cursor run.
-
-    Run ctx-20260907-063855 lost 4/5 clarification assists to
-    "Cursor result did not contain a JSON object": in plan mode Cursor often
-    returns a narrative/plan as the run result with the JSON embedded elsewhere
-    (fenced mid-text, or inside another field of the terminal run payload).
-    Recovery order: fenced/direct parse -> outer {...} slice -> every balanced
-    JSON object in the text (preferring ones carrying schema_hint) -> the same
-    scan over every string leaf of the terminal run payload.
-    """
+def _parse_result_text(result_text: str) -> dict[str, Any]:
     text = str(result_text or "").strip()
     if text.startswith("```"):
         lines = text.splitlines()
@@ -594,48 +518,18 @@ def _parse_result_text(
         text = "\n".join(lines).strip()
     try:
         data = json.loads(text)
-        if isinstance(data, dict):
-            return data
     except json.JSONDecodeError:
-        pass
-
-    start = text.find("{")
-    end = text.rfind("}")
-    if start >= 0 and end > start:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start < 0 or end <= start:
+            raise CursorPromptError("Cursor result did not contain a JSON object.")
         try:
             data = json.loads(text[start : end + 1])
-            if isinstance(data, dict):
-                return data
-        except json.JSONDecodeError:
-            pass
-
-    def _scan(blob: str) -> dict[str, Any] | None:
-        fallback: dict[str, Any] | None = None
-        for candidate in _iter_balanced_json_objects(blob):
-            if schema_hint and str(candidate.get("schema_version") or "") == schema_hint:
-                return candidate
-            if fallback is None and (
-                not schema_hint
-                or "schema_version" in candidate
-                or "resolution_type" in candidate
-                or "cases" in candidate
-                or "prompts" in candidate
-            ):
-                fallback = candidate
-        return fallback
-
-    scanned = _scan(text)
-    if scanned is not None:
-        return scanned
-
-    if isinstance(terminal, dict):
-        for leaf in sorted(_deep_strings(terminal), key=len, reverse=True):
-            if "{" not in leaf:
-                continue
-            scanned = _scan(leaf)
-            if scanned is not None:
-                return scanned
-    raise CursorPromptError("Cursor result did not contain a JSON object.")
+        except json.JSONDecodeError as exc:
+            raise CursorPromptError(f"Cursor result JSON was invalid: {exc}") from exc
+    if not isinstance(data, dict):
+        raise CursorPromptError("Cursor result must be a JSON object.")
+    return data
 
 
 def _validated_prompts(
@@ -826,7 +720,7 @@ def _generate_for_group(
                 repo=f"{owner}/{repo}",
                 reported_branches=len(pushed_branches),
             )
-        parsed = _parse_result_text(result_text, terminal=terminal_run, schema_hint=_SCHEMA_VERSION)
+        parsed = _parse_result_text(result_text)
         prompts = _validated_prompts(parsed, cases, commit_sha)
 
         generated: list[Any] = []
@@ -1018,7 +912,6 @@ def _repair_clarification_protocol(
             "Do not change the semantic meaning of the prior result and do not invent a path, flag, value, or evidence.",
             f"The previous response failed validation with: {validation_error}",
             "Return exactly one raw JSON object; first character { and last character }. No markdown or prose.",
-            "PLAN-MODE OUTPUT (HARD): do NOT produce a plan document, checklist, or narrative as the run result. Your ENTIRE final message must be exactly the raw JSON object — first character {, last character }.",
             f"schema_version must be exactly {_CLARIFICATION_SCHEMA_VERSION}.",
             "Required keys: schema_version, answer, resolution_type, candidates_relevant, selected_index, selected_path, selected_flag, selected_current_value, selected_new_value, module_source, sibling_example_path, reason, evidence.",
             "If the prior result did not actually identify a unique repository control, preserve that meaning by returning resolution_type=unresolved, selected_index=null, selected_path=\"\", selected_flag=\"\", selected_current_value=null, selected_new_value=null, answer=\"\", evidence=[].",
@@ -1060,7 +953,7 @@ def _repair_clarification_protocol(
                 headers=headers,
                 timeout=request_timeout,
             )
-            repaired_text, repair_terminal = _wait_for_result(
+            repaired_text, _terminal = _wait_for_result(
                 session,
                 agent_id,
                 cursor_run_id,
@@ -1073,7 +966,7 @@ def _repair_clarification_protocol(
                 run_label=f"{run_id}:{case_id}:clarification-repair",
                 log_event=log_event,
             )
-            parsed = _parse_result_text(repaired_text, terminal=repair_terminal, schema_hint=_CLARIFICATION_SCHEMA_VERSION)
+            parsed = _parse_result_text(repaired_text)
             if str(parsed.get("schema_version") or "").strip() != _CLARIFICATION_SCHEMA_VERSION:
                 raise CursorPromptError(
                     f"Cursor clarification repair schema_version must be {_CLARIFICATION_SCHEMA_VERSION}."
@@ -1288,8 +1181,9 @@ def resolve_repository_clarification(
         "For candidate or repository_control resolutions, selected_current_value and selected_new_value must be JSON booleans, must differ, and must describe the exact live assignment before/after the requested change; module_source and sibling_example_path must be empty strings.",
         "For unresolved, set selected_current_value=null, selected_new_value=null, selected_path=\"\", selected_flag=\"\", module_source=\"\", sibling_example_path=\"\", and evidence=[].",
         "evidence must contain at most 4 short repository-grounded strings identifying the live file/assignment or wiring that proves the choice.",
-        "The answer must be concise and directly usable as the clarification reply. Never invent a path, flag, module source, current value, or target value.",
-        "FINAL RESPONSE CONTRACT: output exactly one raw JSON object. You are running in plan mode: do NOT produce a plan document, checklist, or narrative as your final output — your ENTIRE final message must be exactly the JSON object and nothing else. The first character must be { and the last character must be }. Do not emit markdown, prose, or a sentence saying that JSON is required; actually emit the JSON object.",
+        "ANSWER FORMAT (REQ 5): the 'answer' field must be EITHER a single integer (the 1-based candidate index) when resolution_type=candidate, OR the exact flag name (e.g. 'enable_object_replication') when resolution_type=repository_control. For creation_target, a single imperative sentence. Never return prose like 'Use X in Y' for Boolean resolutions. The backend will verify your answer against the live pinned repository and construct the immutable contract itself. Do not route your clarification text through natural-language intent re-detection.",
+        "The answer must be machine-parseable. Never invent a path, flag, module source, current value, or target value.",
+        "FINAL RESPONSE CONTRACT: output exactly one raw JSON object. The first character must be { and the last character must be }. Do not emit markdown, prose, or a sentence saying that JSON is required; actually emit the JSON object.",
         f"Use this exact schema_version literal: {_CLARIFICATION_SCHEMA_VERSION}.",
     ])
     repos = [{"url": f"https://github.com/{owner}/{repo}", "startingRef": commit_sha}]
@@ -1346,7 +1240,7 @@ def resolve_repository_clarification(
                 + json.dumps(mutations, ensure_ascii=False)[:1000]
             )
         try:
-            parsed = _parse_result_text(result_text, terminal=terminal, schema_hint=_CLARIFICATION_SCHEMA_VERSION)
+            parsed = _parse_result_text(result_text)
             schema_version = str(parsed.get("schema_version") or "").strip()
             if schema_version != _CLARIFICATION_SCHEMA_VERSION:
                 raise CursorPromptError(
@@ -1367,7 +1261,10 @@ def resolve_repository_clarification(
             )
             if not parsed:
                 raise
-        answer = re.sub(r"\s+", " ", str(parsed.get("answer") or "")).strip()
+        raw_answer = str(parsed.get("answer") or "").strip()
+        # REQ 5: Cursor may return a bare integer (index) or exact flag name.
+        # Normalise for both callers: keep the raw value but flag it.
+        answer = re.sub(r"\s+", " ", raw_answer)
         resolution_type = str(parsed.get("resolution_type") or "").strip().lower()
         if resolution_type not in {"candidate", "repository_control", "creation_target", "unresolved"}:
             raise CursorPromptError("Cursor clarification resolution_type is invalid.")
@@ -1580,7 +1477,6 @@ def generate_repository_questions(
         "Do not ask for secrets, credentials, external production state, or facts that cannot be proven from the pinned repository.",
         "For every question provide a concise expected_answer and 1-5 exact evidence_paths that support it. Do not invent paths.",
         "Return raw JSON only.",
-        "PLAN-MODE OUTPUT (HARD): do NOT produce a plan document, checklist, or narrative as the run result. Your ENTIRE final message must be exactly the raw JSON object — first character {, last character }.",
         json.dumps({
             "schema_version": _REPO_QUESTION_SCHEMA_VERSION,
             "repository_commit_sha": commit_sha,
@@ -1625,7 +1521,7 @@ def generate_repository_questions(
         mutations = cursor_readonly_guard.cursor_reported_remote_mutations(terminal, remote_before, remote_after)
         if mutations:
             raise CursorPromptError("Cursor changed a verified remote GitHub branch while generating repository questions.")
-        parsed = _parse_result_text(result_text, terminal=terminal, schema_hint=_REPO_QUESTION_SCHEMA_VERSION)
+        parsed = _parse_result_text(result_text)
         if str(parsed.get("schema_version") or "").strip() != _REPO_QUESTION_SCHEMA_VERSION:
             raise CursorPromptError(f"Cursor repository-question schema_version must be {_REPO_QUESTION_SCHEMA_VERSION}.")
         if str(parsed.get("repository_commit_sha") or "").strip() != commit_sha:
@@ -1715,7 +1611,6 @@ def validate_repository_answer(
         json.dumps(list(evidence_paths), ensure_ascii=False),
         "Inspect the repository yourself. Mark correct=true only if the Terrabot answer is materially correct and repository-grounded. It need not use identical wording to expected_answer.",
         "Return raw JSON only with schema_version, correct, reason, evidence.",
-        "PLAN-MODE OUTPUT (HARD): do NOT produce a plan document, checklist, or narrative as the run result. Your ENTIRE final message must be exactly the raw JSON object — first character {, last character }.",
         json.dumps({"schema_version": _REPO_ANSWER_SCHEMA_VERSION, "correct": True, "reason": "short reason", "evidence": ["path: proof"]}, ensure_ascii=False),
     ])
     repos = [{"url": f"https://github.com/{owner}/{repo}", "startingRef": commit_sha}]
@@ -1745,7 +1640,7 @@ def validate_repository_answer(
             mutations = cursor_readonly_guard.cursor_reported_remote_mutations(terminal, remote_before, remote_after)
             if mutations:
                 raise CursorPromptError("Cursor changed a verified remote GitHub branch during repository answer validation.")
-            parsed = _parse_result_text(result_text, terminal=terminal, schema_hint=_REPO_ANSWER_SCHEMA_VERSION)
+            parsed = _parse_result_text(result_text)
             if str(parsed.get("schema_version") or "").strip() != _REPO_ANSWER_SCHEMA_VERSION:
                 raise CursorPromptError(f"Cursor repository-answer schema_version must be {_REPO_ANSWER_SCHEMA_VERSION}.")
             correct = parsed.get("correct")

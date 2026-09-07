@@ -95,21 +95,96 @@ def _repository_context_evidence_fetcher(
     )
 
 
+def _context_record_priority(record: dict, current_sha: str) -> int:
+    """Return a priority rank for a context record (lower = higher priority).
+
+    REQ 8 ranking:
+      1 = exact ID live-revalidated (required_repository_context_ids supplied and SHA matches)
+      2 = current-SHA active record (status=active and evidence_commit_sha == current_sha)
+      3 = freshly revalidated equivalent (status=active, stale=False, different SHA)
+      4 = stale record (stale=True, status=active)
+      5 = conflicted record (status=conflicted)
+      6 = invalidated / unknown
+    """
+    status = str((record or {}).get("status") or "active").strip().lower()
+    stale = bool((record or {}).get("stale"))
+    evidence_sha = str((record or {}).get("evidence_commit_sha") or "").strip()
+    if status == "conflicted":
+        return 5
+    if status not in {"active"}:
+        return 6
+    if stale:
+        return 4
+    if current_sha and evidence_sha == current_sha:
+        return 2
+    return 3
+
+
 def search_repository_context(
     repo_owner: str,
     repo_name: str,
     query: str,
     current_commit_sha: str = "",
     top_k: int = 8,
+    required_context_ids: list | None = None,
 ) -> dict:
-    """Backend/tool API: retrieve shared durable knowledge for one repository."""
-    return shared_repository_context.search_repository_context(
+    """Backend/tool API: retrieve shared durable knowledge for one repository.
+
+    REQ 8: Results are priority-ranked and each accept/reject decision is logged.
+    Priority: exact-ID live-revalidated > current-SHA active > freshly revalidated
+    > stale > conflicted. Conflicted/stale records may suggest paths but never
+    directly establish a target.
+    """
+    raw = shared_repository_context.search_repository_context(
         repo_owner=repo_owner,
         repo_name=repo_name,
         query=query,
         current_commit_sha=current_commit_sha,
         top_k=top_k,
     )
+    results = list(raw.get("results") or [])
+    required_ids = set(str(v) for v in (required_context_ids or []) if str(v).strip())
+
+    # Annotate and rank
+    ranked: list[tuple[int, int, dict]] = []
+    for idx, record in enumerate(results):
+        if not isinstance(record, dict):
+            continue
+        rid = str(record.get("id") or "").strip()
+        priority = 1 if (rid and rid in required_ids) else _context_record_priority(record, current_commit_sha)
+        ranked.append((priority, idx, record))
+    ranked.sort(key=lambda item: (item[0], item[1]))
+
+    accepted: list[dict] = []
+    for priority, _, record in ranked:
+        rid = str(record.get("id") or "").strip()
+        status = str(record.get("status") or "active").lower()
+        stale = bool(record.get("stale"))
+        category = str(record.get("category") or "").strip()
+        reason_accept = (
+            "required_id_exact_match" if priority == 1
+            else "current_sha_active" if priority == 2
+            else "freshly_revalidated_active" if priority == 3
+            else "stale_advisory_only" if priority == 4
+            else "conflicted_advisory_only"
+        )
+        if priority >= 4:
+            # Stale/conflicted may suggest paths but must not establish targets
+            record = dict(record)
+            record["_advisory_only"] = True
+            record["_accept_reason"] = reason_accept
+        try:
+            LOGGER.debug(
+                "[TerrabotCtx] event=context_record_ranked repo=%s/%s id=%s priority=%s "
+                "status=%s stale=%s category=%s reason=%s",
+                repo_owner, repo_name, rid, priority, status, stale, category, reason_accept,
+            )
+        except Exception:
+            pass
+        accepted.append(record)
+
+    raw["results"] = accepted
+    return raw
 
 
 def add_repository_context(

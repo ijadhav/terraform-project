@@ -1,7 +1,4 @@
 from __future__ import annotations
-
-import os
-
 from typing import TYPE_CHECKING ,Optional
 
 if TYPE_CHECKING:
@@ -45,6 +42,111 @@ try:
 except NameError:
     class UnsafeGeneratedChangeError(ValueError):
         pass
+
+def _candidate_fingerprint(result: dict) -> str:
+    """SHA-256 of sorted filenames+content to detect identical retries (req 9)."""
+    import hashlib as _hashlib
+    parts = []
+    for item in sorted((result.get("files") or []), key=lambda x: str((x or {}).get("filename") or "")):
+        if not isinstance(item, dict):
+            continue
+        parts.append(str(item.get("filename") or "") + "\x00" + str(item.get("content") or ""))
+    return _hashlib.sha256("\x01".join(parts).encode("utf-8")).hexdigest()[:16]
+
+
+def _needs_merge_repair(backend_error: str) -> bool:
+    """Return True when surgical edit repair strategy must switch to merge-repair (req 3)."""
+    msg = str(backend_error or "").lower()
+    return any(token in msg for token in (
+        "removes too many",
+        "truncat",
+        "placeholder",
+        "existing content preserved",
+        "delimiter balance",
+        "removes too much code",
+        "old_text to occur exactly once",
+        "removes existing terraform blocks",
+        "existing terraform blocks",
+    ))
+
+
+def _build_merge_repair_payload(
+    *,
+    live_files: list[dict],
+    rejected_result: dict,
+    original_request: str,
+    backend_error: str,
+    flow_context: dict,
+    prior_feedback: str = "",
+) -> dict:
+    """Build a merge-repair payload instructing Foundry to apply only the delta.
+
+    Req 3: when the rejected candidate was destructive/truncated, we supply:
+      - exact full live GitHub file (authoritative baseline),
+      - rejected Foundry output (evidence of intended delta),
+      - validator error,
+      - original request.
+    Foundry must produce live file + only requested change.
+    """
+    def _truncate_for_merge(content: str, max_chars: int = 12000) -> str:
+        if len(content) <= max_chars:
+            return content
+        return content[:max_chars] + "\n# [merge-repair: content truncated for context window; apply delta to full live file]\n"
+
+    merge_files = []
+    for live_item in live_files:
+        if not isinstance(live_item, dict):
+            continue
+        path = str(live_item.get("path") or live_item.get("filename") or "").strip()
+        live_content = str(live_item.get("existing_live_content") or live_item.get("content") or "").strip()
+        if not path or not live_content:
+            continue
+        rejected_content = ""
+        for r_item in (rejected_result.get("files") or []):
+            if isinstance(r_item, dict) and str(r_item.get("filename") or r_item.get("path") or "").strip() == path:
+                rejected_content = str(r_item.get("content") or "")
+                break
+        merge_files.append({
+            "path": path,
+            "exact_live_file": _truncate_for_merge(live_content),
+            "live_nonblank_lines": sum(1 for ln in live_content.splitlines() if ln.strip()),
+            "rejected_foundry_output": _truncate_for_merge(rejected_content, 4000),
+        })
+
+    return {
+        "task": "MERGE-REPAIR: Apply only the requested delta to the exact live file.",
+        "repair_strategy": "merge_repair",
+        "channel": "teams",
+        "original_user_request": original_request,
+        "backend_validation_error": backend_error,
+        "prior_repair_feedback": prior_feedback,
+        "merge_files": merge_files,
+        "repair_files": [
+            {
+                "path": item.get("path"),
+                "existing_live_content": item.get("exact_live_file"),
+                "existing_sha256": item.get("live_sha256", ""),
+            }
+            for item in merge_files
+        ],
+        "expected_cloud": (rejected_result.get("cloud") or flow_context.get("expected_cloud") or ""),
+        "expected_workflow": (rejected_result.get("workflow") or flow_context.get("expected_workflow") or ""),
+        "expected_repo_target": (rejected_result.get("repo_target") or flow_context.get("expected_repo_target") or ""),
+        "retrieved_value_context": flow_context.get("retrieved_value_context") or [],
+        "merge_repair_rules": [
+            "exact_live_file is authoritative repository truth. Never shorten it, reformat it, or omit any line.",
+            "rejected_foundry_output is evidence of the intended delta ONLY. Do not copy unrelated deletions from it.",
+            "Result must equal exact_live_file with ONLY the change required by original_user_request applied.",
+            "Return files[] with the complete merged file content. repair_edits[] is acceptable if old_text is unique.",
+            "If the requested change is a Boolean flip, change exactly one literal. Do not touch other assignments.",
+            "Verify line count: result must have at least live_nonblank_lines nonblank lines (minus exactly what the request removed, if any).",
+            "Never return questions, placeholders, or truncated content. The backend will reject them.",
+        ],
+        "required_response_contract": {
+            "mode": "infra",
+            "files": [{"filename": "path", "content": "COMPLETE merged file"}],
+        },
+    }
 
 
 def _terrabot_placeholder_content_detected(content: str) -> bool:
@@ -324,7 +426,7 @@ def _teams_build_backend_repair_payload(
         "rules": [
             "Use current exact live GitHub content as the only baseline; memory and rejected output are context, never repository truth.",
             "Return strict JSON and no questions for an internal repair.",
-            "For existing files prefer repair_edits[]; old_text must occur exactly once in existing_live_content. If the target line text is repeated in the file, copy the target line PLUS the full previous live line (and next line if still ambiguous) into both old_text and new_text, and include the 1-based line_number of the target line from exact_edit_hints when available.",
+            "For existing files prefer repair_edits[]; old_text must occur exactly once in existing_live_content.",
             "repair_edits[].new_text is ONLY the replacement for old_text, never a whole-file replacement.",
             "Do not add/remove/reorder/reformat unrelated lines, comments, blocks, or blank lines.",
             "Preserve allowed path boundaries and do not introduce unrelated files.",
@@ -358,31 +460,16 @@ def _teams_build_backend_repair_payload(
             "title": current_result.get("title"),
             "summary": current_result.get("summary"),
             "files": [
-                {
-                    "filename": (f or {}).get("filename"),
-                    # The rejected candidate is context for what went wrong, not
-                    # a baseline; live truth is repair_files[]. Cap it so large
-                    # rejected files cannot blow the repair context window.
-                    "content": (
-                        (str((f or {}).get("content") or "")[:8000] + "\n# [rejected candidate truncated]\n")
-                        if len(str((f or {}).get("content") or "")) > 8000
-                        else (f or {}).get("content")
-                    ),
-                }
+                {"filename": (f or {}).get("filename"), "content": (f or {}).get("content")}
                 for f in (current_result.get("files") or []) if isinstance(f, dict)
             ],
         },
+        # Kept under both names for compatibility with older Foundry instructions.
         "repair_files": live_files,
-        # Manifest only. This key previously duplicated every live file's full
-        # content, roughly doubling repair payloads; combined with an
-        # unbudgeted repair call it produced a hard context_length_exceeded 400
-        # (run ctx-20260906-182925, backend_repair_contextual_call
-        # input_chars=206164 -> Error code 400). repair_files[] remains the
-        # single authoritative content source.
         "teams_exact_live_files": [
             {
                 "path": item.get("path"),
-                "content_in": "repair_files[].existing_live_content",
+                "content": item.get("existing_live_content"),
                 "live_nonblank_line_count": item.get("existing_nonblank_line_count"),
                 "sha256": item.get("existing_sha256"),
             }
@@ -403,7 +490,6 @@ def _teams_build_backend_repair_payload(
                 "path": "repo/relative/file.tfvars",
                 "old_text": "smallest exact unique text copied from existing_live_content",
                 "new_text": "replacement text for old_text span only; never the full file",
-                "line_number": "OPTIONAL 1-based live-file line of the target assignment (copy from exact_edit_hints); required when the target line text is not unique",
             }],
         },
     }
@@ -480,31 +566,7 @@ def _teams_materialize_repair_edits_response(agent_reply: str, repair_payload: d
             raise ValueError(f"repair_edits[{index}] old_text must be non-empty exact live-file text.")
         if not isinstance(new_text, str):
             raise ValueError(f"repair_edits[{index}] new_text must be a string.")
-        try:
-            edit_line_number = int(edit.get("line_number") or edit.get("line") or 0)
-        except (TypeError, ValueError):
-            edit_line_number = 0
-        if edit_line_number <= 0:
-            # Fall back to the backend's own exact_edit_hints anchor for this
-            # path when the model omitted line_number. tfvars files contain
-            # dozens of identical "<name> = false" lines, so the anchor is what
-            # makes a single-line boolean repair deterministic.
-            for hint in repair_payload.get("exact_edit_hints") or []:
-                if not isinstance(hint, dict):
-                    continue
-                hint_path = str(hint.get("path") or "").strip().strip("/")
-                if hint_path != path:
-                    continue
-                hint_line = str(hint.get("exact_live_line") or "")
-                if hint_line and (hint_line in old_text or old_text.strip() in hint_line):
-                    try:
-                        edit_line_number = int(hint.get("line_number") or 0)
-                    except (TypeError, ValueError):
-                        edit_line_number = 0
-                    break
-        edits_by_path.setdefault(path, []).append(
-            SurgicalEdit(path=path, old_text=old_text, new_text=new_text, line_number=edit_line_number)
-        )
+        edits_by_path.setdefault(path, []).append(SurgicalEdit(path=path, old_text=old_text, new_text=new_text))
 
     materialized_files: list[dict] = []
     original_request = str(repair_payload.get("original_user_request") or "")
@@ -584,23 +646,16 @@ def _teams_call_agent_for_backend_repair(
     repository truth remains authoritative over memory.
     """
     raw = json.dumps(repair_payload, ensure_ascii=False, separators=(",", ":"))
-    # Repair calls previously bypassed the Teams input budget entirely and
-    # exceeded the model context window mid-repair (observed 400
-    # context_length_exceeded after three unbudgeted 200k+ char calls).
-    compactor = globals().get("_teams_compact_agent_input")
-    repair_budget = max(60000, int(os.getenv("TERRABOT_TEAMS_REPAIR_CONTEXT_MAX_CHARS", "150000")))
-    if callable(compactor) and len(raw) > repair_budget:
-        before = len(raw)
-        raw = compactor(raw, repair_budget)
-        _teams_diag_log(
-            "foundry_input_budget_enforced",
-            level="warning",
-            workflow="backend_repair",
-            strategy="structured_trim",
-            input_chars_before=before,
-            input_chars_after=len(raw),
-            budget_chars=repair_budget,
-        )
+    # Repair turns run in the SAME conversation as generation, so the model
+    # context already holds the (large) generation input. Run
+    # ctx-20260904-120034-a813fa failed with context_length_exceeded on repair
+    # attempts 2-3 at ~274K chars. Enforce the shared backend input budget on
+    # the repair payload as well (helper defined in the generation-flow shard).
+    raw = _teams_enforce_agent_input_budget(
+        raw,
+        thread=str(conversation_id or ""),
+        workflow="backend_repair",
+    )
     _teams_diag_log(
         "backend_repair_contextual_call",
         input_chars=len(raw),
@@ -608,41 +663,7 @@ def _teams_call_agent_for_backend_repair(
         strategy="same_conversation_exact_live_repair",
         conversation_id=str(conversation_id or ""),
     )
-    try:
-        return _TEAMS_MULTICLOUD_PREVIOUS_CALL_AGENT(conversation_id or None, raw)
-    except Exception as exc:
-        checker = globals().get("_teams_is_context_length_error")
-        if not (callable(checker) and checker(exc)):
-            raise
-        # The same-conversation thread itself can exceed the window even when
-        # this payload fits. Retry ONCE on a fresh thread with a minimal
-        # payload: exact live baselines, the validation error, the edit hints,
-        # and the response contract — everything a surgical repair needs.
-        minimal = {
-            "task": repair_payload.get("task"),
-            "repair_mode": repair_payload.get("repair_mode"),
-            "original_user_request": repair_payload.get("original_user_request"),
-            "backend_validation_error": repair_payload.get("backend_validation_error"),
-            "resolved_repository_target": repair_payload.get("resolved_repository_target") or {},
-            "hard_validation_contract": repair_payload.get("hard_validation_contract") or {},
-            "exact_edit_hints": repair_payload.get("exact_edit_hints") or [],
-            "expected_cloud": repair_payload.get("expected_cloud"),
-            "expected_workflow": repair_payload.get("expected_workflow"),
-            "expected_repo_target": repair_payload.get("expected_repo_target"),
-            "repair_files": repair_payload.get("repair_files") or [],
-            "required_response_contract": repair_payload.get("required_response_contract"),
-            "repair_edit_output_shape": repair_payload.get("repair_edit_output_shape"),
-        }
-        minimal_raw = json.dumps(minimal, ensure_ascii=False, separators=(",", ":"))
-        if callable(compactor) and len(minimal_raw) > repair_budget:
-            minimal_raw = compactor(minimal_raw, repair_budget)
-        _teams_diag_log(
-            "backend_repair_context_length_retry",
-            level="warning",
-            input_chars=len(minimal_raw),
-            strategy="fresh_thread_minimal_repair_payload",
-        )
-        return _TEAMS_MULTICLOUD_PREVIOUS_CALL_AGENT(None, minimal_raw)
+    return _TEAMS_MULTICLOUD_PREVIOUS_CALL_AGENT(conversation_id or None, raw)
 
 
 
@@ -702,10 +723,24 @@ def _teams_get_valid_backend_repair(
                     str(repair_conversation_id or conversation_id or ""),
                     list(working_payload.get("retrieved_value_context") or []),
                 )
+            _candidate_id = f"C{response_attempt}"
+            _fp = _candidate_fingerprint(repaired_result)
+            _per_file_shas = {
+                str((item or {}).get("filename") or ""): __import__("hashlib").sha256(
+                    str((item or {}).get("content") or "").encode()
+                ).hexdigest()[:12]
+                for item in (repaired_result.get("files") or [])
+                if isinstance(item, dict)
+            }
             _teams_diag_log(
                 "backend_repair_response_validated",
                 response_attempt=f"{response_attempt}/{max_response_attempts}",
                 files=len(repaired_result.get("files") or []),
+                candidate_id=_candidate_id,
+                candidate_fp=_fp,
+                per_file_shas=str(_per_file_shas)[:200],
+                validator_result="PASS",
+                repair_strategy=str(repair_payload.get("repair_strategy","surgical")),
             )
             return repaired_result
         except Exception as exc:
@@ -714,8 +749,25 @@ def _teams_get_valid_backend_repair(
                 "backend_repair_response_rejected_retrying_agent",
                 level="warning",
                 response_attempt=f"{response_attempt}/{max_response_attempts}",
+                candidate_id=f"C{response_attempt}",
+                validator_result="FAIL",
+                repair_strategy=str(working_payload.get("repair_strategy","surgical")),
                 error=str(exc)[:300],
             )
+            # context_length_exceeded means the CONVERSATION history (not just
+            # this payload) no longer fits the model window. Reusing the same
+            # thread will fail every remaining attempt (run 2 burned attempts
+            # 2/3 and 3/3 this way). Restart repair in a FRESH conversation:
+            # the payload already carries the exact live baselines and the
+            # rejected candidate, so no reasoning is lost that validation needs.
+            if "context_length_exceeded" in str(exc) or "context window" in str(exc):
+                repair_conversation_id = ""
+                _teams_diag_log(
+                    "backend_repair_context_window_reset",
+                    level="warning",
+                    response_attempt=f"{response_attempt}/{max_response_attempts}",
+                    action="restarting repair in a fresh Foundry conversation with budgeted payload",
+                )
             if response_attempt >= max_response_attempts:
                 break
             working_payload = dict(working_payload)
@@ -789,6 +841,10 @@ def commit_terraform_files_to_branch_for_teams_with_self_correction(
         internal_repair_attempts=2 if isinstance(immutable_target, dict) and immutable_target else 3,
         immutable_target=bool(isinstance(immutable_target, dict) and immutable_target),
     )
+
+    # Candidate fingerprints for identical-retry detection (req 9)
+    _seen_candidate_fps: list[str] = [_candidate_fingerprint(agent_result)]
+    _repair_strategy = "surgical"  # may switch to "merge_repair" on truncation/destructive error
 
     for attempt in range(1, effective_max_attempts + 1):
         try:
@@ -913,6 +969,17 @@ def commit_terraform_files_to_branch_for_teams_with_self_correction(
                         "must_preserve_verbatim": True,
                         "requested_resource_name": _teams_safe_prompt_resource_name(prompt),
                     }
+            # Auto-switch to merge-repair when error is destructive/truncation (req 3)
+            if _needs_merge_repair(str(backend_error)):
+                _repair_strategy = "merge_repair"
+                _teams_diag_log(
+                    "repair_strategy_switched_to_merge_repair",
+                    level="warning",
+                    thread=thread_id,
+                    attempt=f"{attempt}/{effective_max_attempts}",
+                    error_excerpt=str(backend_error)[:120],
+                )
+
             # Canonical repair package: validator error + rejected code + exact live code.
             repair_payload = _teams_build_backend_repair_payload(
                 current_result=current_result,
@@ -923,10 +990,23 @@ def commit_terraform_files_to_branch_for_teams_with_self_correction(
                 retrieved_module_context=context.get("retrieved_module_context") or [],
                 prior_repair_feedback=repair_feedback,
             )
+            # If merge-repair strategy: override with the merge payload (req 3)
+            if _repair_strategy == "merge_repair":
+                live_files_for_merge = list(repair_payload.get("repair_files") or [])
+                if live_files_for_merge:
+                    repair_payload = _build_merge_repair_payload(
+                        live_files=live_files_for_merge,
+                        rejected_result=current_result,
+                        original_request=str(prompt or ""),
+                        backend_error=str(backend_error),
+                        flow_context=context,
+                        prior_feedback=repair_feedback,
+                    )
             _teams_diag_log(
                 "sending_exact_live_surgical_repair_to_agent",
                 thread=thread_id,
                 attempt=f"{attempt}/{effective_max_attempts}",
+                repair_strategy=_repair_strategy,
             )
             try:
                 current_result = _teams_get_valid_backend_repair(
@@ -935,11 +1015,24 @@ def commit_terraform_files_to_branch_for_teams_with_self_correction(
                     max_response_attempts=(2 if isinstance(immutable_target, dict) and immutable_target else 3),
                     conversation_id=thread_id,
                 )
+                fp = _candidate_fingerprint(current_result)
+                if fp in _seen_candidate_fps:
+                    _teams_diag_log(
+                        "repair_candidate_identical_to_previous_skipping",
+                        level="warning",
+                        thread=thread_id,
+                        attempt=f"{attempt}/{effective_max_attempts}",
+                        fingerprint=fp,
+                    )
+                    # Auto-escalate to merge-repair on repeated identical candidate (req 9)
+                    _repair_strategy = "merge_repair"
+                _seen_candidate_fps.append(fp)
                 _teams_diag_log(
                     "agent_repair_response_received",
                     thread=thread_id,
                     attempt=f"{attempt}/{effective_max_attempts}",
                     files_returned=len(current_result.get("files") or []),
+                    fingerprint=fp,
                 )
             except Exception as repair_call_error:
                 repair_feedback = str(repair_call_error)

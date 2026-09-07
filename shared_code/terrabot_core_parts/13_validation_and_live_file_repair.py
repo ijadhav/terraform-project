@@ -1914,6 +1914,273 @@ def _teams_lock_resolved_repository_boolean_target(
     return context
 
 
+def _check_module_not_yet_consumed(
+    prompt: str,
+    evidence: list[dict],
+    cloud: str,
+) -> dict:
+    """REQ 14: detect 'module exists in catalog but not yet consumed in target env'.
+
+    When the module is present in the live module catalog AND it is NOT
+    already instantiated in the target environment file, route to module
+    consumption workflow immediately without emitting a clarification.
+
+    Returns a dict with:
+      - "route": "module_consumption" | "new_module" | "none"
+      - "module_rel_path": the verified catalog path (aws) or module_source_url (azure)
+      - "environment_file_path": where the consumer block must be added
+      - "sibling_example_path": an existing consumer from another environment
+      - "reason": short explanation
+
+    Returns {"route": "none"} when the request cannot be resolved this way
+    (caller falls back to normal Foundry generation / clarification).
+
+    This function inspects only live GitHub evidence already in `evidence`
+    plus the AWS module catalog. It never hardcodes resource names or paths.
+    """
+    cloud_norm = str(cloud or "").strip().lower()
+    if cloud_norm not in {"aws", "azure"}:
+        return {"route": "none"}
+
+    # ── AWS path ──────────────────────────────────────────────────────────────
+    if cloud_norm == "aws":
+        aws_module_exists_fn = globals().get("github_verified_aws_module_exists")
+        aws_module_context_fn = globals().get("build_verified_aws_module_context")
+        if not callable(aws_module_exists_fn) or not callable(aws_module_context_fn):
+            return {"route": "none"}
+
+        # Extract candidate module names from evidence paths already gathered.
+        # Pattern: terraform/modules/<name>/… or a module "source" attribute.
+        candidate_paths: list[str] = []
+        prompt_tokens = {
+            t for t in re.findall(r"[a-z0-9]+", prompt.lower())
+            if len(t) >= 3 and t not in {
+                "the","a","an","in","for","to","please","can","you","we","need",
+                "want","make","another","more","one","new","fresh","add","create",
+                "provision","instance","terraform","module","aws","azure",
+            }
+        }
+        for item in evidence:
+            if not isinstance(item, dict):
+                continue
+            path = str(item.get("path") or item.get("filename") or "")
+            m = re.search(r"terraform/modules/([^/]+)/", path)
+            if m and m.group(1) not in candidate_paths:
+                candidate_paths.append(m.group(1))
+            content = str(item.get("content") or "")
+            for src_match in re.finditer(r'source\s*=\s*"[^"]*modules/([^/"]+)', content):
+                name = src_match.group(1)
+                if name not in candidate_paths:
+                    candidate_paths.append(name)
+
+        # Score candidates by prompt-token overlap, verify existence, pick best.
+        best_path: str = ""
+        best_score = 0
+        for cpath in candidate_paths:
+            tok = {t for t in re.findall(r"[a-z0-9]+", cpath.replace("_"," ").replace("-"," ")) if len(t) >= 3}
+            score = len(tok & prompt_tokens)
+            if score > best_score:
+                best_score = score
+                best_path = cpath
+
+        if not best_path or best_score == 0:
+            return {"route": "none"}
+        if not aws_module_exists_fn(best_path):
+            return {"route": "none"}
+
+        # Check whether the module is already consumed in the target env evidence.
+        for item in evidence:
+            if not isinstance(item, dict):
+                continue
+            if not str(item.get("path") or "").endswith("main.tf"):
+                continue
+            content = str(item.get("content") or "")
+            if re.search(rf'modules/{re.escape(best_path)}(?:\b|")', content):
+                # Already consumed — not a fresh consumption request.
+                return {"route": "none"}
+
+        # Find the target environment main.tf from evidence.
+        env_file_path = ""
+        for item in evidence:
+            if not isinstance(item, dict):
+                continue
+            ipath = str(item.get("path") or "")
+            if re.search(r"^terraform/(?:dev_aws|prod_aws|dev_services_aws)/[^/]+/main\.tf$", ipath):
+                env_file_path = ipath
+                break
+
+        if not env_file_path:
+            return {"route": "none"}
+
+        try:
+            mctx = aws_module_context_fn(best_path, include_examples=True)
+        except Exception:
+            return {"route": "none"}
+
+        sibling = ""
+        for ex in mctx.get("consumer_examples") or []:
+            ex_path = str(ex.get("consumer_file") or ex.get("path") or "")
+            if ex_path and ex_path != env_file_path:
+                sibling = ex_path
+                break
+
+        return {
+            "route": "module_consumption",
+            "module_rel_path": best_path,
+            "environment_file_path": env_file_path,
+            "sibling_example_path": sibling,
+            "module_source": mctx.get("module_source",""),
+            "reason": (
+                f"Module '{best_path}' exists in tf-devops catalog and is not yet "
+                f"consumed in {env_file_path}."
+            ),
+        }
+
+    # ── Azure path ───────────────────────────────────────────────────────────
+    # Azure creation routing: when evidence contains a root-module .tf family
+    # with a recognisable module block but the target env hub.tfvars has no
+    # corresponding assignment, the correct action is to add the assignment,
+    # not emit a clarification.
+    if cloud_norm == "azure":
+        target_hub: str = ""
+        hub_content: str = ""
+        for item in evidence:
+            if not isinstance(item, dict):
+                continue
+            ipath = str(item.get("path") or "")
+            if re.search(r"hub\.tfvars$", ipath):
+                target_hub = ipath
+                hub_content = str(item.get("content") or "")
+                break
+
+        if not target_hub or not hub_content:
+            return {"route": "none"}
+
+        # Look for root-level module families referenced in .tf files in evidence.
+        for item in evidence:
+            if not isinstance(item, dict):
+                continue
+            ipath = str(item.get("path") or "")
+            if not ipath.endswith(".tf") or "/" in ipath:
+                continue
+            content = str(item.get("content") or "")
+            for mod_match in re.finditer(r'(?m)^\s*module\s+"([^"]+)"\s*\{', content):
+                mod_label = mod_match.group(1)
+                mod_tokens = {
+                    t for t in re.findall(r"[a-z0-9]+", mod_label.replace("_"," "))
+                    if len(t) >= 3
+                }
+                if not (mod_tokens & {
+                    t for t in re.findall(r"[a-z0-9]+", prompt.lower()) if len(t) >= 3
+                }):
+                    continue
+                # Check the hub doesn't already reference it.
+                if re.search(re.escape(mod_label), hub_content, re.IGNORECASE):
+                    return {"route": "none"}
+                return {
+                    "route": "module_consumption",
+                    "module_rel_path": mod_label,
+                    "environment_file_path": target_hub,
+                    "sibling_example_path": "",
+                    "module_source": ipath,
+                    "reason": (
+                        f"Root module family '{mod_label}' exists in {ipath} and is not "
+                        f"yet referenced in {target_hub}."
+                    ),
+                }
+
+    return {"route": "none"}
+
+
+def _boolean_inventory_unambiguous_match(
+    prompt: str,
+    inventory: list[dict],
+    intent: str,
+) -> dict | None:
+    """Return the single unambiguous Boolean candidate without calling Foundry or Cursor.
+
+    REQ 4: Python/backend only verifies literal existence and current value.
+    Semantics live in token matching against flag names, scope headers, and
+    exact_line. No hardcoded resource→flag mappings.
+
+    Returns None when the inventory is empty, when no entry matches the
+    request tokens, or when TWO OR MORE entries are plausible (ambiguous) —
+    in those cases the full Foundry semantic strategy runs as before.
+    """
+    if not inventory or not prompt:
+        return None
+
+    # Derive the expected current/new polarity from intent.
+    # enable → flag must currently be false (flip to true)
+    # disable → flag must currently be true (flip to false)
+    if intent == "enable":
+        expected_current, new_value = "false", "true"
+    elif intent == "disable":
+        expected_current, new_value = "true", "false"
+    else:
+        return None
+
+    # Build request token set from the prompt (stripped of intent verb and env).
+    _stop = {
+        "enable","disable","turn","on","off","the","a","an","in","for","to","set",
+        "change","please","can","you","i","we","need","want","make","ensure","sure",
+        "update","modify","toggle","service","infrastructure","terraform","feature",
+        "repo","repository","environment","aws","azure","cloud","please",
+    }
+    prompt_tokens = {
+        t for t in re.findall(r"[a-z0-9]+", prompt.lower())
+        if len(t) >= 3 and t not in _stop
+    }
+
+    polarity_filtered = [
+        item for item in inventory
+        if isinstance(item, dict)
+        and str(item.get("current_value") or "").lower() == expected_current
+    ]
+    if not polarity_filtered:
+        return None
+
+    def _item_tokens(item: dict) -> set[str]:
+        """Tokens from flag name, scope header, and exact_line comment."""
+        text = " ".join([
+            str(item.get("flag") or "").replace("_", " ").replace("-", " "),
+            str(item.get("scope") or "").replace("_", " ").replace("-", " "),
+            str(item.get("exact_line") or ""),
+        ]).lower()
+        return {t for t in re.findall(r"[a-z0-9]+", text) if len(t) >= 3 and t not in _stop}
+
+    scored: list[tuple[int, dict]] = []
+    for item in polarity_filtered:
+        overlap = len(prompt_tokens & _item_tokens(item))
+        if overlap > 0:
+            scored.append((overlap, item))
+
+    if not scored:
+        return None
+
+    # Sort descending by overlap; if the top score is strictly better than
+    # the second, the match is unambiguous → auto-resolve.
+    scored.sort(key=lambda pair: -pair[0])
+    top_score = scored[0][0]
+    runners_up = [s for s, _ in scored[1:] if s == top_score]
+
+    if runners_up:
+        # Two or more entries tie at the highest overlap → ambiguous.
+        # Fall through to Foundry for semantic ranking.
+        return None
+
+    winner = dict(scored[0][1])
+    winner["new_value"] = new_value
+    winner["confidence"] = 0.97
+    winner["classification_reason"] = (
+        f"backend_literal_inventory_single_match: "
+        f"'{winner.get('flag')}' was the only polarity-filtered Boolean assignment "
+        f"with token overlap ({top_score}) against the request."
+    )
+    winner["resolution_source"] = "backend_boolean_inventory_auto_resolved"
+    return winner
+
+
 def build_backend_existing_infra_modification_context(
     prompt: str,
     thread_id: str,
@@ -1985,7 +2252,47 @@ def build_backend_existing_infra_modification_context(
     except Exception as exc:
         LOGGER.debug("Full Teams repository evidence rehydration skipped: %s", exc)
 
-    if normalized_cloud == "azure":
+    # ── REQ 4: Pre-Cursor Boolean auto-resolution shortcut ─────────────────────
+    # Build the literal inventory first. When exactly ONE Boolean assignment
+    # in the environment evidence uniquely matches the request tokens by name/
+    # scope (no Foundry model call required), auto-select it and lock the
+    # target contract immediately. This makes the common case (one unambiguous
+    # flag) deterministic and removes the Foundry/Cursor round-trip entirely.
+    # Foundry semantic ranking is only invoked when the inventory contains
+    # multiple plausible candidates or zero matches.
+    # Python/backend verifies literal existence and current value only;
+    # no hardcoded resource→flag mappings anywhere.
+    _intent = _teams_feature_flag_intent(prompt)
+    _pre_resolved_candidate: dict | None = None
+    if _intent in {"enable", "disable"}:
+        _inventory_for_shortcut = _repository_literal_boolean_inventory(evidence)
+        if _inventory_for_shortcut:
+            _pre_resolved_candidate = _boolean_inventory_unambiguous_match(
+                prompt, _inventory_for_shortcut, _intent
+            )
+            if _pre_resolved_candidate:
+                _teams_diag_log(
+                    "boolean_inventory_single_flag_auto_resolved",
+                    path=_pre_resolved_candidate.get("path",""),
+                    flag=_pre_resolved_candidate.get("flag",""),
+                    current_value=_pre_resolved_candidate.get("current_value",""),
+                    new_value=_pre_resolved_candidate.get("new_value",""),
+                    reason="single_unambiguous_match_skips_foundry_and_cursor",
+                )
+    # ────────────────────────────────────────────────────────────────────────
+
+    if _pre_resolved_candidate:
+        # Bypass both Foundry semantic call and Cursor clarification entirely.
+        strategy = {
+            "operation": "disable" if _intent == "disable" else "enable",
+            "boolean_applicable": True,
+            "reason": "pre_cursor_literal_inventory_single_match",
+            "resolution_source": "backend_boolean_inventory_auto_resolved",
+            "validated_candidate_count": 1,
+            "adjudicated_candidate_count": 1,
+        }
+        candidates = [_pre_resolved_candidate]
+    elif normalized_cloud == "azure":
         strategy, candidates, strategy_evidence = _teams_resolve_repository_boolean_strategy(
             prompt,
             evidence,
@@ -2006,6 +2313,45 @@ def build_backend_existing_infra_modification_context(
     # A non-Boolean result remains a normal Foundry generation request. The
     # backend supplies live files but does not select or edit a resource.
     if not candidates:
+        # REQ 14: before returning a generic Foundry context, check if this is
+        # "module exists in catalog and not yet consumed in target env". If so,
+        # route directly to module consumption without emitting a clarification
+        # or creating a new module. Only create a new reusable module when the
+        # live module catalog proves none exists for the request.
+        _module_route = _check_module_not_yet_consumed(prompt, evidence, cloud)
+        if _module_route.get("route") == "module_consumption":
+            _teams_diag_log(
+                "creation_routed_to_module_consumption",
+                cloud=cloud,
+                module_path=_module_route.get("module_rel_path",""),
+                env_file=_module_route.get("environment_file_path",""),
+                reason=_module_route.get("reason",""),
+            )
+            context = dict(context or {})
+            context["matched_files"] = evidence
+            context["matched_file_paths"] = [_teams_context_file_identity(item) for item in evidence]
+            context["selection_state"] = "selected"
+            context["selected_path"] = _module_route.get("environment_file_path","")
+            context["agent_resolves_target"] = True
+            context["module_consumption_routing"] = _module_route
+            context["instructions"] = [
+                "REQ 14: This request is for a module that EXISTS in the live catalog "
+                "but is NOT YET consumed in the target environment. Route to module "
+                "consumption, not to clarification or new-module creation.",
+                f"Target environment consumer file: {_module_route.get('environment_file_path','')}",
+                f"Module to instantiate: {_module_route.get('module_rel_path','')} "
+                f"(source: {_module_route.get('module_source','')})",
+                (
+                    f"Sibling consumer example (model your block on this): {_module_route.get('sibling_example_path','N/A')}"
+                    if _module_route.get("sibling_example_path")
+                    else "No sibling consumer found; use the module's required inputs to construct the block."
+                ),
+                "Add ONLY the new module consumer block. Copy every unrelated existing line exactly. "
+                "The backend validates preservation and will block unrelated changes.",
+                "Do not create a new reusable module. Do not emit a clarification. Generate immediately.",
+            ]
+            return context
+
         context.pop("feature_flag_selection", None)
         context["matched_files"] = evidence
         context["matched_file_paths"] = [_teams_context_file_identity(item) for item in evidence]
