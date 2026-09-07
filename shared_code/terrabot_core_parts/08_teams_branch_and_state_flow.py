@@ -1103,11 +1103,38 @@ def _teams_coerce_agent_payload_stage1(agent_text: str, context: dict) -> tuple[
     payload.setdefault("branch_name", _teams_suggested_branch_name(payload, context.get("effective_prompt") or "", context.get("thread_id") or "teams"))
 
     normalized_files: list[dict] = []
+    dropped_non_dict = 0
+    coerced_json_strings = 0
     for item in payload.get("files") or []:
+        if isinstance(item, str):
+            # Foundry (especially after an internal repair turn) occasionally
+            # returns a files[] entry as a JSON-encoded string instead of an
+            # object. Dropping it silently destroyed an already-accepted repair
+            # in run ctx-20260906-182925 (dropped_non_dict_entries=1 ->
+            # files_after=0 -> semantic_relevance "no Terraform files").
+            # Coerce it back into an object before deciding to drop anything.
+            try:
+                decoded = json.loads(item)
+            except Exception:
+                decoded = None
+            if isinstance(decoded, dict):
+                item = decoded
+                coerced_json_strings += 1
         if not isinstance(item, dict):
+            dropped_non_dict += 1
             continue
+        # Some replies nest the real file under a single-key wrapper such as
+        # {"file": {...}} or return {"path": ..., "text": ...} variants.
+        if "filename" not in item and "path" not in item:
+            inner = item.get("file") if isinstance(item.get("file"), dict) else None
+            if inner and (inner.get("filename") or inner.get("path")):
+                item = inner
         filename = str(item.get("filename") or item.get("path") or "").strip()
         content = item.get("content")
+        if not isinstance(content, str):
+            alt = item.get("text") or item.get("file_content") or item.get("new_content")
+            if isinstance(alt, str):
+                content = alt
         operation = str(item.get("operation") or "").strip().lower()
         if not filename or not isinstance(content, str) or not content.strip():
             # Teams remote branch writes require complete materialized files.
@@ -1117,6 +1144,14 @@ def _teams_coerce_agent_payload_stage1(agent_text: str, context: dict) -> tuple[
                 continue
             continue
         normalized_files.append({"filename": filename, "content": content})
+    if dropped_non_dict or coerced_json_strings:
+        _teams_diag_log(
+            "agent_result_files_normalized",
+            level="warning" if dropped_non_dict else "info",
+            coerced_json_strings=coerced_json_strings,
+            dropped_non_dict_entries=dropped_non_dict,
+            files_after=len(normalized_files),
+        )
     payload["files"] = normalized_files
 
     # A user-confirmed AWS module selection has one deterministic write target:
@@ -1311,6 +1346,32 @@ def repair_and_parse_agent_output(
             parse_error,
         )
 
+    def _teams_resolved_boolean_control_hint(flow_context: dict) -> dict:
+        """Return the already-verified path/flag target, when one exists.
+
+        Run ctx-20260906-182925 showed Foundry re-asking the same free-form
+        question through all three parse repairs even though the environment
+        file's matching Boolean existed. Surfacing the backend-resolved control
+        in the repair payload converts those repairs into a deterministic
+        one-literal generation instead of a repeated question.
+        """
+        for context_item in (flow_context or {}).get("retrieved_value_context") or []:
+            if not isinstance(context_item, dict):
+                continue
+            for matched in context_item.get("matched_files") or []:
+                if not isinstance(matched, dict):
+                    continue
+                feature_match = matched.get("feature_flag_match") or {}
+                if isinstance(feature_match, dict) and feature_match.get("flag"):
+                    return {
+                        "path": str(matched.get("path") or matched.get("filename") or "").strip(),
+                        "flag": str(feature_match.get("flag") or "").strip(),
+                        "line_number": feature_match.get("line_number") or feature_match.get("line") or 0,
+                        "current_value": str(feature_match.get("current_value") or "").strip().lower(),
+                        "new_value": str(feature_match.get("new_value") or "").strip().lower(),
+                    }
+        return {}
+
     repair_payload = {
         "task": "Repair the current Teams Terraform generation and return executable files now.",
         "channel": "teams",
@@ -1343,9 +1404,12 @@ def repair_and_parse_agent_output(
             "questions": [],
             "validation_commands": [],
         },
+        "resolved_repository_target": _teams_resolved_boolean_control_hint(context),
         "absolute_rules": [
             "Return one valid JSON object only.",
             "Do not return files=[] for missing non-sensitive preference values.",
+            "When resolved_repository_target is non-empty, the target path/flag/current->new value is FINAL backend-verified truth: return files[] implementing exactly that one-literal change on the complete live file. Questions are forbidden in that situation.",
+            "If (and only if) resolved_repository_target is empty and live evidence leaves more than one materially valid target, return mode=clarification with 2-6 structured candidates (path, flag or module_source, current_value, new_value, reason). Never return a bare question without candidates.",
             "Use the confirmed module/environment/target already present in backend context; do not restart discovery.",
             "Use explicit prompt values, then live GitHub examples/defaults, then __FILL__<input_name>__ placeholders with matching user_fillable entries.",
             "For modification requests, use the latest full file content from the live branch and alter only the requested code.",

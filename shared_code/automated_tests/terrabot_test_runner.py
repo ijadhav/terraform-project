@@ -1453,6 +1453,16 @@ def _resolve_automated_clarifications(
                 if case.case_type == "boolean_context"
                 else None
             ),
+            expected_creation_hint=(
+                {
+                    "target_consumer_path": case.path,
+                    "environment": case.environment,
+                    "alias": case.alias,
+                    "module_hint": case.evidence_line,
+                }
+                if case.case_type == "resource_creation"
+                else None
+            ),
             prompt_author_target_binding=prompt_author_binding,
             run_id=run_id,
             case_id=case.case_id,
@@ -1502,7 +1512,7 @@ def _resolve_automated_clarifications(
                 )
                 break
 
-        if not structured_picker:
+        if not structured_picker and resolution_type != "creation_target":
             if phase == 1:
                 row.phase1_freeform_clarification = True
             else:
@@ -1510,7 +1520,7 @@ def _resolve_automated_clarifications(
 
         cursor_assist_used = bool(
             cursor_resolution
-            and resolution_type in {"candidate", "repository_control"}
+            and resolution_type in {"candidate", "repository_control", "creation_target"}
             and selection
         )
         if cursor_assist_used:
@@ -1551,7 +1561,16 @@ def _resolve_automated_clarifications(
             cursor_selected_flag=cursor_resolution.get("selected_flag") if cursor_resolution else "",
             process="cursor_repo_analysis->backend_continuation",
         )
-        continuation_prompt = selection if structured_picker else original_user_prompt
+        if structured_picker:
+            continuation_prompt = selection
+        elif cursor_assist_used and resolution_type in {"repository_control", "creation_target"}:
+            # Previously the continuation re-sent the original ambiguous prompt,
+            # so a correct Cursor resolution never reached Foundry and the agent
+            # simply asked the same question again. Carry the resolved
+            # repository instruction with the user's intent instead.
+            continuation_prompt = f"{original_user_prompt}\n\nResolved repository target: {selection}"
+        else:
+            continuation_prompt = original_user_prompt
         followup = {
             "prompt": continuation_prompt,
             "original_prompt": original_user_prompt,

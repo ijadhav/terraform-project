@@ -2879,6 +2879,49 @@ def _prompt_guard_validate_terraform_shape(agent_result: dict) -> None:
             raise ValueError(f"Generated Terraform file {path} contains Git conflict markers.")
 
 
+def _deterministic_resolved_flag_verdict(agent_result: dict, resolved_feature_flag: dict) -> str:
+    """Return 'pass'/'fail'/'unknown' for a backend-resolved Boolean flip.
+
+    Run ctx-20260906-182925 lost two of three internal repair attempts to
+    agent_self_validation FALSE POSITIVES on a byte-correct one-line boolean
+    flip ("generated output did not match the current request" and a confused
+    verdict about the evidence payload). For a target that repository
+    resolution has ALREADY literally verified (path + flag + current -> new
+    value), the check is mechanical: the generated file for that path must
+    assign the flag to new_value and must not still assign it current_value.
+    When that holds, skip the nondeterministic model call entirely; when it
+    provably fails, reject without a model call; anything else falls through
+    to the model as before.
+    """
+    flag = str((resolved_feature_flag or {}).get("flag") or "").strip()
+    path = str((resolved_feature_flag or {}).get("path") or "").strip().strip("/")
+    new_value = str((resolved_feature_flag or {}).get("new_value") or "").strip().lower()
+    current_value = str((resolved_feature_flag or {}).get("current_value") or "").strip().lower()
+    if not flag or not path or new_value not in {"true", "false"} or current_value not in {"true", "false"}:
+        return "unknown"
+    target_content = ""
+    for item in agent_result.get("files") or []:
+        if not isinstance(item, dict):
+            continue
+        item_path = str(item.get("filename") or item.get("path") or "").strip().strip("/")
+        if item_path == path:
+            target_content = str(item.get("content") or "")
+            break
+    if not target_content:
+        return "unknown"
+    assignment = re.compile(
+        rf'(?m)^\s*"?{re.escape(flag)}"?\s*[:=]\s*(true|false)\b'
+    )
+    values = [match.group(1).lower() for match in assignment.finditer(target_content)]
+    if not values:
+        return "unknown"
+    if all(value == new_value for value in values):
+        return "pass"
+    if any(value == current_value for value in values) and new_value not in values:
+        return "fail"
+    return "unknown"
+
+
 def _prompt_guard_agent_self_validate_stage1(agent_result: dict, prompt: str) -> None:
     """Ask Foundry for an independent semantic + Terraform sanity verdict.
 
@@ -2947,6 +2990,23 @@ def _prompt_guard_agent_self_validate_stage1(agent_result: dict, prompt: str) ->
                 "new_value": str(selected.get("new_value") or "").strip().lower(),
                 "description": str(selected.get("description") or selected.get("context") or "").strip(),
             }
+
+    deterministic_verdict = _deterministic_resolved_flag_verdict(agent_result, resolved_feature_flag)
+    if deterministic_verdict == "pass":
+        LOGGER.info(
+            "[TerrabotFlow] step=generated_output_validation actor=backend_deterministic result=pass "
+            "target=%s flag=%s (resolved Boolean target implemented exactly; model self-validation skipped)",
+            resolved_feature_flag.get("path") or "",
+            resolved_feature_flag.get("flag") or "",
+        )
+        return
+    if deterministic_verdict == "fail":
+        raise ValueError(
+            "AGENT_SELF_VALIDATION_FAILED: generated "
+            f"{resolved_feature_flag.get('path')} still assigns {resolved_feature_flag.get('flag')} "
+            f"= {resolved_feature_flag.get('current_value')} instead of the resolved target value "
+            f"{resolved_feature_flag.get('new_value')}."
+        )
 
     validation_request = {
         "task": "VALIDATE GENERATED TERRAFORM AGAINST CURRENT USER REQUEST. Return JSON verdict only.",

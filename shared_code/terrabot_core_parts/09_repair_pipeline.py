@@ -1,4 +1,7 @@
 from __future__ import annotations
+
+import os
+
 from typing import TYPE_CHECKING ,Optional
 
 if TYPE_CHECKING:
@@ -321,7 +324,7 @@ def _teams_build_backend_repair_payload(
         "rules": [
             "Use current exact live GitHub content as the only baseline; memory and rejected output are context, never repository truth.",
             "Return strict JSON and no questions for an internal repair.",
-            "For existing files prefer repair_edits[]; old_text must occur exactly once in existing_live_content.",
+            "For existing files prefer repair_edits[]; old_text must occur exactly once in existing_live_content. If the target line text is repeated in the file, copy the target line PLUS the full previous live line (and next line if still ambiguous) into both old_text and new_text, and include the 1-based line_number of the target line from exact_edit_hints when available.",
             "repair_edits[].new_text is ONLY the replacement for old_text, never a whole-file replacement.",
             "Do not add/remove/reorder/reformat unrelated lines, comments, blocks, or blank lines.",
             "Preserve allowed path boundaries and do not introduce unrelated files.",
@@ -355,16 +358,31 @@ def _teams_build_backend_repair_payload(
             "title": current_result.get("title"),
             "summary": current_result.get("summary"),
             "files": [
-                {"filename": (f or {}).get("filename"), "content": (f or {}).get("content")}
+                {
+                    "filename": (f or {}).get("filename"),
+                    # The rejected candidate is context for what went wrong, not
+                    # a baseline; live truth is repair_files[]. Cap it so large
+                    # rejected files cannot blow the repair context window.
+                    "content": (
+                        (str((f or {}).get("content") or "")[:8000] + "\n# [rejected candidate truncated]\n")
+                        if len(str((f or {}).get("content") or "")) > 8000
+                        else (f or {}).get("content")
+                    ),
+                }
                 for f in (current_result.get("files") or []) if isinstance(f, dict)
             ],
         },
-        # Kept under both names for compatibility with older Foundry instructions.
         "repair_files": live_files,
+        # Manifest only. This key previously duplicated every live file's full
+        # content, roughly doubling repair payloads; combined with an
+        # unbudgeted repair call it produced a hard context_length_exceeded 400
+        # (run ctx-20260906-182925, backend_repair_contextual_call
+        # input_chars=206164 -> Error code 400). repair_files[] remains the
+        # single authoritative content source.
         "teams_exact_live_files": [
             {
                 "path": item.get("path"),
-                "content": item.get("existing_live_content"),
+                "content_in": "repair_files[].existing_live_content",
                 "live_nonblank_line_count": item.get("existing_nonblank_line_count"),
                 "sha256": item.get("existing_sha256"),
             }
@@ -385,6 +403,7 @@ def _teams_build_backend_repair_payload(
                 "path": "repo/relative/file.tfvars",
                 "old_text": "smallest exact unique text copied from existing_live_content",
                 "new_text": "replacement text for old_text span only; never the full file",
+                "line_number": "OPTIONAL 1-based live-file line of the target assignment (copy from exact_edit_hints); required when the target line text is not unique",
             }],
         },
     }
@@ -461,7 +480,31 @@ def _teams_materialize_repair_edits_response(agent_reply: str, repair_payload: d
             raise ValueError(f"repair_edits[{index}] old_text must be non-empty exact live-file text.")
         if not isinstance(new_text, str):
             raise ValueError(f"repair_edits[{index}] new_text must be a string.")
-        edits_by_path.setdefault(path, []).append(SurgicalEdit(path=path, old_text=old_text, new_text=new_text))
+        try:
+            edit_line_number = int(edit.get("line_number") or edit.get("line") or 0)
+        except (TypeError, ValueError):
+            edit_line_number = 0
+        if edit_line_number <= 0:
+            # Fall back to the backend's own exact_edit_hints anchor for this
+            # path when the model omitted line_number. tfvars files contain
+            # dozens of identical "<name> = false" lines, so the anchor is what
+            # makes a single-line boolean repair deterministic.
+            for hint in repair_payload.get("exact_edit_hints") or []:
+                if not isinstance(hint, dict):
+                    continue
+                hint_path = str(hint.get("path") or "").strip().strip("/")
+                if hint_path != path:
+                    continue
+                hint_line = str(hint.get("exact_live_line") or "")
+                if hint_line and (hint_line in old_text or old_text.strip() in hint_line):
+                    try:
+                        edit_line_number = int(hint.get("line_number") or 0)
+                    except (TypeError, ValueError):
+                        edit_line_number = 0
+                    break
+        edits_by_path.setdefault(path, []).append(
+            SurgicalEdit(path=path, old_text=old_text, new_text=new_text, line_number=edit_line_number)
+        )
 
     materialized_files: list[dict] = []
     original_request = str(repair_payload.get("original_user_request") or "")
@@ -541,16 +584,23 @@ def _teams_call_agent_for_backend_repair(
     repository truth remains authoritative over memory.
     """
     raw = json.dumps(repair_payload, ensure_ascii=False, separators=(",", ":"))
-    # Repair turns run in the SAME conversation as generation, so the model
-    # context already holds the (large) generation input. Run
-    # ctx-20260904-120034-a813fa failed with context_length_exceeded on repair
-    # attempts 2-3 at ~274K chars. Enforce the shared backend input budget on
-    # the repair payload as well (helper defined in the generation-flow shard).
-    raw = _teams_enforce_agent_input_budget(
-        raw,
-        thread=str(conversation_id or ""),
-        workflow="backend_repair",
-    )
+    # Repair calls previously bypassed the Teams input budget entirely and
+    # exceeded the model context window mid-repair (observed 400
+    # context_length_exceeded after three unbudgeted 200k+ char calls).
+    compactor = globals().get("_teams_compact_agent_input")
+    repair_budget = max(60000, int(os.getenv("TERRABOT_TEAMS_REPAIR_CONTEXT_MAX_CHARS", "150000")))
+    if callable(compactor) and len(raw) > repair_budget:
+        before = len(raw)
+        raw = compactor(raw, repair_budget)
+        _teams_diag_log(
+            "foundry_input_budget_enforced",
+            level="warning",
+            workflow="backend_repair",
+            strategy="structured_trim",
+            input_chars_before=before,
+            input_chars_after=len(raw),
+            budget_chars=repair_budget,
+        )
     _teams_diag_log(
         "backend_repair_contextual_call",
         input_chars=len(raw),
@@ -558,7 +608,41 @@ def _teams_call_agent_for_backend_repair(
         strategy="same_conversation_exact_live_repair",
         conversation_id=str(conversation_id or ""),
     )
-    return _TEAMS_MULTICLOUD_PREVIOUS_CALL_AGENT(conversation_id or None, raw)
+    try:
+        return _TEAMS_MULTICLOUD_PREVIOUS_CALL_AGENT(conversation_id or None, raw)
+    except Exception as exc:
+        checker = globals().get("_teams_is_context_length_error")
+        if not (callable(checker) and checker(exc)):
+            raise
+        # The same-conversation thread itself can exceed the window even when
+        # this payload fits. Retry ONCE on a fresh thread with a minimal
+        # payload: exact live baselines, the validation error, the edit hints,
+        # and the response contract — everything a surgical repair needs.
+        minimal = {
+            "task": repair_payload.get("task"),
+            "repair_mode": repair_payload.get("repair_mode"),
+            "original_user_request": repair_payload.get("original_user_request"),
+            "backend_validation_error": repair_payload.get("backend_validation_error"),
+            "resolved_repository_target": repair_payload.get("resolved_repository_target") or {},
+            "hard_validation_contract": repair_payload.get("hard_validation_contract") or {},
+            "exact_edit_hints": repair_payload.get("exact_edit_hints") or [],
+            "expected_cloud": repair_payload.get("expected_cloud"),
+            "expected_workflow": repair_payload.get("expected_workflow"),
+            "expected_repo_target": repair_payload.get("expected_repo_target"),
+            "repair_files": repair_payload.get("repair_files") or [],
+            "required_response_contract": repair_payload.get("required_response_contract"),
+            "repair_edit_output_shape": repair_payload.get("repair_edit_output_shape"),
+        }
+        minimal_raw = json.dumps(minimal, ensure_ascii=False, separators=(",", ":"))
+        if callable(compactor) and len(minimal_raw) > repair_budget:
+            minimal_raw = compactor(minimal_raw, repair_budget)
+        _teams_diag_log(
+            "backend_repair_context_length_retry",
+            level="warning",
+            input_chars=len(minimal_raw),
+            strategy="fresh_thread_minimal_repair_payload",
+        )
+        return _TEAMS_MULTICLOUD_PREVIOUS_CALL_AGENT(None, minimal_raw)
 
 
 
@@ -632,20 +716,6 @@ def _teams_get_valid_backend_repair(
                 response_attempt=f"{response_attempt}/{max_response_attempts}",
                 error=str(exc)[:300],
             )
-            # context_length_exceeded means the CONVERSATION history (not just
-            # this payload) no longer fits the model window. Reusing the same
-            # thread will fail every remaining attempt (run 2 burned attempts
-            # 2/3 and 3/3 this way). Restart repair in a FRESH conversation:
-            # the payload already carries the exact live baselines and the
-            # rejected candidate, so no reasoning is lost that validation needs.
-            if "context_length_exceeded" in str(exc) or "context window" in str(exc):
-                repair_conversation_id = ""
-                _teams_diag_log(
-                    "backend_repair_context_window_reset",
-                    level="warning",
-                    response_attempt=f"{response_attempt}/{max_response_attempts}",
-                    action="restarting repair in a fresh Foundry conversation with budgeted payload",
-                )
             if response_attempt >= max_response_attempts:
                 break
             working_payload = dict(working_payload)

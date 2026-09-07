@@ -2247,9 +2247,48 @@ def _teams_compact_agent_input(agent_input: str, max_chars: int = 90000) -> str:
         compact = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     if len(compact) <= max_chars:
         return compact
-    # Never cut JSON text mid-object. If authoritative evidence alone exceeds
-    # the preferred budget, send the valid payload intact and let call_agent
-    # perform its context-length retry with a smaller budget.
+    # Final guaranteed stage. The previous behavior ("send the valid payload
+    # intact and let call_agent retry") shipped 250k-300k character inputs to a
+    # small-context model: run ctx-20260906-182925 logged
+    # input_chars_after=292328 against budget_chars=240000 and a hard
+    # context_length_exceeded 400 during backend repair. Instead of ever
+    # returning an over-budget payload, deterministically shrink the largest
+    # string leaves (middle-out, structure-preserving) until the serialized
+    # JSON fits. Authoritative paths keep proportionally more content because
+    # they are the largest leaves last to be revisited only if still needed.
+    def _string_leaves(node, trail):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                yield from _string_leaves(value, trail + [(node, key)])
+        elif isinstance(node, list):
+            for idx, value in enumerate(node):
+                yield from _string_leaves(value, trail + [(node, idx)])
+        elif isinstance(node, str) and len(node) > 2000:
+            parent, key = trail[-1]
+            yield parent, key, node
+
+    for _round in range(12):
+        overflow = len(compact) - max_chars
+        if overflow <= 0:
+            break
+        leaves = sorted(_string_leaves(payload, [(None, None)]), key=lambda item: -len(item[2]))
+        if not leaves:
+            break
+        shrunk_any = False
+        for parent, key, text in leaves:
+            if overflow <= 0:
+                break
+            keep = max(1500, len(text) - overflow - 200)
+            if keep >= len(text):
+                continue
+            head = text[: int(keep * 0.7)]
+            tail = text[-int(keep * 0.3):] if int(keep * 0.3) > 0 else ""
+            parent[key] = head + "\n# [Terrabot budget-trimmed middle omitted]\n" + tail
+            shrunk_any = True
+            compact = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            overflow = len(compact) - max_chars
+        if not shrunk_any:
+            break
     return compact
 
 
@@ -2550,85 +2589,6 @@ def _teams_required_repository_context_block(search_result: dict, required_ids: 
         "MANDATORY REQUIRED REPOSITORY CONTEXT RECORDS (transported by exact ID; live code remains authoritative):\n"
         + "\n".join(rows)
     )
-
-
-_TEAMS_CONTEXT_FLAG_TOKEN_RE = re.compile(r"\b[a-z][a-z0-9_]{2,}\b")
-
-
-def _teams_resolve_required_context_target(
-    search_result: dict,
-    required_ids: list[str],
-    live_files: list[dict],
-) -> dict | None:
-    """Deterministically resolve one Boolean target from required context records.
-
-    Run ctx-20260904-120034-a813fa (azure-01-53144a): the required Phase-1
-    record mapped the request to enable_object_replication in
-    vars/npr/npr-int/hub.tfvars, the record was retrieved, and both phases
-    STILL ended in clarification. Historical context is only a hint, so the
-    backend now closes the loop itself: when exactly one flag token named by a
-    required record is proven as a live Boolean assignment in that record's own
-    evidence file, the target is resolved as backend evidence — Foundry gets it
-    as an authoritative selection instead of a question opportunity.
-
-    Returns {"context_id","path","flag","current_value"} or None when zero or
-    more than one live-proven (path, flag) pair exists. Never guesses: only
-    tokens literally present in the record subject/statement AND literally
-    assigned true/false in the current live file qualify.
-    """
-    wanted = {str(value).strip() for value in (required_ids or []) if str(value).strip()}
-    if not wanted or not live_files:
-        return None
-    live_by_path = {
-        str(item.get("path") or "").strip().strip("/"): str(item.get("content") or "")
-        for item in live_files
-        if isinstance(item, dict)
-    }
-    matches: list[dict] = []
-    for record in search_result.get("results") or []:
-        if not isinstance(record, dict):
-            continue
-        context_id = str(record.get("id") or "").strip()
-        if context_id not in wanted:
-            continue
-        text = f"{record.get('subject') or ''}\n{record.get('statement') or ''}".lower()
-        tokens = {
-            token for token in _TEAMS_CONTEXT_FLAG_TOKEN_RE.findall(text)
-            if "_" in token  # flag-shaped identifiers only, not prose words
-        }
-        if not tokens:
-            continue
-        for raw_path in record.get("evidence_paths") or []:
-            path = str(raw_path or "").strip().strip("/")
-            content = live_by_path.get(path)
-            if not content:
-                continue
-            for token in sorted(tokens):
-                pattern = re.compile(
-                    r"(?m)^[ \t]*" + re.escape(token) + r"[ \t]*=[ \t]*(true|false)[ \t]*$"
-                )
-                found = pattern.search(content)
-                if not found:
-                    continue
-                candidate = {
-                    "context_id": context_id,
-                    "path": path,
-                    "flag": token,
-                    "current_value": found.group(1),
-                }
-                if not any(
-                    item["path"] == candidate["path"] and item["flag"] == candidate["flag"]
-                    for item in matches
-                ):
-                    matches.append(candidate)
-    if len(matches) == 1:
-        return matches[0]
-    if len(matches) > 1:
-        LOGGER.info(
-            "[TerrabotDiag] event=repository_context_required_target_ambiguous candidates=%s",
-            ",".join(f"{item['path']}::{item['flag']}" for item in matches)[:800],
-        )
-    return None
 
 
 def _teams_attach_repository_context(agent_input: str, active: dict) -> str:

@@ -10,6 +10,111 @@ class SurgicalEdit:
     path: str
     old_text: str
     new_text: str
+    # Optional 1-based live-file line anchor (from exact_edit_hints). When the
+    # selected old_text is not unique in the live file — tfvars files routinely
+    # contain dozens of identical "<name> = false" lines — the anchor selects
+    # the intended occurrence deterministically instead of failing the repair.
+    line_number: int = 0
+
+
+def anchor_edit_to_unique_span(
+    live_content: str,
+    old_text: str,
+    new_text: str,
+    line_number: int = 0,
+) -> tuple[str, str]:
+    """Expand an ambiguous (old_text, new_text) pair into a unique span.
+
+    Strategy: locate the intended occurrence (by 1-based line anchor when
+    given, otherwise unresolvable), then prepend/append whole neighbor lines
+    from the live file to BOTH old_text and new_text until the expanded
+    old_text occurs exactly once. Run ctx-20260906-182925 failed a correct
+    boolean repair with "expected old_text to occur exactly once ... found 23";
+    this makes that class of repair deterministic instead of model-dependent.
+    """
+    if not live_content or not old_text:
+        return old_text, new_text
+    if live_content.count(old_text) == 1:
+        return old_text, new_text
+    if line_number <= 0:
+        return old_text, new_text
+
+    normalized = live_content.replace("\r\n", "\n")
+    lines = normalized.split("\n")
+    if line_number > len(lines):
+        return old_text, new_text
+
+    # The anchored occurrence must plausibly contain the target line. Compare
+    # with collapsed whitespace so formatting drift (aligned '=' columns) does
+    # not disqualify a correct anchor.
+    anchor_line = lines[line_number - 1]
+    def _collapse(text: str) -> str:
+        return " ".join(str(text or "").split())
+    first_old_line = _collapse((old_text.splitlines() or [""])[0])
+    anchor_collapsed = _collapse(anchor_line)
+    if (
+        first_old_line
+        and first_old_line not in anchor_collapsed
+        and anchor_collapsed not in _collapse(old_text)
+    ):
+        return old_text, new_text
+
+    old_line_count = max(1, len(old_text.split("\n")))
+    start = line_number - 1
+    end = start + old_line_count  # exclusive
+    span = "\n".join(lines[start:end])
+    if span != old_text:
+        # Anchor points at the line but the reply's old_text does not equal the
+        # live span (whitespace/formatting drift). Rebuild both sides from live
+        # truth when this is a single-line Boolean flip: keep the live line
+        # exactly and swap only the Boolean literal implied by new_text.
+        if old_line_count == 1 and "\n" not in new_text:
+            import re as _re
+            new_literal_match = _re.search(r"\b(true|false)\b", new_text)
+            span_literal_match = _re.search(r"\b(true|false)\b", span)
+            old_stripped = old_text.strip()
+            if old_stripped and old_stripped in span:
+                new_line = span.replace(old_stripped, new_text.strip(), 1)
+                old_text, new_text = span, new_line
+            elif new_literal_match and span_literal_match:
+                flag_token_match = _re.match(r'\s*"?([A-Za-z0-9_.-]+)"?\s*[:=]', old_text)
+                flag_token = flag_token_match.group(1) if flag_token_match else ""
+                if flag_token and flag_token not in span:
+                    return old_text, new_text
+                new_line = (
+                    span[: span_literal_match.start()]
+                    + new_literal_match.group(1)
+                    + span[span_literal_match.end():]
+                )
+                old_text, new_text = span, new_line
+            else:
+                return old_text, new_text
+        else:
+            return old_text, new_text
+
+    expanded_old, expanded_new = old_text, new_text
+    lo, hi = start, end
+    for _ in range(0, 60):
+        if normalized.count(expanded_old) == 1:
+            return expanded_old, expanded_new
+        grew = False
+        if lo > 0:
+            lo -= 1
+            expanded_old = lines[lo] + "\n" + expanded_old
+            expanded_new = lines[lo] + "\n" + expanded_new
+            grew = True
+        if normalized.count(expanded_old) == 1:
+            return expanded_old, expanded_new
+        if hi < len(lines):
+            expanded_old = expanded_old + "\n" + lines[hi]
+            expanded_new = expanded_new + "\n" + lines[hi]
+            hi += 1
+            grew = True
+        if not grew:
+            break
+    if normalized.count(expanded_old) == 1:
+        return expanded_old, expanded_new
+    return old_text, new_text
 
 
 def _strip_quoted_text(value: str) -> str:
@@ -123,17 +228,23 @@ def apply_surgical_edits(
     """Apply exact Foundry-selected edits while preserving all other bytes."""
     candidate = live_content
     for index, edit in enumerate(edits, start=1):
+        old_text, new_text = anchor_edit_to_unique_span(
+            candidate,
+            edit.old_text,
+            edit.new_text,
+            line_number=int(getattr(edit, "line_number", 0) or 0),
+        )
         validate_surgical_edit(
             path=path,
             live_content=candidate,
-            old_text=edit.old_text,
-            new_text=edit.new_text,
+            old_text=old_text,
+            new_text=new_text,
             original_user_request=original_user_request,
         )
-        before, sep, after = candidate.partition(edit.old_text)
+        before, sep, after = candidate.partition(old_text)
         if not sep:
             raise ValueError(f"Surgical edit {index} for {path} no longer matches the current materialized candidate.")
-        candidate = before + edit.new_text + after
+        candidate = before + new_text + after
 
         # The complete materialized candidate must retain the live file's
         # delimiter signature after every edit. Comparing only old_text and
