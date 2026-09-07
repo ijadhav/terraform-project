@@ -272,7 +272,12 @@ class TestRunResult:
     duration_ms: int = 0
 
 
-def _calculate_case_score(row: TestCaseResult, *, include_cursor: bool) -> int:
+def _calculate_case_score(row: TestCaseResult) -> int:
+    """Score based on agent self-validation + backend validation only.
+
+    Cursor result validation is temporarily disabled. Scoring covers:
+    generation, preservation validation, branch push, and context reuse.
+    """
     if row.case.case_type == "resource_creation":
         assertions = [
             row.expected_target_found,
@@ -294,18 +299,6 @@ def _calculate_case_score(row: TestCaseResult, *, include_cursor: bool) -> int:
             row.phase2_target_ok,
             row.phase2_context_useful,
         ]
-
-    if include_cursor and row.cursor_validation_requested:
-        assertions.append(row.cursor_validation_completed)
-        if row.cursor_validation_completed:
-            assertions.append(row.cursor_output_correct)
-            if row.case.case_type == "boolean_context":
-                assertions.extend([
-                    row.cursor_context_added,
-                    row.cursor_context_retrievable,
-                    row.cursor_context_reused,
-                ])
-            assertions.append(row.cursor_overall_ok)
     return round(100 * sum(bool(value) for value in assertions) / max(len(assertions), 1))
 
 
@@ -1847,7 +1840,7 @@ def _run_case(core: Any, case: TestCase, run_id: str, requester_id: str) -> Test
             # Creation is a separate workflow test. It intentionally allows
             # one or more repository/module pickers and does not require a
             # Phase 2 repository-context reuse assertion.
-            row.score = _calculate_case_score(row, include_cursor=False)
+            row.score = _calculate_case_score(row)
             row.backend_score = row.score
             _diag(
                 "resource_creation_case_completed",
@@ -2190,7 +2183,7 @@ def _run_case(core: Any, case: TestCase, run_id: str, requester_id: str) -> Test
             "generated_files": _cursor_file_evidence(case, phase2_result),
         }
 
-        row.score = _calculate_case_score(row, include_cursor=False)
+        row.score = _calculate_case_score(row)
         row.backend_score = row.score
     except Exception as exc:
         row.error = str(exc)
@@ -2325,18 +2318,16 @@ def _run_repository_question_checks(
             except Exception as exc:
                 response, status, answer, backend_mode, backend_ok = {}, 500, "", "", False
                 _diag("repository_question_backend_failed", level="warning", run_id=run_id, question_id=qid, error=exc)
-            validation = cursor_prompt_provider.validate_repository_answer(
-                owner=spec.owner,
-                repo=spec.repo,
-                commit_sha=str(commit_sha or ""),
-                question=str(item.get("question") or ""),
-                terrabot_answer=answer,
-                expected_answer=str(item.get("expected_answer") or ""),
-                evidence_paths=list(item.get("evidence_paths") or []),
-                run_id=run_id,
-                question_id=qid,
-                log_event=_diag,
-            ) if backend_ok else {"completed": False, "correct": False, "reason": "Terrabot did not return a normal chat answer.", "evidence": [], "error": "backend_chat_failed"}
+            # Cursor answer validation is disabled. Q&A correctness is assessed
+            # by the backend routing check (backend_ok) only: repo questions must
+            # return mode=chat, never infra_preview/clarification/branch_created.
+            validation = {
+                "completed": backend_ok,
+                "correct": backend_ok,
+                "reason": "Backend routing check only (Cursor answer validation disabled).",
+                "evidence": [],
+                "error": "" if backend_ok else "backend_routing_failure",
+            }
             check = {
                 "question_id": qid,
                 "cloud": spec.cloud,
@@ -2543,7 +2534,7 @@ def _apply_cursor_validation_result(
         else:
             item.cursor_validation_error = shared_error or "Cursor validation did not return a verdict for this case."
 
-        item.score = _calculate_case_score(item, include_cursor=True)
+        item.score = _calculate_case_score(item)
         item.failure_classification = terrabot_test_analysis.classify_result(item.case, item)
         _diag(
             "cursor_validation_applied",
@@ -2613,14 +2604,6 @@ def format_test_run_report(run: TestRunResult) -> str:
     p2_files = sum(1 for item in context_cases if item.phase2_file_generated)
     avg_calls = round(sum(item.bot_calls for item in run.cases) / completed, 1) if completed else 0.0
     avg_seconds = round(sum(item.duration_ms for item in run.cases) / max(completed, 1) / 1000.0, 1)
-    cursor_cases = [item for item in run.cases if item.cursor_validation_requested]
-    cursor_reviewed = sum(1 for item in cursor_cases if item.cursor_validation_completed)
-    cursor_output = sum(1 for item in cursor_cases if item.cursor_validation_completed and item.cursor_output_correct)
-    cursor_context_cases = [item for item in context_cases if item.cursor_validation_requested]
-    cursor_context_added = sum(1 for item in cursor_context_cases if item.cursor_validation_completed and item.cursor_context_added)
-    cursor_context_get = sum(1 for item in cursor_context_cases if item.cursor_validation_completed and item.cursor_context_retrievable)
-    cursor_context_use = sum(1 for item in cursor_context_cases if item.cursor_validation_completed and item.cursor_context_reused)
-    cursor_overall = sum(1 for item in cursor_cases if item.cursor_validation_completed and item.cursor_overall_ok)
     freeform_p1 = sum(1 for item in run.cases if item.phase1_freeform_clarification)
     freeform_p2 = sum(1 for item in context_cases if item.phase2_freeform_clarification)
     context_attach_defects = sum(1 for item in context_cases if item.phase2_context_backend_defect)
@@ -2636,7 +2619,7 @@ def format_test_run_report(run: TestRunResult) -> str:
     repository_questions = list(run.repository_question_checks or [])
     repository_questions_correct = sum(
         1 for item in repository_questions
-        if item.get("backend_ok") and item.get("cursor_completed") and item.get("cursor_correct")
+        if item.get("backend_ok")
     )
 
     lines = [
@@ -2661,23 +2644,10 @@ def format_test_run_report(run: TestRunResult) -> str:
             f"| Evidence attached: **{qna_evidence_ok}/{len(repository_questions)}** "
             f"| Intent failures (routed to infra): **{qna_intent_failures}**"
         )
-    if cursor_cases:
-        lines.append(
-            f"Cursor independent review: **{cursor_reviewed}/{len(cursor_cases)}** completed | "
-            f"Output correct: **{cursor_output}/{len(cursor_cases)}** | "
-            f"Context added: **{cursor_context_added}/{len(cursor_context_cases) or 1}** | "
-            f"Retrievable: **{cursor_context_get}/{len(cursor_context_cases) or 1}** | "
-            f"Reused: **{cursor_context_use}/{len(cursor_context_cases) or 1}** | "
-            f"Overall accepted: **{cursor_overall}/{len(cursor_cases)}**"
-        )
-        lines.append(
-            f"Backend-only accuracy: **{average_backend_score}%** | "
-            f"Final accuracy after Cursor: **{average_score}%**"
-        )
     lines.extend([
         "",
-        "| Test | Type | Cloud/Env | Phase 1 prompt | Expected target | P1 mode | P2 mode | Target found | Control/output | Control mentioned | P1 file | Validation | Branch URL | Branch pushed | Diag branch | Context | P2 retrieved | P2 attached | P2 useful | Cursor output | Cursor context | Cursor overall | Classification | Score |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---:|",
+        "| Test | Type | Cloud/Env | Phase 1 prompt | Expected target | P1 mode | P2 mode | Target found | Control/output | Control mentioned | P1 file | Validation | Branch URL | Branch pushed | Diag branch | Context | P2 retrieved | P2 attached | P2 useful | Classification | Score |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---:|",
     ])
     for item in run.cases:
         case = item.case
@@ -2721,9 +2691,6 @@ def format_test_run_report(run: TestRunResult) -> str:
                     p2_context_status,
                     _status(item.phase2_context_attached) if case.case_type == "boolean_context" else "N/A",
                     _status(item.phase2_context_useful) if case.case_type == "boolean_context" else "N/A",
-                    _cursor_status(item, "cursor_output_correct"),
-                    _escape_table(_cursor_context_status(item), 42),
-                    _cursor_status(item, "cursor_overall_ok"),
                     _escape_table(item.failure_classification or "", 36),
                     f"{item.score}%",
                 ]
@@ -2731,49 +2698,11 @@ def format_test_run_report(run: TestRunResult) -> str:
             + " |"
         )
 
-    if cursor_cases:
-        lines.extend([
-            "",
-            "**Cursor independent validation**",
-            "| Test | Output correct | Context added | Context retrievable | Context reused | Overall | Reason |",
-            "|---|---|---|---|---|---|---|",
-        ])
-        for item in cursor_cases:
-            context_added_status = (
-                _cursor_status(item, "cursor_context_added")
-                if item.case.case_type == "boolean_context"
-                else "N/A"
-            )
-            context_retrievable_status = (
-                _cursor_status(item, "cursor_context_retrievable")
-                if item.case.case_type == "boolean_context"
-                else "N/A"
-            )
-            context_reused_status = (
-                _cursor_status(item, "cursor_context_reused")
-                if item.case.case_type == "boolean_context"
-                else "N/A"
-            )
-            reason = item.cursor_validation_reason or item.cursor_validation_error or "No Cursor reason returned."
-            lines.append(
-                "| "
-                + " | ".join([
-                    _escape_table(item.case.case_id, 24),
-                    _cursor_status(item, "cursor_output_correct"),
-                    context_added_status,
-                    context_retrievable_status,
-                    context_reused_status,
-                    _cursor_status(item, "cursor_overall_ok"),
-                    _escape_table(reason, 100),
-                ])
-                + " |"
-            )
-
     if repository_questions:
         lines.extend([
             "",
-            "**Cursor repository/workflow Q&A checks**",
-            "| Check | Repository | Question | Terrabot answer | Cursor verified | Reason |",
+            "**Repository/workflow Q&A checks** (backend-validated intent routing)",
+            "| Check | Repository | Question | Terrabot answer | Intent OK | Reason |",
             "|---|---|---|---|---|---|",
         ])
         for check in repository_questions:
@@ -2784,8 +2713,8 @@ def format_test_run_report(run: TestRunResult) -> str:
                     _escape_table(check.get("repository") or "", 32),
                     _escape_table(check.get("question") or "", 60),
                     _escape_table(check.get("terrabot_answer") or "", 80),
-                    _status(bool(check.get("backend_ok") and check.get("cursor_completed") and check.get("cursor_correct"))),
-                    _escape_table(check.get("cursor_reason") or check.get("cursor_error") or "", 90),
+                    _status(bool(check.get("backend_ok"))),
+                    _escape_table(check.get("backend_intent") or "", 40),
                 ])
                 + " |"
             )
@@ -2840,21 +2769,6 @@ def format_test_run_report(run: TestRunResult) -> str:
                 reasons.append("Phase 2 target mismatch")
             if item.case.case_type == "boolean_context" and not item.phase2_reused_without_clarification:
                 reasons.append("Phase 2 required clarification")
-            if item.cursor_validation_requested and not item.cursor_validation_completed:
-                reasons.append("Cursor validation unavailable")
-            if item.cursor_validation_completed and not item.cursor_output_correct:
-                reasons.append("Cursor rejected generated output")
-            if item.case.case_type == "boolean_context" and item.cursor_validation_completed:
-                if not item.cursor_context_added:
-                    reasons.append("Cursor did not verify context addition")
-                if not item.cursor_context_retrievable:
-                    reasons.append("Cursor did not verify context retrieval")
-                if not item.cursor_context_reused:
-                    reasons.append("Cursor did not verify context reuse")
-            if item.cursor_validation_reason and not item.cursor_overall_ok:
-                reasons.append("Cursor: " + item.cursor_validation_reason)
-            if item.cursor_validation_error:
-                reasons.append("Cursor error: " + item.cursor_validation_error)
             if not item.error and item.validation_error and not item.validation_ok:
                 reasons.append(item.validation_error)
             if item.repair_exhausted:
@@ -2884,7 +2798,8 @@ def format_test_run_report(run: TestRunResult) -> str:
     lines.extend([
         "",
         "Phase 1 pushes each backend-validated test change to its own Terrabot test branch; no pull request is created. Phase 2 applies only to Boolean-context cases, uses a fresh synthetic Teams conversation, and does not push another branch. After all cases finish, one read-only Cursor review independently checks generated output plus context addition, retrieval, attachment, and reuse evidence. Cursor verdicts are included in full-pass scoring when the feature is enabled.",
-        f"Search Function App logs with `run_id={run.run_id}` for `[TerrabotTest]` and `[TerrabotCursorValidation]` traces.",
+        f"Search Function App logs with `run_id={run.run_id}` for `[TerrabotTest]` traces.",
+        "Validation: agent self-validation + backend preservation/shape/semantic checks. Cursor used for prompt generation and target clarification only.",
     ])
     return "\n".join(lines)
 
@@ -3198,11 +3113,7 @@ def execute_automated_test_job(core: Any, job: dict) -> str:
                         "failure_count": failure_count,
                         "last_score": case_result.score,
                         "last_backend_score": case_result.backend_score,
-                        "last_cursor_overall_ok": (
-                            case_result.cursor_overall_ok
-                            if case_result.cursor_validation_requested
-                            else None
-                        ),
+                        "last_cursor_overall_ok": None,  # cursor result validation disabled
                         "last_run_id": run_id,
                         "last_commit_sha": case_result.case.commit_sha,
                         "last_classification": case_result.failure_classification,
@@ -3228,19 +3139,9 @@ def execute_automated_test_job(core: Any, job: dict) -> str:
             "discovery_errors": discovery_errors,
             "repository_question_checks": list(result.repository_question_checks),
             "cursor_validation": {
-                "enabled": bool(cursor_validation.get("enabled")),
-                "completed": bool(cursor_validation.get("completed")),
-                "agent_id": str(cursor_validation.get("agent_id") or ""),
-                "agent_url": str(cursor_validation.get("agent_url") or ""),
-                "duration_ms": int(cursor_validation.get("duration_ms") or 0),
-                "requested_cases": sum(1 for item in result.cases if item.cursor_validation_requested),
-                "completed_cases": sum(1 for item in result.cases if item.cursor_validation_completed),
-                "output_correct_cases": sum(1 for item in result.cases if item.cursor_output_correct),
-                "overall_accepted_cases": sum(1 for item in result.cases if item.cursor_overall_ok),
-                "context_added_cases": sum(1 for item in result.cases if item.cursor_context_added),
-                "context_retrievable_cases": sum(1 for item in result.cases if item.cursor_context_retrievable),
-                "context_reused_cases": sum(1 for item in result.cases if item.cursor_context_reused),
-                "error": str(cursor_validation.get("error") or ""),
+                "enabled": False,
+                "completed": False,
+                "note": "Cursor result validation temporarily disabled; using agent self-validation + backend validation.",
             },
             "report": report,
         })

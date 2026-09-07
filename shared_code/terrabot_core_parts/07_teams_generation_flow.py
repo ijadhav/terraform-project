@@ -1175,6 +1175,99 @@ def _handle_teams_chat_request_base(data: dict):  # pyright: ignore[reportGenera
 
 
 
+
+def _teams_build_preservation_retry_context(
+    *,
+    original_user_prompt: str,
+    conversation_id: str,
+    retrieved_value_context: list | None,
+    validation_error: str,
+    cloud: str,
+    workflow: str,
+) -> dict:
+    """Build a structured retry payload when Foundry removed too many existing lines.
+
+    The agent receives:
+      1. The original user request (initial prompt).
+      2. All clarifications exchanged this session (from conversation context).
+      3. The complete live evidence files with full contents so the agent can
+         copy them verbatim and apply ONLY the requested change.
+      4. Clear instructions that it must preserve every unrelated line exactly.
+
+    This avoids forcing the user to rephrase and gives the agent everything it
+    needs to succeed on the next attempt without backend mediation.
+    """
+    import re as _re
+
+    # Collect full live file contents from evidence — the agent needs these
+    # verbatim, not the bounded snippets used for semantic discovery.
+    live_evidence_files: list[dict] = []
+    seen_paths: set[str] = set()
+    for ctx_item in retrieved_value_context or []:
+        if not isinstance(ctx_item, dict):
+            continue
+        for matched in (
+            list(ctx_item.get("matched_files") or [])
+            + list(ctx_item.get("environment_files") or [])
+        ):
+            if not isinstance(matched, dict):
+                continue
+            path = str(matched.get("path") or matched.get("filename") or "").strip()
+            content = str(matched.get("content") or "")
+            if not path or not content or path in seen_paths:
+                continue
+            seen_paths.add(path)
+            nonblank = sum(1 for ln in content.splitlines() if ln.strip())
+            live_evidence_files.append({
+                "path": path,
+                "content": content,
+                "nonblank_line_count": nonblank,
+            })
+
+    # Pull clarification history from the Teams conversation context (same
+    # session — everything the user and bot exchanged before this turn).
+    clarification_history = str(_TEAMS_CONVERSATION_CONTEXT.get() or "")[-8000:]
+    clarification_turn_count = max(0, clarification_history.count("\nUser:") + clarification_history.count("\nBot:")) // 2
+
+    # Build a clear, actionable user message.
+    evidence_summary = ""
+    if live_evidence_files:
+        paths_listed = "\n".join(f"  • `{item['path']}` ({item['nonblank_line_count']} lines)" for item in live_evidence_files[:8])
+        evidence_summary = (
+            f"\n\n**Live files included for this retry** (copy verbatim, change only the requested line):\n"
+            + paths_listed
+        )
+
+    user_message = (
+        "Terrabot detected that the generated file was substantially shorter than the "
+        "live repository file — the agent removed existing content it should have preserved.\n\n"
+        "**Your original request has been kept intact. Please resend it so Terrabot can retry "
+        "with the complete live file content supplied below.**\n\n"
+        f"**Original request:** {str(original_user_prompt or '').strip()}"
+        + evidence_summary
+        + "\n\n"
+        "When retrying, Terrabot will provide the full live file contents so only the "
+        "requested line changes — every other line will be copied exactly."
+    )
+
+    return {
+        "original_user_prompt": str(original_user_prompt or "").strip(),
+        "clarification_history": clarification_history,
+        "clarification_turn_count": clarification_turn_count,
+        "live_evidence_files": live_evidence_files,
+        "validation_error": str(validation_error or ""),
+        "user_message": user_message,
+        "cloud": cloud,
+        "workflow": workflow,
+        "retry_instruction": (
+            "PRESERVATION_RETRY: The previous response was rejected because it removed existing "
+            "repository content. The complete live file(s) are supplied in live_evidence_files. "
+            "Copy each file verbatim and change ONLY the specific line(s) required by "
+            "original_user_prompt. Every other line must be identical to the live file."
+        ),
+    }
+
+
 def _teams_build_hard_validation_contract(
     *,
     cloud: str,
@@ -1529,9 +1622,33 @@ def handle_chat_request(data: dict):
             if not token:
                 return {"ok": False, "mode": "github_auth_required", "reply": "Connect GitHub before Terrabot creates the branch."}, 401
             with github_token_context(token):
-                branch_result = commit_terraform_files_to_branch_for_teams_with_self_correction(
-                    pending["agent_result"], pending["prompt"], conversation_id
-                )
+                try:
+                    branch_result = commit_terraform_files_to_branch_for_teams_with_self_correction(
+                        pending["agent_result"], pending["prompt"], conversation_id
+                    )
+                except UnsafeGeneratedChangeError as _preserve_err:
+                    # The commit pipeline exhausted all repair attempts due to the
+                    # agent removing too many existing lines. Return a structured
+                    # retry to the user with the full live evidence files.
+                    _retry_ctx = _teams_build_preservation_retry_context(
+                        original_user_prompt=str(pending.get("prompt") or ""),
+                        conversation_id=conversation_id,
+                        retrieved_value_context=list(
+                            (pending.get("agent_result") or {}).get("retrieved_value_context") or []
+                        ),
+                        validation_error=str(_preserve_err),
+                        cloud=str((pending.get("agent_result") or {}).get("cloud") or ""),
+                        workflow=str((pending.get("agent_result") or {}).get("workflow") or ""),
+                    )
+                    return {
+                        "ok": False,
+                        "mode": "clarification",
+                        "reply": _retry_ctx["user_message"],
+                        "thread_id": conversation_id,
+                        "pending_change_id": pending_change_id,
+                        "diagnostic_code": "PRESERVATION_FAILURE_RETRY_WITH_FULL_EVIDENCE",
+                        "_preservation_retry_context": _retry_ctx,
+                    }, 400
             # The self-correction loop may have replaced the originally-generated
             # files/analysis with a corrected version — keep pending["agent_result"]
             # in sync so any later fill/insert follow-up edits the version that
@@ -4342,6 +4459,44 @@ def handle_chat_request(data: dict):
                                     thread=conversation_id,
                                     error=str(_diag_err)[:200],
                                 )
+                        # When exhaustion is caused by the agent removing too many existing
+                        # file contents (truncation / preservation failure), give the user a
+                        # structured retry instead of a generic error message.
+                        # The retry payload includes: original request, every clarification
+                        # sent this session, and the full live evidence files so the agent can
+                        # copy them verbatim and apply only the requested delta.
+                        _is_preservation_failure = _needs_merge_repair(str(validation_error))
+                        if _is_preservation_failure:
+                            _retry_evidence = _teams_build_preservation_retry_context(
+                                original_user_prompt=effective_prompt,
+                                conversation_id=conversation_id,
+                                retrieved_value_context=retrieved_value_context,
+                                validation_error=str(validation_error),
+                                cloud=target_cloud,
+                                workflow=effective_workflow,
+                            )
+                            _teams_diag_log(
+                                "preservation_failure_returning_retry_context_to_user",
+                                level="warning",
+                                thread=conversation_id,
+                                evidence_files=len(_retry_evidence.get("live_evidence_files") or []),
+                                clarification_turns=_retry_evidence.get("clarification_turn_count", 0),
+                            )
+                            return {
+                                "ok": False,
+                                "mode": "clarification",
+                                "reply": _retry_evidence["user_message"],
+                                "thread_id": conversation_id,
+                                "conversation_label": conversation_label,
+                                "cloud": target_cloud,
+                                "jira_ticket": ticket_number,
+                                "ticket_number": ticket_number,
+                                "ticket_link": ticket_link,
+                                "ticket_title": ticket_title,
+                                "diagnostic_code": "PRESERVATION_FAILURE_RETRY_WITH_FULL_EVIDENCE",
+                                "_preservation_retry_context": _retry_evidence,
+                            }, 400
+
                         raise ValueError(
                             "Terrabot could not produce a backend-valid Terraform change "
                             "after internal repair attempts. No repository changes were written."

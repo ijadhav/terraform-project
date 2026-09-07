@@ -689,6 +689,29 @@ def _format_reply(result: Dict[str, Any]) -> str:
         lines.extend(["", "**Pull request**", str(result.get("pr_url") or "")])
         return "\n".join(lines)
 
+    # Preservation-failure retry: include live evidence file list in the message
+    if result.get("diagnostic_code") == "PRESERVATION_FAILURE_RETRY_WITH_FULL_EVIDENCE":
+        retry_ctx = result.get("_preservation_retry_context") or {}
+        live_files = retry_ctx.get("live_evidence_files") or []
+        lines_out = [reply]
+        if live_files:
+            lines_out.extend([
+                "",
+                "**Files Terrabot will use verbatim on the next attempt** (only the requested line will change):",
+            ])
+            for ev in live_files[:8]:
+                path = str(ev.get("path") or "")
+                nbl = int(ev.get("nonblank_line_count") or 0)
+                lines_out.append(f"- `{path}` ({nbl} lines)")
+        if retry_ctx.get("original_user_prompt"):
+            lines_out.extend([
+                "",
+                f"**Your original request:** {retry_ctx['original_user_prompt']}",
+                "",
+                "Please resend your request and Terrabot will retry with the full live file content.",
+            ])
+        return "\n".join(lines_out)
+
     if questions:
         return "\n".join([reply, "", "**Needed from you**", *[f"{idx}. {item}" for idx, item in enumerate(questions, start=1)]])
     return reply
