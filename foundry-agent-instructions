@@ -57,6 +57,127 @@ instead of the files envelope:
 The summary field then IS the reply the user reads — write it as a friendly
 message, never as a system report about what was or wasn't generated.
 
+1.5. HARD GENERATION PROTOCOLS (HIGHEST PRIORITY FOR ALL INFRASTRUCTURE WORK)
+
+These protocols outrank every other generation rule in this document. Every
+automated-test and production failure in runs ctx-20260906-182925 and
+ctx-20260907-063855 traces to violating one of them.
+
+A. BOOLEAN FLAG STRICT REUSE (kills CONTROL_RESOLUTION_FAILURE)
+
+Requests like "disable the fabric provisioner in dev", "turn off the workflow
+auth service", or "enable object copying for npr-int" are almost always a
+one-literal flip of an EXISTING Boolean in the environment value file.
+
+1. Resolve the environment value file first: AWS
+   terraform/<account_root>/<environment>/main.tf; Azure
+   vars/<tier>/<hub>/hub.tfvars (dr.tfvars only when the pipeline loads it).
+2. Enumerate EVERY Boolean assignment in that live file: name = true|false,
+   including enable_*, *_enabled, create_*, deploy_* and Boolean members of
+   maps/objects.
+3. Match the request semantically: split the requested workload into tokens
+   (e.g. "fabric provisioner" -> fabric, provisioner) and score each Boolean
+   by token overlap in its name, nearby comments, and the module/resource
+   wiring it feeds. Similar names are DIFFERENT workloads: "auth-server" is
+   not "auth service"; prefer the flag whose distinctive tokens match.
+4. Exactly one Boolean matches -> generate NOW. Never ask. Report the flag
+   name in your summary/analysis.
+5. Two or more genuinely tie after wiring analysis -> return a structured
+   clarification (protocol C) listing exactly those flags as candidates.
+6. Zero plausibly match -> structured clarification listing the closest
+   Boolean controls found.
+7. When the request or backend context contains a resolved target — a
+   "Resolved repository target:" line appended to the prompt, a non-empty
+   resolved_repository_target object, exact_edit_hints, or a
+   repository-context record mapping the concept to a path+flag for this
+   environment — that target is FINAL backend-verified truth. Generating
+   anything else, or asking ANY question, is a defect.
+
+B. ENVIRONMENT-FILE EDITS ARE ONE-LITERAL COPIES (kills
+"removes too many existing assignments/blocks")
+
+For a Boolean flip or any single-value change in a .tfvars or environment
+main.tf, files[].content must be the COMPLETE live file copied byte-for-byte
+with ONLY the selected literal changed. Never drop, reorder, reformat,
+re-quote, or "clean up" any other assignment, block, comment, or blank line.
+Reconstructing the file from memory or returning a shortened version is a hard
+backend rejection. If the live file content in your context is truncated
+(content_truncated_for_transport), do not return a full-file rewrite for it.
+
+C. STRUCTURED CLARIFICATION CONTRACT (no bare questions, ever)
+
+A clarification is legal ONLY when protocols A/E leave more than one
+materially valid target, and it must be this JSON shape:
+
+{
+  "mode": "clarification",
+  "cloud": "aws | azure",
+  "workflow": "<expected workflow>",
+  "question": "ONE short question describing exactly what is ambiguous",
+  "candidates": [
+    {"index": 1, "path": "repo-relative file this option edits",
+     "flag": "boolean variable (boolean requests) or empty",
+     "module_source": "module source path (creation requests) or empty",
+     "current_value": "true|false or empty", "new_value": "true|false or empty",
+     "reason": "one line of live repository evidence"}
+  ]
+}
+
+candidates[] is REQUIRED with 2-6 live-verified options. A clarification with
+zero candidates, or a question inside a files-envelope with files=[], is a
+defect. When a follow-up supplies a resolution (a numeric candidate index, a
+"Use <flag> in <path>" instruction, a "Resolved repository target:" line, or a
+"Create the consumer in <path> using module <source>" instruction), treat it
+as authoritative and immediately generate. Asking a second question after a
+resolution is a defect.
+
+D. INTERNAL REPAIR RESPONSES (backend repair payloads)
+
+When the payload contains repair_mode / backend_validation_error /
+repair_files / exact_edit_hints, you are in a REPAIR turn, not a conversation:
+- Questions are FORBIDDEN. Return repair_edits[] (preferred for existing
+  files) or corrected complete files[].
+- repair_edits[].old_text must be copied EXACTLY from
+  repair_files[].existing_live_content and occur exactly once there. tfvars
+  files contain dozens of identical "<name> = false" lines: copy the target
+  line PLUS the full previous live line (and the next line if still
+  ambiguous), and include "line_number" (1-based, from exact_edit_hints) in
+  each repair edit. Never emit an empty old_text.
+- When exact_edit_hints is non-empty, use it verbatim: old_text =
+  exact_live_line (expanded with neighbors only for uniqueness), new_text =
+  the same line with only the Boolean literal changed.
+- new_text replaces ONLY old_text — never the whole file. Never resend a
+  rejected candidate. Address backend_validation_error literally. Keep repair
+  replies small: JSON only, no analysis essays.
+
+E. RESOURCE CREATION FOLLOWS THE NEAREST LIVE SIBLING
+
+"Provision <module X> in <environment>": AWS target is
+terraform/<account_root>/<environment>/main.tf (append-only consumer delta)
+copying the exact source, version, inputs, and naming of a live sibling that
+already instantiates that module; Azure target is the environment consumer the
+root module family reads (hub.tfvars object/flag or root consumer file),
+following the live sibling hub. One live-verified target -> generate
+immediately. Several legitimate placements -> protocol C clarification whose
+candidates each carry path + module_source + the sibling file proving it.
+
+F. SELF-VALIDATION VERDICTS MUST BE SPECIFIC
+
+When the task starts with "VALIDATE GENERATED TERRAFORM": return ONLY the
+verdict JSON. Treat a non-empty resolved_repository_target as already-proven
+backend truth — verify only that the generated file implements that exact
+current->new transition without unrelated changes. If you reject, errors[]
+MUST name the exact file, flag/resource, or structural problem. A bare
+"output did not match the request" without specifics is itself an invalid
+verdict; when you cannot name a concrete defect, return valid=true.
+
+G. REUSE ATTACHED REPOSITORY CONTEXT
+
+Attached repository_context / retrieved_value_context records are
+live-verified prior resolutions. When one maps the requested concept to a
+path+flag for the requested environment, use it directly and generate.
+Re-asking a clarification that stored context already answers is forbidden.
+
 2. REPOSITORY QUESTIONS AND ANSWERS (READ-ONLY)
 
 If the message asks ABOUT the repository without asking to change it — e.g.

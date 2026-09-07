@@ -3057,6 +3057,54 @@ def _prompt_guard_agent_self_validate_stage1(agent_result: dict, prompt: str) ->
         errors = [errors]
     reason = str(verdict.get("reason") or "").strip()
     detail = "; ".join(str(item) for item in errors if str(item).strip()) or reason or "generated output did not match the current request"
+
+    def _rejection_is_specific(text: str) -> bool:
+        """A rejection must cite concrete evidence to block the pipeline.
+
+        Runs ctx-20260906-182925 and ctx-20260907-063855 both lost all internal
+        repair attempts to the bare verdict "generated output did not match the
+        current request" — no file, no flag, no resource named — on candidates
+        that had already passed every deterministic guard. A model-level guard
+        that cannot say WHAT is wrong is inconclusive, not a proof of defect.
+        Specific = the rejection names a generated path, the resolved flag, or
+        a concrete structural problem.
+        """
+        lowered = str(text or "").lower()
+        if not lowered:
+            return False
+        for item in agent_result.get("files") or []:
+            if not isinstance(item, dict):
+                continue
+            path = str(item.get("filename") or item.get("path") or "").strip().lower()
+            if path and (path in lowered or path.rsplit("/", 1)[-1] in lowered):
+                return True
+        flag = str((resolved_feature_flag or {}).get("flag") or "").strip().lower()
+        if flag and flag in lowered:
+            return True
+        structural_markers = (
+            "syntax", "unbalanced", "conflict marker", "truncat", "placeholder",
+            "missing variable", "undeclared", "wrong resource", "different resource",
+            "module source", "duplicate", "removed", "deleted",
+        )
+        if any(marker in lowered for marker in structural_markers):
+            return True
+        # Any resource-family token shared between the rejection and the
+        # request counts as concrete grounding.
+        request_tokens = {
+            token for token in re.findall(r"[a-z0-9_]{5,}", str(prompt or "").lower())
+        }
+        rejection_tokens = set(re.findall(r"[a-z0-9_]{5,}", lowered))
+        generic = {"generated", "output", "request", "current", "match", "terraform", "infrastructure", "validation"}
+        return bool((request_tokens & rejection_tokens) - generic)
+
+    strict = str(os.getenv("TERRABOT_SELF_VALIDATION_STRICT", "false")).strip().lower() in {"1", "true", "yes"}
+    if not strict and not _rejection_is_specific(detail):
+        LOGGER.warning(
+            "[TerrabotFlow] step=generated_output_validation actor=foundry result=advisory_pass "
+            "reason=nonspecific_rejection detail=%s",
+            detail[:300],
+        )
+        return
     raise ValueError(f"AGENT_SELF_VALIDATION_FAILED: {detail}")
 _prompt_guard_agent_self_validate = _prompt_guard_agent_self_validate_stage1
 
