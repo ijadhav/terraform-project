@@ -426,7 +426,8 @@ def _teams_build_backend_repair_payload(
         "rules": [
             "Use current exact live GitHub content as the only baseline; memory and rejected output are context, never repository truth.",
             "Return strict JSON and no questions for an internal repair.",
-            "For existing files prefer repair_edits[]; old_text must occur exactly once in existing_live_content.",
+            "For existing files prefer repair_edits[]; old_text must occur exactly once in existing_live_content unless exact_edit_hints supplies a line_number anchor.",
+            "When exact_edit_hints has a line_number, include that same line_number in repair_edits[] so the backend can disambiguate repeated tfvars Boolean assignments.",
             "repair_edits[].new_text is ONLY the replacement for old_text, never a whole-file replacement.",
             "Do not add/remove/reorder/reformat unrelated lines, comments, blocks, or blank lines.",
             "Preserve allowed path boundaries and do not introduce unrelated files.",
@@ -566,7 +567,37 @@ def _teams_materialize_repair_edits_response(agent_reply: str, repair_payload: d
             raise ValueError(f"repair_edits[{index}] old_text must be non-empty exact live-file text.")
         if not isinstance(new_text, str):
             raise ValueError(f"repair_edits[{index}] new_text must be a string.")
-        edits_by_path.setdefault(path, []).append(SurgicalEdit(path=path, old_text=old_text, new_text=new_text))
+        try:
+            line_number = int(edit.get("line_number") or edit.get("line") or 0)
+        except (TypeError, ValueError):
+            line_number = 0
+        if line_number <= 0:
+            for hint in repair_payload.get("exact_edit_hints") or []:
+                if not isinstance(hint, dict):
+                    continue
+                if str(hint.get("path") or "").strip().strip("/") != path:
+                    continue
+                flag = str(hint.get("flag") or "").strip()
+                expected_old = str(hint.get("current_value") or "").strip().lower()
+                expected_new = str(hint.get("new_value") or "").strip().lower()
+                hint_line = str(hint.get("exact_live_line") or "")
+                try:
+                    hinted_line_number = int(hint.get("line_number") or 0)
+                except (TypeError, ValueError):
+                    hinted_line_number = 0
+                if (
+                    hinted_line_number > 0
+                    and flag
+                    and flag in (old_text + "\n" + new_text + "\n" + hint_line)
+                    and expected_old in {"true", "false"}
+                    and expected_new in {"true", "false"}
+                    and expected_new in new_text.lower()
+                ):
+                    line_number = hinted_line_number
+                    break
+        edits_by_path.setdefault(path, []).append(
+            SurgicalEdit(path=path, old_text=old_text, new_text=new_text, line_number=line_number)
+        )
 
     materialized_files: list[dict] = []
     original_request = str(repair_payload.get("original_user_request") or "")
@@ -783,6 +814,7 @@ def _teams_get_valid_backend_repair(
                 "existing_file_output": "repair_edits_only",
                 "must_not_return_full_existing_files": True,
                 "must_copy_old_text_from": "repair_files[].existing_live_content",
+                "line_number_required_when_hint_exists": True,
                 "new_text_scope": "replacement for old_text span only, never a full-file replacement",
                 "must_satisfy_all_hard_validation_rules_before_return": True,
             }

@@ -2194,10 +2194,18 @@ def _handle_teams_chat_request_state_machine(data: dict):
     # deterministic protocol continuations (branch yes/no, Jira, target picks,
     # PR decisions). Every ordinary user message is classified once in a fresh
     # Foundry call before repository discovery/routing.
-    if (
+    explicit_mode = str(request_data.get("mode") or "").strip().lower()
+    if explicit_mode == "repo_qna":
+        # Repository Q&A is a read-only Teams answer path. Do not reclassify it
+        # into infrastructure, do not run Terraform validators, and do not
+        # create branches. Cursor/test harnesses may set this mode explicitly
+        # when they only need Terrabot's repository answer sent to the Teams
+        # conversation.
+        request_data["foundry_intent"] = "repo_qna"
+    elif (
         prompt
         and not _teams_message_is_protocol_control(request_data, state, prompt)
-        and str(request_data.get("mode") or "").strip().lower() != "infra"
+        and explicit_mode != "infra"
     ):
         foundry_intent = _teams_foundry_classify_request(prompt)
         request_data["foundry_intent"] = foundry_intent

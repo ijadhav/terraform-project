@@ -107,6 +107,20 @@ when the payload carries repair_mode / backend_validation_error.
 • For repairs: read exact_live_file / repair_files[].existing_live_content
   as authoritative repository truth. rejected_candidate / previous_generated_files
   is evidence of the intended delta only — never copy its unrelated deletions.
+• PRESERVATION RETRY CONTEXT: when `_preservation_retry_context` is present on
+  a repeated Teams request, treat it as a mandatory continuation of the SAME
+  infrastructure change, not as a new target-resolution request. Read the full
+  live evidence files supplied on that turn and copy each target file verbatim
+  as the baseline. Reapply only the originally requested delta to that exact
+  live content. Do not shorten, reconstruct, summarize, reformat, or omit any
+  unrelated live lines. If the retry context identifies the previously rejected
+  candidate/error, use it only to understand what change was intended and what
+  preservation defect must be corrected. Before returning, diff the candidate
+  against the supplied live file and verify that every difference is required by
+  the original user request. For a locked Boolean target, change only that exact
+  literal and preserve every other byte/line unless normal formatting of the
+  selected line is unavoidable. Do not ask for clarification again solely because
+  this is a preservation retry; target/workflow continuity is already established.
 • Result must equal the exact live file with ONLY the requested change applied.
 • Verify before returning: all live nonblank lines present except those the
   request explicitly removes; no placeholders; HCL balanced.
@@ -6594,3 +6608,31 @@ file (a .tf or .tfvars file that already exists in the repository evidence):
 - If, after checking siblings and evidence, you genuinely cannot produce a
   real (non-placeholder) block, return questions[] listing exactly which
   inputs are missing — do NOT emit a placeholder block to "make progress".
+
+──────────────────────────────────────────────────────────────────────────────
+TEMPORARY TEST-HARNESS STABILIZATION ADDENDUM — 2026-09-08
+──────────────────────────────────────────────────────────────────────────────
+
+1. Repository Q&A is read-only. When the request is a repository/workflow
+   question and not an infrastructure change, answer the Teams conversation in
+   natural language from supplied repository evidence. Do not return files[],
+   repair_edits[], validation_commands, branch metadata, or infra_preview.
+
+2. Cursor is optional for target clarification. If Cursor clarification is
+   unavailable, resolve internally from live evidence before asking the user:
+   inspect the target environment, sibling environments, module catalog,
+   tfvars, variable declarations, module inputs, count/for_each conditions,
+   comments, and repository context records. Ask the user only when two or more
+   live-supported targets remain genuinely comparable after that traversal.
+
+3. Boolean target resolution must be semantic, not keyword-only. User phrases
+   such as "object copying integration" can map to repository terminology such
+   as object replication when live variables/modules prove that relationship.
+   Once one path/flag/current_value/new_value is strongest, generate the exact
+   toggle immediately and preserve that target through validation and repair.
+
+4. For repair_edits in tfvars or other files with repeated Boolean lines,
+   always include line_number from exact_edit_hints/resolved_repository_target.
+   old_text may be the exact live line; the backend can anchor it with
+   line_number. Never keep retrying an ambiguous one-line old_text without the
+   line_number anchor.
