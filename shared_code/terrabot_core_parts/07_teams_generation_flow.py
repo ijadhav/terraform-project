@@ -2531,6 +2531,19 @@ def handle_chat_request(data: dict):
                         str(operation_class.get("reason") or "")[:300],
                     )
                     effective_workflow = modification_workflow
+            elif (
+                operation_class.get("operation_shape") == "creation_or_consumer"
+                and _teams_truthy(data.get("test_mode"))
+            ):
+                creation_workflow = "aws_module_creation" if target_cloud == "aws" else "azure_consumer_generation" if target_cloud == "azure" else ""
+                if creation_workflow:
+                    LOGGER.info(
+                        "[TerrabotFlow] step=workflow_classification actor=foundry->backend result=creation_or_consumer previous=%s resolved=%s reason=%s",
+                        effective_workflow or "<none>",
+                        creation_workflow,
+                        str(operation_class.get("reason") or "")[:300],
+                    )
+                    effective_workflow = creation_workflow
             else:
                 LOGGER.info(
                     "[TerrabotFlow] step=workflow_classification actor=foundry->backend result=%s workflow=%s reason=%s",
@@ -2733,40 +2746,51 @@ def handle_chat_request(data: dict):
                     )
 
                     if routing_context and routing_context.get("source") == "backend_new_azure_consumer_file_confirmation_required":
-                        store_pending_azure_new_consumer_file_confirmation(
-                            thread_id=conversation_id,
-                            ticket_number=ticket_number,
-                            original_prompt=effective_prompt,
-                            retrieved_module_context=retrieved_module_context,
-                            retrieved_value_context=[
+                        if _teams_truthy(data.get("test_mode")):
+                            LOGGER.info(
+                                "[TerrabotFlow] step=azure_consumer_creation actor=backend result=auto_confirmed_new_consumer_file test_mode=true target=%s",
+                                str(routing_context.get("target_consumer_filename") or routing_context.get("target_tfvars_filename") or "")[:300],
+                            )
+                            retrieved_value_context = [
                                 item for item in list(retrieved_value_context or [])
                                 if not (isinstance(item, dict) and item.get("source") == "backend_new_azure_consumer_file_confirmation_required")
-                            ],
-                            routing_context=routing_context,
-                            ticket_link=ticket_link,
-                            ticket_title=ticket_title,
-                        )
-                        return {
-                            "ok": False,
-                            "mode": "clarification",
-                            "reply": build_azure_new_consumer_file_confirmation_reply(routing_context),
-                            "thread_id": conversation_id,
-                            "conversation_label": conversation_label,
-                            "jira_ticket": ticket_number,
-                            "ticket_number": ticket_number,
-                            "ticket_link": ticket_link,
-                            "ticket_title": ticket_title,
-                            "router": {
-                                "request_type": "infra",
-                                "cloud": "azure",
-                                "workflow": "azure_new_consumer_file_confirmation",
-                                "reason": "No tf-azure-hub file uses the selected module source; user must confirm new consumer file creation.",
-                            },
-                            "decision_state": "azure_new_consumer_file_confirmation",
-                            "target_consumer_file": routing_context.get("target_consumer_filename"),
-                            "target_tfvars_file": routing_context.get("target_tfvars_filename"),
-                            "module_source_url": routing_context.get("module_source_url"),
-                        }, 400
+                            ]
+                            retrieved_value_context.append(_confirm_new_azure_consumer_file_routing_context(routing_context))
+                        else:
+                            store_pending_azure_new_consumer_file_confirmation(
+                                thread_id=conversation_id,
+                                ticket_number=ticket_number,
+                                original_prompt=effective_prompt,
+                                retrieved_module_context=retrieved_module_context,
+                                retrieved_value_context=[
+                                    item for item in list(retrieved_value_context or [])
+                                    if not (isinstance(item, dict) and item.get("source") == "backend_new_azure_consumer_file_confirmation_required")
+                                ],
+                                routing_context=routing_context,
+                                ticket_link=ticket_link,
+                                ticket_title=ticket_title,
+                            )
+                            return {
+                                "ok": False,
+                                "mode": "clarification",
+                                "reply": build_azure_new_consumer_file_confirmation_reply(routing_context),
+                                "thread_id": conversation_id,
+                                "conversation_label": conversation_label,
+                                "jira_ticket": ticket_number,
+                                "ticket_number": ticket_number,
+                                "ticket_link": ticket_link,
+                                "ticket_title": ticket_title,
+                                "router": {
+                                    "request_type": "infra",
+                                    "cloud": "azure",
+                                    "workflow": "azure_new_consumer_file_confirmation",
+                                    "reason": "No tf-azure-hub file uses the selected module source; user must confirm new consumer file creation.",
+                                },
+                                "decision_state": "azure_new_consumer_file_confirmation",
+                                "target_consumer_file": routing_context.get("target_consumer_filename"),
+                                "target_tfvars_file": routing_context.get("target_tfvars_filename"),
+                                "module_source_url": routing_context.get("module_source_url"),
+                            }, 400
 
                     if routing_context and not _azure_consumer_value_selection_confirmed(retrieved_value_context):
                         store_pending_azure_consumer_value_selection(

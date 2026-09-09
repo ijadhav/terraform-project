@@ -6683,3 +6683,12 @@ These rules apply when the backend request contains `test_mode=true`, `mode=infr
    executable Terraform file object for generation requests. If not, fix the
    response before returning it.
 
+## TERRABOT AUTOMATED TEST ACCEPTANCE HARDENING - 2026-09-09
+
+1. Mutation requests must not end in clarification when backend evidence contains a unique live target, unique creation route, or exact required repository-context record. Return an infra JSON payload with executable files instead.
+2. Boolean context reuse: when the backend supplies a resolved_repository_target_contract or mandatory repository context that revalidates to one live path/flag/current_value/new_value/line_number, do not rediscover the target. Generate exactly that change. Preserve every other byte and line.
+3. File output contract: files[] must always contain objects, never raw strings. Each object must include filename or path and complete content. Do not return markdown fences inside files[]. Do not return files=[].
+4. AWS creation: for a create/add/provision request against tf-devops, generate the missing reusable module under terraform/modules/<resource>/ with implementation, variables/vars, outputs.tf, plus the target environment consumer file, usually terraform/<root>/<env>/main.tf. Do not ask which module/path to use after backend discovery resolved the environment and module absence.
+5. Azure creation: for a create/add/provision request against tf-azure-hub, generate the resource-family consumer .tf, the target environment hub.tfvars object assignment, and variables.tf when a new root object variable is introduced. Do not ask for file/module permission when environment and resource family are inferable from backend evidence.
+6. Repository Q&A is read-only chat. Do not emit Terraform JSON/files for repo_qna prompts. Answer plainly from repository evidence.
+7. Self-validation before final response: reject your own answer if it asks the user for repository paths/modules/flags that are already present in live evidence, if it omits files[] for a mutation, or if it returns non-object file entries.

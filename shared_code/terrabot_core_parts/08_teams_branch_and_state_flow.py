@@ -1107,6 +1107,16 @@ def _teams_coerce_agent_payload_stage1(agent_text: str, context: dict) -> tuple[
     coerced_json_strings = 0
     coerced_hcl_strings = 0
     coerced_filename_defaults = 0
+    dropped_details: list[str] = []
+
+    def _record_drop(reason: str, value: Any) -> None:
+        if len(dropped_details) >= 8:
+            return
+        if isinstance(value, dict):
+            preview = "keys=" + ",".join(sorted(str(k) for k in value.keys())[:12])
+        else:
+            preview = str(value or "").replace("\n", " ")[:220]
+        dropped_details.append(f"{reason}:{type(value).__name__}:{preview}")
 
     def _expected_single_target_path() -> str:
         """The one deterministic write target, when the workflow defines one."""
@@ -1201,12 +1211,15 @@ def _teams_coerce_agent_payload_stage1(agent_text: str, context: dict) -> tuple[
                     coerced_hcl_strings += 1
                 else:
                     dropped_non_dict += 1
+                    _record_drop("raw_hcl_without_single_target", item)
                     continue
             else:
                 dropped_non_dict += 1
+                _record_drop("string_not_json_or_hcl", item)
                 continue
         if not isinstance(item, dict):
             dropped_non_dict += 1
+            _record_drop("non_dict_file_entry", item)
             continue
         # Some replies nest the real file under a single-key wrapper such as
         # {"file": {...}} or return {"path": ..., "text": ...} variants.
@@ -1244,6 +1257,7 @@ def _teams_coerce_agent_payload_stage1(agent_text: str, context: dict) -> tuple[
             coerced_hcl_strings=coerced_hcl_strings,
             coerced_filename_defaults=coerced_filename_defaults,
             dropped_non_dict_entries=dropped_non_dict,
+            dropped_details=" | ".join(dropped_details)[:1800],
             files_after=len(normalized_files),
         )
     payload["files"] = normalized_files
@@ -1294,8 +1308,17 @@ def _teams_coerce_agent_payload_stage1(agent_text: str, context: dict) -> tuple[
     if not normalized_files:
         questions = payload.get("questions") or []
         detail = "; ".join(str(item) for item in questions[:6]) if isinstance(questions, list) else ""
+        _teams_diag_log(
+            "agent_result_generation_shape_repair_required",
+            level="warning",
+            original_files=len(raw_file_entries),
+            flattened_files=len(flattened_entries),
+            dropped_non_dict_entries=dropped_non_dict,
+            dropped_details=" | ".join(dropped_details)[:1800],
+            parser_succeeded=True,
+        )
         raise ValueError(
-            "Teams agent returned no Terraform files after module/environment selection. "
+            "GENERATION_SHAPE_FAILURE: Teams agent returned no executable Terraform files after normalization. "
             + (f"Agent questions: {detail}" if detail else "A repair generation is required.")
         )
     return payload, dict(payload)

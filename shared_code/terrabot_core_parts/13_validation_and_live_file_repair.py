@@ -3456,7 +3456,7 @@ def _validated_repository_boolean_strategy(
             ],
         }
         try:
-            _conversation, raw = call_named_agent(AGENT_NAME, None, json.dumps(transition_request, ensure_ascii=False))
+            raw = call_named_agent(json.dumps(transition_request, ensure_ascii=False), AGENT_NAME)
             parsed = extract_json_from_text(raw)
             target = str((parsed or {}).get("new_value") or "").strip().lower() if isinstance(parsed, dict) else ""
             current = str(fixed.get("current_value") or "").strip().lower()

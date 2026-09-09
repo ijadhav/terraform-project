@@ -42,6 +42,10 @@ FAILURE_CLASSES = {
     "CONTEXT_REVALIDATION_FAILURE",     # Context record failed live revalidation
     "FAILED_VALIDATION_BRANCH_PUSHED",  # Diagnostic branch pushed after all repairs failed
     "TARGET_RESOLUTION_FAILURE",        # Kept: generic target resolution failed
+    "GENERATION_SHAPE_FAILURE",          # Agent/backend produced no executable Terraform files or malformed files[]
+    "CREATION_WORKFLOW_ROUTING_FAILURE", # Creation prompt stopped in clarification or wrong workflow before preview
+    "BOOLEAN_CONTEXT_ATTACHMENT_FAILURE",# Phase 2 context was retrieved but not attached/reused for generation
+    "QNA_ROUTING_FAILURE",               # Repo Q&A leaked into infra generation or failed as a conversation answer
 }
 
 
@@ -66,14 +70,23 @@ def _cursor_failure(case: Any, result: Any) -> str:
 
 def classify_result(case: Any, result: Any) -> str:  # noqa: C901 – intentionally ordered
     # Repo Q&A intent gate (req 1, 15)
-    if getattr(result, "repo_qna_intent_failure", False):
-        return "REPO_QNA_INTENT_FAILURE"
+    if getattr(result, "repo_qna_intent_failure", False) or getattr(result, "qna_routing_failed", False):
+        return "QNA_ROUTING_FAILURE"
 
     if getattr(result, "error", ""):
         return "BACKEND_OR_HARNESS_FAILURE"
 
     if getattr(result, "creation_case_invalid", False):
         return "CREATION_CASE_INVALID"
+
+    if getattr(result, "creation_workflow_routing_failed", False):
+        return "CREATION_WORKFLOW_ROUTING_FAILURE"
+
+    if getattr(result, "generation_shape_failed", False):
+        return "GENERATION_SHAPE_FAILURE"
+
+    if getattr(result, "boolean_context_attachment_failed", False):
+        return "BOOLEAN_CONTEXT_ATTACHMENT_FAILURE"
 
     if not getattr(result, "expected_target_found", False):
         # Refine generic TARGET_RESOLUTION_FAILURE where we can
@@ -202,5 +215,5 @@ def build_repo_qna_check(
         "cursor_correct": bool(cursor_correct),
         "cursor_reason": cursor_reason,
         "failure_reason": failure_reason,
-        "classification": "PASS" if backend_ok and cursor_correct else "REPO_QNA_INTENT_FAILURE",
+        "classification": "PASS" if backend_ok and cursor_correct else "QNA_ROUTING_FAILURE",
     }

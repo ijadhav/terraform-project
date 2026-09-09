@@ -257,6 +257,10 @@ class TestCaseResult:
     context_revalidation_failed: bool = False
     creation_case_invalid: bool = False
     failed_validation_branch_pushed: bool = False
+    generation_shape_failed: bool = False
+    creation_workflow_routing_failed: bool = False
+    boolean_context_attachment_failed: bool = False
+    qna_routing_failed: bool = False
     diag_branch_name: str = ""
     diag_branch_url: str = ""
     candidate_fingerprints: list[str] = field(default_factory=list)
@@ -1859,6 +1863,8 @@ def _run_case(core: Any, case: TestCase, run_id: str, requester_id: str) -> Test
         else:
             row.validation_ok = False
             row.validation_error = f"Expected infra_preview before branch push, received {phase1_result.get('mode') or '<none>'}."
+            if case.case_type == "resource_creation" and str(phase1_result.get("mode") or "").lower() == "clarification":
+                row.creation_workflow_routing_failed = True
 
         branch_result = phase1_result
         branch_status = status
@@ -1899,6 +1905,13 @@ def _run_case(core: Any, case: TestCase, run_id: str, requester_id: str) -> Test
             "branch_name": row.branch_name,
             "branch_url": row.branch_url,
         })
+        validation_lower = str(row.validation_error or "").lower()
+        if not row.phase1_file_generated and (
+            "no terraform files" in validation_lower
+            or "no executable terraform" in validation_lower
+            or "generation_shape_failure" in validation_lower
+        ):
+            row.generation_shape_failed = True
         _diag(
             "phase1_branch_result",
             run_id=run_id,
@@ -2159,6 +2172,7 @@ def _run_case(core: Any, case: TestCase, run_id: str, requester_id: str) -> Test
         row.phase2_context_backend_defect = bool(
             row.phase2_context_retrieved and not row.phase2_context_attached
         )
+        row.boolean_context_attachment_failed = bool(row.phase2_context_backend_defect)
         if row.phase2_context_backend_defect:
             _diag(
                 "phase2_context_attachment_backend_defect",
