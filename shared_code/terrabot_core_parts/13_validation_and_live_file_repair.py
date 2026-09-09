@@ -2252,47 +2252,10 @@ def build_backend_existing_infra_modification_context(
     except Exception as exc:
         LOGGER.debug("Full Teams repository evidence rehydration skipped: %s", exc)
 
-    # ── REQ 4: Pre-Cursor Boolean auto-resolution shortcut ─────────────────────
-    # Build the literal inventory first. When exactly ONE Boolean assignment
-    # in the environment evidence uniquely matches the request tokens by name/
-    # scope (no Foundry model call required), auto-select it and lock the
-    # target contract immediately. This makes the common case (one unambiguous
-    # flag) deterministic and removes the Foundry/Cursor round-trip entirely.
-    # Foundry semantic ranking is only invoked when the inventory contains
-    # multiple plausible candidates or zero matches.
-    # Python/backend verifies literal existence and current value only;
-    # no hardcoded resource→flag mappings anywhere.
-    _intent = _teams_feature_flag_intent(prompt)
-    _pre_resolved_candidate: dict | None = None
-    if _intent in {"enable", "disable"}:
-        _inventory_for_shortcut = _repository_literal_boolean_inventory(evidence)
-        if _inventory_for_shortcut:
-            _pre_resolved_candidate = _boolean_inventory_unambiguous_match(
-                prompt, _inventory_for_shortcut, _intent
-            )
-            if _pre_resolved_candidate:
-                _teams_diag_log(
-                    "boolean_inventory_single_flag_auto_resolved",
-                    path=_pre_resolved_candidate.get("path",""),
-                    flag=_pre_resolved_candidate.get("flag",""),
-                    current_value=_pre_resolved_candidate.get("current_value",""),
-                    new_value=_pre_resolved_candidate.get("new_value",""),
-                    reason="single_unambiguous_match_skips_foundry_and_cursor",
-                )
-    # ────────────────────────────────────────────────────────────────────────
-
-    if _pre_resolved_candidate:
-        # Bypass both Foundry semantic call and Cursor clarification entirely.
-        strategy = {
-            "operation": "disable" if _intent == "disable" else "enable",
-            "boolean_applicable": True,
-            "reason": "pre_cursor_literal_inventory_single_match",
-            "resolution_source": "backend_boolean_inventory_auto_resolved",
-            "validated_candidate_count": 1,
-            "adjudicated_candidate_count": 1,
-        }
-        candidates = [_pre_resolved_candidate]
-    elif normalized_cloud == "azure":
+    # Semantic target ownership remains with Foundry. The backend may build and
+    # validate a literal Boolean inventory, but it must not select a resource
+    # target using lexical/token overlap before Foundry sees the full evidence.
+    if normalized_cloud == "azure":
         strategy, candidates, strategy_evidence = _teams_resolve_repository_boolean_strategy(
             prompt,
             evidence,
@@ -3165,16 +3128,27 @@ def _verified_immutable_contract_boolean_resolution(inventory: list[dict]) -> di
         line_number = 0
     if not path or not flag or line_number <= 0 or current not in {"true", "false"} or target not in {"true", "false"} or current == target:
         return {}
-    matches = [
+    # The semantic identity of a locked Boolean target is path+flag+polarity.
+    # line_number is an edit anchor, not permission to rediscover another flag
+    # when surrounding repository lines move.
+    exact_matches = [
         item for item in (inventory or [])
         if isinstance(item, dict)
         and str(item.get("path") or "").strip().strip("/") == path
         and str(item.get("flag") or "").strip() == flag
         and int(item.get("line_number") or 0) == line_number
     ]
+    same_target_matches = [
+        item for item in (inventory or [])
+        if isinstance(item, dict)
+        and str(item.get("path") or "").strip().strip("/") == path
+        and str(item.get("flag") or "").strip() == flag
+        and str(item.get("current_value") or "").strip().lower() == current
+    ]
+    matches = exact_matches if len(exact_matches) == 1 else same_target_matches
     if len(matches) != 1:
         LOGGER.warning(
-            "[TerrabotFlow] step=target_contract actor=backend result=rejected reason=live_assignment_count path=%s flag=%s line=%s matches=%s",
+            "[TerrabotFlow] step=target_contract actor=backend result=rejected reason=locked_target_not_uniquely_live path=%s flag=%s line=%s matches=%s",
             path, flag, line_number, len(matches),
         )
         return {}
@@ -3196,6 +3170,8 @@ def _verified_immutable_contract_boolean_resolution(inventory: list[dict]) -> di
         "repository_context_id": str(contract.get("repository_context_id") or ""),
         "resolution_source": "resolved_repository_target_contract",
     }
+    if int(live.get("line_number") or 0) != line_number:
+        candidate["resolution_source"] = "resolved_repository_target_contract_relocated_same_flag"
     LOGGER.info(
         "[TerrabotFlow] step=target_contract actor=backend result=reused path=%s flag=%s old=%s new=%s",
         path, flag, current, target,
@@ -3293,6 +3269,8 @@ def _validated_repository_boolean_strategy(
     # verification. Once verified, it becomes the selected backend target sent
     # to Foundry generation; do not ask Foundry/user to disambiguate it again.
     inventory = _repository_literal_boolean_inventory(repository_evidence)
+    active = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
+    immutable_contract = active.get("resolved_repository_target_contract")
     contract_match = _verified_immutable_contract_boolean_resolution(inventory)
     if contract_match:
         strategy = {
@@ -3306,6 +3284,13 @@ def _validated_repository_boolean_strategy(
             "inventory": inventory,
         }
         return strategy, [contract_match]
+    if isinstance(immutable_contract, dict) and immutable_contract:
+        # Once a target is locked, stale/missing live evidence is a continuity
+        # failure. Never silently reclassify the request onto another flag.
+        raise ValueError(
+            "RESOLVED_TARGET_CONTRACT_INVALID: the immutable repository target "
+            "could not be revalidated against current live evidence; rediscovery is disabled."
+        )
     cursor_match = _verified_cursor_repository_boolean_resolution(inventory)
     if cursor_match:
         strategy = {

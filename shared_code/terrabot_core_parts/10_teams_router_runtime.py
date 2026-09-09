@@ -2765,6 +2765,33 @@ def _teams_attach_repository_context(agent_input: str, active: dict) -> str:
         for item in (search_result.get("results") or [])
         if isinstance(item, dict) and str(item.get("id") or "").strip()
     ]
+    retrieved = bool(selected_ids)
+    attached = bool(context_block)
+    if retrieved and not attached:
+        # A retrieved-but-unattached context state is a backend invariant
+        # violation. Do not call Foundry with a different evidence view than
+        # the reuse diagnostics report.
+        diagnostics = dict(active.get("repository_context_test_diagnostics") or {})
+        diagnostics.update({
+            "searched": True,
+            "retrieved": True,
+            "attached": False,
+            "generation_attached": False,
+            "context_ids": selected_ids,
+            "attachment_invariant_failed": True,
+        })
+        active["repository_context_test_diagnostics"] = diagnostics
+        LOGGER.error(
+            "[TerrabotDiag] event=repository_context_attachment_invariant_failed "
+            "repo=%s/%s retrieved=true attached=false context_ids=%s",
+            owner,
+            repo,
+            ",".join(selected_ids)[:800],
+        )
+        raise ValueError(
+            "REPOSITORY_CONTEXT_ATTACHMENT_REQUIRED: repository context was retrieved "
+            "but was not attached to the Foundry generation payload. Generation aborted."
+        )
     LOGGER.info(
         "[TerrabotDiag] event=repository_context_selection_complete repo=%s/%s selected_count=%s selected_ids=%s",
         owner, repo, len(selected_ids), ",".join(selected_ids)[:800],
@@ -2804,6 +2831,7 @@ def _teams_attach_repository_context(agent_input: str, active: dict) -> str:
             "SHARED CONTEXT DECISION RULE: shared_repository_context is a semantic hint from prior validated repository work. Validate every mapping against shared_repository_context_live_files and the other current live repository evidence before using it.",
             "If a retrieved context item maps the current user phrase to a flag/module/resource and the CURRENT live file still proves that mapping, use that repository control directly; do not ask the user for its file path, variable name, module name, or permission.",
             "If the current live file disproves or no longer contains the mapped control, ignore the stale mapping and continue live repository discovery.",
+            "When a live-verified repository-context record uniquely maps this request to a target, generate immediately. Do not return clarification after attaching that evidence.",
             "When required_repository_context_reuse=true, the required record IDs are a mandatory continuation input. Revalidate their evidence paths against CURRENT live repository content before target selection. If exactly one required mapping remains live-valid, use it directly and do not ask another target clarification.",
         ])
         payload["instructions"] = instructions
