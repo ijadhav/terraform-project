@@ -72,7 +72,7 @@ _MAX_CASES = max(1, min(int(os.getenv("TERRABOT_TEST_RUNNER_MAX_CASES", "10")), 
 _DEFAULT_CASES = max(1, min(int(os.getenv("TERRABOT_TEST_RUNNER_DEFAULT_CASES", "8")), _MAX_CASES))
 _SCAN_FILE_LIMIT = max(10, min(int(os.getenv("TERRABOT_TEST_RUNNER_SCAN_FILES", "45")), 150))
 _TREE_PATH_LIMIT = max(200, min(int(os.getenv("TERRABOT_TEST_RUNNER_TREE_PATH_LIMIT", "12000")), 50000))
-_MAX_PARALLEL_CASES = max(1, min(int(os.getenv("TERRABOT_TEST_RUNNER_MAX_PARALLEL_CASES", "1")), 4))
+_MAX_PARALLEL_CASES = max(1, min(int(os.getenv("TERRABOT_TEST_RUNNER_MAX_PARALLEL_CASES", "2")), 4))
 
 
 def _diag(event: str, level: str = "info", **fields: Any) -> None:
@@ -1485,46 +1485,65 @@ def _resolve_automated_clarifications(
             case=case,
             prompt=original_user_prompt,
         )
-        cursor_resolution = cursor_prompt_provider.resolve_repository_clarification(
-            owner=case.owner,
-            repo=case.repo,
-            commit_sha=case.commit_sha,
-            original_prompt=original_user_prompt,
-            clarification_text=clarification_text,
-            candidates=candidates,
-            # REQ 6: oracle hints are DISABLED by default.
-            # The expected path/flag validates results AFTER generation but must
-            # not rescue production target discovery in normal acceptance tests.
-            # Enable only for explicit diagnostic runs: TERRABOT_TEST_ORACLE_HINT=true.
-            expected_target_hint=(
-                {
-                    "path": case.path,
-                    "flag": case.flag,
-                    "current_value": case.current_value,
-                    "new_value": case.desired_value,
-                    "environment": case.environment,
-                    "alias": case.alias,
-                }
-                if case.case_type == "boolean_context"
-                and os.getenv("TERRABOT_TEST_ORACLE_HINT","false").strip().lower() in {"1","true","yes"}
-                else None
-            ),
-            expected_creation_hint=(
-                {
-                    "target_consumer_path": case.path,
-                    "environment": case.environment,
-                    "alias": case.alias,
-                    "module_hint": case.evidence_line,
-                }
-                if case.case_type == "resource_creation"
-                and os.getenv("TERRABOT_TEST_ORACLE_HINT","false").strip().lower() in {"1","true","yes"}
-                else None
-            ),
-            prompt_author_target_binding=prompt_author_binding,
-            run_id=run_id,
-            case_id=case.case_id,
-            log_event=_diag,
-        )
+        cursor_clarification_enabled = os.getenv(
+            "TERRABOT_TEST_CURSOR_CLARIFICATION_ENABLED", "false"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        if prompt_author_binding or cursor_clarification_enabled:
+            cursor_resolution = cursor_prompt_provider.resolve_repository_clarification(
+                owner=case.owner,
+                repo=case.repo,
+                commit_sha=case.commit_sha,
+                original_prompt=original_user_prompt,
+                clarification_text=clarification_text,
+                candidates=candidates,
+                # REQ 6: oracle hints are DISABLED by default.
+                # The expected path/flag validates results AFTER generation but must
+                # not rescue production target discovery in normal acceptance tests.
+                # Enable only for explicit diagnostic runs: TERRABOT_TEST_ORACLE_HINT=true.
+                expected_target_hint=(
+                    {
+                        "path": case.path,
+                        "flag": case.flag,
+                        "current_value": case.current_value,
+                        "new_value": case.desired_value,
+                        "environment": case.environment,
+                        "alias": case.alias,
+                    }
+                    if case.case_type == "boolean_context"
+                    and os.getenv("TERRABOT_TEST_ORACLE_HINT","false").strip().lower() in {"1","true","yes"}
+                    else None
+                ),
+                expected_creation_hint=(
+                    {
+                        "target_consumer_path": case.path,
+                        "environment": case.environment,
+                        "alias": case.alias,
+                        "module_hint": case.evidence_line,
+                    }
+                    if case.case_type == "resource_creation"
+                    and os.getenv("TERRABOT_TEST_ORACLE_HINT","false").strip().lower() in {"1","true","yes"}
+                    else None
+                ),
+                prompt_author_target_binding=prompt_author_binding,
+                run_id=run_id,
+                case_id=case.case_id,
+                log_event=_diag,
+            )
+        else:
+            cursor_resolution = {
+                "attempted": False,
+                "resolved": False,
+                "resolution_type": "unresolved",
+                "answer": "",
+                "error": "",
+            }
+            _diag(
+                "cursor_clarification_skipped",
+                run_id=run_id,
+                test_case_id=case.case_id,
+                phase=phase,
+                reason="prompt_generation_only",
+            )
         cursor_attempted = bool((cursor_resolution or {}).get("attempted", True))
         cursor_resolved = bool((cursor_resolution or {}).get("resolved"))
         cursor_error = str((cursor_resolution or {}).get("error") or "").strip()
@@ -3278,11 +3297,21 @@ def execute_automated_test_job(core: Any, job: dict) -> str:
         # Deterministic backend checks have already completed and gated every
         # branch push. Run one independent read-only Cursor review across the
         # complete run, then include its verdicts in durable state and Teams.
-        cursor_validation = terrabot_cursor_result_validator.validate_test_run_with_cursor(
-            run_id=run_id,
-            cases=[_cursor_validation_case_payload(item) for item in result.cases],
-        )
-        _apply_cursor_validation_result(run_id, result.cases, cursor_validation)
+        # Cursor post-generation/result validation is intentionally disabled.
+        # Cursor may author prompts, but generated Terraform correctness is owned
+        # by Foundry self-validation plus deterministic backend validators.
+        if terrabot_cursor_result_validator.cursor_result_validation_enabled():
+            cursor_validation = terrabot_cursor_result_validator.validate_test_run_with_cursor(
+                run_id=run_id,
+                cases=[_cursor_validation_case_payload(item) for item in result.cases],
+            )
+            _apply_cursor_validation_result(run_id, result.cases, cursor_validation)
+        else:
+            _diag(
+                "cursor_result_validation_skipped",
+                run_id=run_id,
+                reason="disabled_prompt_generation_only",
+            )
         for index, case_result in enumerate(result.cases, start=1):
             terrabot_test_state.save_case_result(
                 owner_hash, run_id, index, _case_state_payload(case_result)

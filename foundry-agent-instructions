@@ -6636,3 +6636,50 @@ TEMPORARY TEST-HARNESS STABILIZATION ADDENDUM — 2026-09-08
    old_text may be the exact live line; the backend can anchor it with
    line_number. Never keep retrying an ambiguous one-line old_text without the
    line_number anchor.
+
+25. TEST-RUN GENERATION HARDENING — PROMPT-GENERATION-ONLY CURSOR MODE
+
+These rules apply when the backend request contains `test_mode=true`, `mode=infra`,
+`automated_test_case_id`, or a Terrabot automated repository-context test run id.
+
+1. Cursor is not a Terraform validator and is not a Terraform generator in these
+   runs. Treat any Cursor-authored text only as the user's natural-language test
+   prompt. You must generate the Terraform output yourself from live repository
+   evidence and backend-supplied context.
+
+2. Never return raw strings inside `files[]`. Every `files[]` item MUST be an
+   object with either `filename` or `path`, plus `content`. Example:
+   `{"filename":"terraform/dev_aws/dev/main.tf","content":"<complete file>"}`.
+   Do not return `files:["main.tf", "..."]`, `files:["module ..."]`, nested
+   prose, Markdown tables, or JSON-stringified file objects.
+
+3. If the request is a Boolean flip and a live Boolean assignment or
+   `resolved_repository_target` is supplied, generate immediately. Do not ask for
+   path, flag, module, environment, permission, or whether to proceed. Return
+   either a valid `repair_edits[]` response against the exact live line when the
+   backend contract allows it, or the complete final file object with only that
+   one Boolean literal changed.
+
+4. If the request is AWS resource/module consumption and the backend has resolved
+   an environment consumer file, return the complete target consumer file. Preserve
+   the live file as an unchanged prefix and append exactly one sibling module block
+   using the verified module source/pattern. Do not return clarification because
+   non-sensitive inputs are missing; use explicit prompt values, sibling defaults,
+   module defaults, then `__FILL__<input>` placeholders with matching user_fillable.
+
+5. If the request is Azure object-backed creation and live evidence shows the
+   object-backed pattern, return the complete multi-file set in the same response:
+   resource-family `.tf`, `variables.tf` when a new object root is needed, and the
+   target environment `.tfvars`. Do not ask whether variables.tf may be edited or
+   which sibling/object-backed pattern to use.
+
+6. Empty `files[]` is a test failure unless there is a real external blocker: a
+   missing secret/reference value, no environment found, or multiple materially
+   distinct resource targets after full repository traversal. In that case return
+   `mode="clarification"` with structured `candidates[]`; never return a bare
+   free-form question.
+
+7. Before final output, self-check that the JSON parser will see at least one
+   executable Terraform file object for generation requests. If not, fix the
+   response before returning it.
+

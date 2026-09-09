@@ -1121,6 +1121,45 @@ def _teams_coerce_agent_payload_stage1(agent_text: str, context: dict) -> tuple[
         hinted = _teams_resolved_boolean_control_hint(context) if "_teams_resolved_boolean_control_hint" in globals() else {}
         return str((hinted or {}).get("path") or "").strip()
 
+    def _looks_like_terraform_or_tfvars_text(value: str) -> bool:
+        text = str(value or "").strip()
+        if not text:
+            return False
+        if text.startswith("```"):
+            text = re.sub(r"^```[A-Za-z0-9_-]*\s*", "", text).strip()
+            text = re.sub(r"\s*```$", "", text).strip()
+        return bool(
+            re.search(r'(?m)^\s*(terraform|provider|module|resource|data|locals|variable|output)\b(?:\s+"|\s*\{)', text)
+            or re.search(r'(?m)^\s*[A-Za-z_][A-Za-z0-9_]*\s*=\s*(?:true|false|"|\{|\[|[0-9-])', text)
+        )
+
+    def _single_target_from_context() -> str:
+        targets: list[str] = []
+        def add(value: Any) -> None:
+            text = str(value or "").strip().strip("/")
+            if text and text not in targets:
+                targets.append(text)
+        add(_expected_single_target_path())
+        selected_ctx = next((
+            entry for entry in context.get("retrieved_value_context") or []
+            if isinstance(entry, dict) and entry.get("source") == "backend_existing_infra_code_match"
+        ), {})
+        if isinstance(selected_ctx, dict):
+            add(selected_ctx.get("selected_path"))
+            for matched in selected_ctx.get("matched_files") or []:
+                if isinstance(matched, dict):
+                    add(matched.get("path") or matched.get("filename"))
+        target_contract = context.get("resolved_repository_target_contract")
+        if isinstance(target_contract, dict):
+            add(target_contract.get("path"))
+        selected_generation = next((
+            entry for entry in context.get("retrieved_value_context") or []
+            if isinstance(entry, dict) and entry.get("source") == "backend_aws_selected_module_generation_context"
+        ), {})
+        if isinstance(selected_generation, dict):
+            add(selected_generation.get("target_file") or selected_generation.get("path"))
+        return targets[0] if len(targets) == 1 else ""
+
     raw_file_entries = list(payload.get("files") or [])
     flattened_entries: list = []
     for item in raw_file_entries:
@@ -1130,25 +1169,35 @@ def _teams_coerce_agent_payload_stage1(agent_text: str, context: dict) -> tuple[
         else:
             flattened_entries.append(item)
 
-    for item in flattened_entries:
+    index = 0
+    while index < len(flattened_entries):
+        item = flattened_entries[index]
+        index += 1
         if isinstance(item, str):
             # Foundry occasionally returns a files[] entry as a JSON-encoded
-            # string, or as raw HCL text without any wrapper. Run
-            # ctx-20260907-063855 dropped exactly such an entry
-            # (coerced_json_strings=0 dropped_non_dict_entries=1 ->
-            # files_after=0), destroying an otherwise-successful generation.
+            # object/list, raw HCL, or raw tfvars content without any wrapper.
+            # Do not silently drop executable Terraform content; bind it to the
+            # single backend-resolved target when one exists.
+            raw_text = item.strip()
             decoded = None
             try:
-                decoded = json.loads(item)
+                decoded = json.loads(raw_text)
             except Exception:
                 decoded = None
             if isinstance(decoded, dict):
                 item = decoded
                 coerced_json_strings += 1
-            elif re.search(r'(?m)^\s*(resource|module|variable|data|locals|output|provider|terraform)\s*("|{)', item):
-                target = _expected_single_target_path()
+            elif isinstance(decoded, list):
+                flattened_entries[index:index] = decoded
+                coerced_json_strings += 1
+                continue
+            elif _looks_like_terraform_or_tfvars_text(raw_text):
+                target = _single_target_from_context()
                 if target:
-                    item = {"filename": target, "content": item}
+                    if raw_text.startswith("```"):
+                        raw_text = re.sub(r"^```[A-Za-z0-9_-]*\s*", "", raw_text).strip()
+                        raw_text = re.sub(r"\s*```$", "", raw_text).strip()
+                    item = {"filename": target, "content": raw_text}
                     coerced_hcl_strings += 1
                 else:
                     dropped_non_dict += 1
