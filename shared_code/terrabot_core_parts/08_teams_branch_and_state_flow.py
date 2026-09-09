@@ -2217,6 +2217,12 @@ def _handle_teams_chat_request_safe(data: dict):
             and isinstance(request_data.get("cursor_repository_resolution"), dict)
             else {}
         ),
+        "resolved_repository_target_contract": (
+            dict(request_data.get("p1_resolved_target_contract") or request_data.get("resolved_repository_target_contract") or {})
+            if _teams_truthy(request_data.get("test_mode"))
+            and isinstance(request_data.get("p1_resolved_target_contract") or request_data.get("resolved_repository_target_contract"), dict)
+            else {}
+        ),
     }
     context_token = _ACTIVE_TEAMS_FLOW_CONTEXT.set(flow_context)
     try:
@@ -2232,6 +2238,13 @@ def _handle_teams_chat_request_safe(data: dict):
             if isinstance(diagnostics, dict):
                 result = dict(result)
                 result["test_diagnostics"] = {"repository_context": dict(diagnostics)}
+            contract = flow_context.get("resolved_repository_target_contract")
+            if isinstance(contract, dict) and contract:
+                result = dict(result)
+                result["resolved_repository_target_contract"] = dict(contract)
+                existing_diag = dict(result.get("test_diagnostics") or {})
+                existing_diag["resolved_repository_target_contract"] = dict(contract)
+                result["test_diagnostics"] = existing_diag
 
         # AWS create/add/provision requests are execute-now after branch choice.
         # Foundry is not allowed to turn repository placement/module existence

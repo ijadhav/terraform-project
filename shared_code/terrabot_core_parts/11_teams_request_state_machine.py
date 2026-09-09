@@ -726,6 +726,22 @@ def _teams_invocation_resource_aliases(prompt: str) -> list[str]:
         if any(value in text for value in values):
             aliases.extend([canonical, *values])
 
+    # Generic creation wording from automated and real Teams prompts, e.g.
+    # "add a fresh audit dr assignment service around prd-us5 named tb-...".
+    # This is not a hardcoded resource map; it exposes the user's resource
+    # phrase so invocation discovery can score live repository files.
+    creation_phrase_patterns = (
+        r"\b(?:add|create|provision|deploy|build|make)\b\s+(?:a\s+|an\s+|one\s+|another\s+|fresh\s+|new\s+|more\s+)*(.{3,80}?)(?:\s+(?:setup|service|thing|workload|piece|instance))?\s+(?:in|around|for)\s+[a-z0-9_-]+",
+        r"\bwe\s+need\s+(?:a\s+|an\s+|one\s+|another\s+|fresh\s+|new\s+|more\s+)*(.{3,80}?)(?:\s+(?:setup|service|thing|workload|piece|instance))?\s+(?:in|around|for)\s+[a-z0-9_-]+",
+    )
+    for pattern in creation_phrase_patterns:
+        for match in re.finditer(pattern, text, re.IGNORECASE):
+            phrase = re.sub(r"\b(?:setup|service|thing|workload|piece|instance|named|called|as|one|more|fresh|new|another)\b", " ", match.group(1))
+            phrase = re.sub(r"[^a-z0-9_\- ]+", " ", phrase).strip()
+            if len(phrase) >= 3:
+                aliases.append(phrase)
+                aliases.extend([token for token in phrase.split() if len(token) >= 3])
+
     # Capture a non-sensitive requested instance name, e.g. homepage-bff.
     for match in re.finditer(
         r"\b(?:named?|name\s+is|called)\s+[\"']?([a-z0-9][a-z0-9_-]{1,63})",

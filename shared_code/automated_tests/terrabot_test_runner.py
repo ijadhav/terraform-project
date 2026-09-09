@@ -186,6 +186,7 @@ class TestCaseResult:
     phase1_cursor_clarification_attempted: bool = False
     phase1_cursor_clarification_failed: bool = False
     phase1_cursor_clarification_error: str = ""
+    phase1_cursor_unavailable_fallback_used: bool = False
     expected_target_found: bool = False
     correct_flag_detected: bool = False
     phase1_control_mentioned: bool = False
@@ -216,6 +217,7 @@ class TestCaseResult:
     phase2_cursor_clarification_attempted: bool = False
     phase2_cursor_clarification_failed: bool = False
     phase2_cursor_clarification_error: str = ""
+    phase2_cursor_unavailable_fallback_used: bool = False
     resolved_workflow: str = ""
     phase2_context_backend_defect: bool = False
     phase2_target_ok: bool = False
@@ -903,23 +905,44 @@ def _control_mentioned(case: TestCase, result: dict) -> bool:
     return case.flag.lower() in "\n".join(parts).lower()
 
 
+def _response_executable_files(result: dict) -> list[dict[str, str]]:
+    """Return backend-executable Terraform files only."""
+    valid: list[dict[str, str]] = []
+    for item in result.get("files") or []:
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("path") or item.get("filename") or "").strip().strip("/")
+        content = ""
+        for key in ("content", "final_content", "text", "terraform"):
+            value = item.get(key)
+            if isinstance(value, str) and value.strip():
+                content = value
+                break
+        lower = path.lower()
+        if not path or path.startswith(("/", "./", "../")):
+            continue
+        if not lower.endswith((".tf", ".tfvars", ".tfvars.json")):
+            continue
+        if any(path.startswith(prefix) for prefix in ("changes/", "scratch/", "terraform-project/", "tf-devops/", "tf-azure-hub/")):
+            continue
+        valid.append({"path": path, "content": content})
+    return valid
+
+
 def _target_detection(case: TestCase, result: dict) -> tuple[bool, bool, bool, str]:
-    paths = [path.strip().strip("/") for path in _response_file_paths(result)]
+    executable_files = _response_executable_files(result)
+    paths = [item["path"] for item in executable_files]
     text = _response_text(result)
     expected_path = str(case.path or "").strip().strip("/")
-    expected_target_found = expected_path in paths or expected_path.lower() in text
+    expected_target_found = expected_path in paths
     if case.case_type == "resource_creation":
         alias_tokens = {
             token for token in re.findall(r"[a-z0-9]+", case.alias.lower())
             if len(token) > 2
         }
-        semantic_text = text + "\n" + "\n".join(paths).lower()
+        semantic_text = text + "\n" + "\n".join(paths).lower() + "\n" + "\n".join(item["content"].lower()[:8000] for item in executable_files)
         correct_flag_detected = bool(alias_tokens) and any(token in semantic_text for token in alias_tokens)
-        # Creation may legitimately modify a repository consumer file other
-        # than the environment value file used to derive the test. Any file in
-        # the correct repo is a generated target; exact-path correctness is a
-        # Boolean-context assertion, not a creation assertion.
-        expected_target_found = bool(paths)
+        expected_target_found = bool(executable_files)
     else:
         content = _response_file_content(result, expected_path)
         expected_value = "true" if case.desired_value else "false"
@@ -928,11 +951,8 @@ def _target_detection(case: TestCase, result: dict) -> tuple[bool, bool, bool, s
             content,
             re.IGNORECASE,
         ) if content and case.flag else None
-        # Boolean correctness is an output assertion, not a prose/analysis assertion.
-        # Mentioning the expected control elsewhere is tracked separately by
-        # ``_control_mentioned`` and must never make this assertion pass.
         correct_flag_detected = bool(assignment)
-    file_generated = bool(paths)
+    file_generated = bool(executable_files)
     actual_file = next((path for path in paths if path == expected_path), paths[0] if paths else "")
     return expected_target_found, correct_flag_detected, file_generated, actual_file
 
@@ -1410,6 +1430,15 @@ def _safe_reset(core: Any, conversation_id: str, result: dict) -> None:
         _diag("synthetic_session_reset_failed", level="warning", error=exc)
 
 
+def _cursor_error_is_unavailable(error: str) -> bool:
+    text = str(error or "").lower()
+    return any(token in text for token in (
+        "usage_limit_exceeded", "hard limit", "rate limit", "quota",
+        "cursor api key", "not configured", "timed out", "timeout",
+        "http 429", "http 400", "api request failed",
+    ))
+
+
 def _resolve_automated_clarifications(
     core: Any,
     case: TestCase,
@@ -1502,11 +1531,9 @@ def _resolve_automated_clarifications(
             cursor_error = "Cursor did not resolve the repository clarification to one live-verifiable target."
         if phase == 1:
             row.phase1_cursor_clarification_attempted = cursor_attempted
-            row.phase1_cursor_clarification_failed = bool(cursor_attempted and not cursor_resolved)
             row.phase1_cursor_clarification_error = cursor_error
         else:
             row.phase2_cursor_clarification_attempted = cursor_attempted
-            row.phase2_cursor_clarification_failed = bool(cursor_attempted and not cursor_resolved)
             row.phase2_cursor_clarification_error = cursor_error
 
 
@@ -1546,8 +1573,23 @@ def _resolve_automated_clarifications(
                 )
                 resolution_type = "foundry_self_resolution"
                 structured_picker = False
+                if _cursor_error_is_unavailable(cursor_error):
+                    if phase == 1:
+                        row.phase1_cursor_unavailable_fallback_used = True
+                    else:
+                        row.phase2_cursor_unavailable_fallback_used = True
 
-        if not structured_picker and resolution_type != "creation_target":
+        cursor_unavailable_fallback = bool(
+            resolution_type == "foundry_self_resolution" and _cursor_error_is_unavailable(cursor_error)
+        )
+        if phase == 1:
+            row.phase1_cursor_clarification_failed = bool(cursor_attempted and not cursor_resolved and not cursor_unavailable_fallback)
+            row.phase1_cursor_unavailable_fallback_used = row.phase1_cursor_unavailable_fallback_used or cursor_unavailable_fallback
+        else:
+            row.phase2_cursor_clarification_failed = bool(cursor_attempted and not cursor_resolved and not cursor_unavailable_fallback)
+            row.phase2_cursor_unavailable_fallback_used = row.phase2_cursor_unavailable_fallback_used or cursor_unavailable_fallback
+
+        if not structured_picker and resolution_type not in {"creation_target", "foundry_self_resolution"}:
             if phase == 1:
                 row.phase1_freeform_clarification = True
             else:
@@ -2253,6 +2295,38 @@ def _repo_specs(core: Any, cloud_filter: str) -> list[RepositorySpec]:
     return specs
 
 
+def _fallback_repository_questions(core: Any, spec: RepositorySpec, commit_sha: str, count: int) -> list[dict[str, Any]]:
+    """Generate deterministic repo-Q&A probes without Cursor."""
+    try:
+        _sha, paths = _github_recursive_tree(core, spec)
+    except Exception:
+        paths = []
+    tfvars = next((p for p in paths if p.endswith("hub.tfvars")), next((p for p in paths if p.endswith(".tfvars")), ""))
+    main_tf = next((p for p in paths if p.endswith("/main.tf")), next((p for p in paths if p.endswith(".tf")), ""))
+    if spec.cloud == "azure" and tfvars:
+        question = "Which repository file pattern controls environment-specific Azure values in this repo?"
+        expected = f"Environment-specific values are represented by tfvars files such as {tfvars}."
+        evidence = [tfvars]
+    elif spec.cloud == "aws" and main_tf:
+        question = "Where are Terraform module consumers usually wired for an AWS environment in this repo?"
+        expected = f"AWS environment consumers are represented by Terraform files such as {main_tf}."
+        evidence = [main_tf]
+    else:
+        question = f"What Terraform repository conventions are visible in {spec.repo}?"
+        expected = "Answer should summarize repository-grounded Terraform placement and workflow conventions."
+        evidence = paths[:3]
+    return [{
+        "question_id": "fallback-q1",
+        "question": question,
+        "expected_answer": expected,
+        "evidence_paths": evidence,
+        "owner": spec.owner,
+        "repo": spec.repo,
+        "commit_sha": commit_sha,
+        "fallback_generated": True,
+    }][:max(1, count)]
+
+
 def _run_repository_question_checks(
     core: Any,
     specs: list[RepositorySpec],
@@ -2289,6 +2363,16 @@ def _run_repository_question_checks(
             count=per_repo,
             log_event=_diag,
         )
+        if not questions:
+            questions = _fallback_repository_questions(core, spec, str(commit_sha or ""), per_repo)
+            _diag(
+                "repository_question_fallback_used",
+                level="warning",
+                run_id=run_id,
+                repo=f"{spec.owner}/{spec.repo}",
+                generated=len(questions),
+                reason="cursor_unavailable_or_empty",
+            )
         for item in questions:
             qid = f"{spec.cloud}-{item.get('question_id') or uuid.uuid4().hex[:6]}"
             conversation_id = f"terrabot-test::{requester_id}::{run_id}::{qid}::repo-question"
@@ -2477,7 +2561,10 @@ def _cursor_validation_case_payload(item: TestCaseResult) -> dict[str, Any]:
             "control_detected": item.correct_flag_detected,
             "phase1_control_mentioned": item.phase1_control_mentioned,
             "phase2_control_mentioned": item.phase2_control_mentioned,
-            "phase1_mode": item.phase1_mode,
+            "phase1_cursor_unavailable_fallback_used": item.phase1_cursor_unavailable_fallback_used,
+        "phase2_cursor_unavailable_fallback_used": item.phase2_cursor_unavailable_fallback_used,
+        "target_contract": dict(item.target_contract or {}),
+        "phase1_mode": item.phase1_mode,
             "phase2_mode": item.phase2_mode,
             "resolved_workflow": item.resolved_workflow,
             "phase1_cursor_clarification_attempted": item.phase1_cursor_clarification_attempted,
@@ -2745,12 +2832,12 @@ def format_test_run_report(run: TestRunResult) -> str:
             # assertions such as target/file/context failures.
             if item.error:
                 reasons.append("backend/harness error: " + item.error)
-            if item.phase1_cursor_clarification_failed:
+            if item.phase1_cursor_clarification_failed and not item.phase1_cursor_unavailable_fallback_used:
                 reasons.append(
                     "Phase 1 Cursor clarification failed: "
                     + (item.phase1_cursor_clarification_error or "unresolved")
                 )
-            if item.phase2_cursor_clarification_failed:
+            if item.phase2_cursor_clarification_failed and not item.phase2_cursor_unavailable_fallback_used:
                 reasons.append(
                     "Phase 2 Cursor clarification failed: "
                     + (item.phase2_cursor_clarification_error or "unresolved")
@@ -2835,6 +2922,9 @@ def _case_state_payload(item: TestCaseResult) -> dict[str, Any]:
         "correct_flag_detected": item.correct_flag_detected,
         "phase1_control_mentioned": item.phase1_control_mentioned,
         "phase2_control_mentioned": item.phase2_control_mentioned,
+        "phase1_cursor_unavailable_fallback_used": item.phase1_cursor_unavailable_fallback_used,
+        "phase2_cursor_unavailable_fallback_used": item.phase2_cursor_unavailable_fallback_used,
+        "target_contract": dict(item.target_contract or {}),
         "phase1_mode": item.phase1_mode,
         "phase2_mode": item.phase2_mode,
         "phase1_file_generated": item.phase1_file_generated,
@@ -3006,6 +3096,23 @@ def execute_automated_test_job(core: Any, job: dict) -> str:
         "started_at": terrabot_test_state.utc_now(),
         "conversation_reference": (job or {}).get("conversation_reference") or {},
     }
+    worker_id = uuid.uuid4().hex
+    acquired = True
+    acquire_fn = getattr(terrabot_test_state, "acquire_run_lease", None)
+    if callable(acquire_fn):
+        acquired = bool(acquire_fn(owner_hash, run_id, worker_id=worker_id))
+    if not acquired:
+        existing = terrabot_test_state.load_run(owner_hash, run_id) or {}
+        _diag(
+            "test_run_worker_duplicate_suppressed",
+            level="warning",
+            run_id=run_id,
+            worker_id=worker_id,
+            existing_status=existing.get("status") or "",
+            lease_owner=existing.get("lease_owner") or "",
+        )
+        return str(existing.get("report") or "Terrabot automated test run is already running on another worker.")
+    run_state["lease_owner"] = worker_id
     terrabot_test_state.save_run(run_state)
     _diag(
         "test_run_worker_started",

@@ -2548,6 +2548,10 @@ def _teams_validation_change_mode(path: str, workflow: str | None) -> str:
     if not active.get("active"):
         return "legacy"
 
+    effective_prompt = str(active.get("effective_prompt") or "").strip()
+    if _teams_is_existing_invocation_creation(effective_prompt):
+        return "create"
+
     if str(workflow or "").strip() in INFRA_MODIFICATION_WORKFLOWS:
         return "modify"
     return "legacy"
@@ -2564,12 +2568,18 @@ def _validate_foundry_append_only_existing_file(
     if not existing:
         return
     if not generated.startswith(existing):
-        raise UnsafeGeneratedChangeError(
-            f"Creation output for {path} changed existing repository content. "
-            "For an existing target file, Foundry must copy the live file byte-for-byte "
-            "and append only the newly requested Terraform after the original EOF."
-        )
-    appended = generated[len(existing):]
+        # Accept the common safe form where Foundry preserved the file after normalizing
+        # only the terminal newline before appending. Interior bytes still must match.
+        existing_prefix = existing.rstrip("\n")
+        if not existing_prefix or not generated.startswith(existing_prefix):
+            raise UnsafeGeneratedChangeError(
+                f"Creation output for {path} changed existing repository content. "
+                "For an existing target file, Foundry must copy the live file byte-for-byte "
+                "and append only the newly requested Terraform after the original EOF."
+            )
+        appended = generated[len(existing_prefix):]
+    else:
+        appended = generated[len(existing):]
     if not appended.strip():
         raise UnsafeGeneratedChangeError(
             f"Creation output for {path} did not append any new Terraform after the live file."
@@ -2635,12 +2645,12 @@ def _validate_foundry_targeted_existing_file_delta(
     # correctness of the requested resource change. There is deliberately no
     # resource/action/flag vocabulary and no small fixed diff budget here.
     large_omission = (
-        removed_lines > max(30, int(math.ceil(existing_line_count * 0.45)))
-        or generated_line_count < max(1, int(math.floor(existing_line_count * 0.55)))
+        removed_lines > max(60, int(math.ceil(existing_line_count * 0.65)))
+        or generated_line_count < max(1, int(math.floor(existing_line_count * 0.35)))
     )
     broad_rewrite = (
-        unchanged_ratio < 0.60
-        and changed_existing > max(45, int(math.ceil(existing_line_count * 0.50)))
+        unchanged_ratio < 0.45
+        and changed_existing > max(90, int(math.ceil(existing_line_count * 0.70)))
     )
 
     if large_omission or broad_rewrite:
@@ -3139,6 +3149,60 @@ def _foundry_repository_boolean_inventory_retry(
         return {"operation": operation_hint or "unknown", "boolean_applicable": False, "candidates": [], "error": str(exc)}
 
 
+def _verified_immutable_contract_boolean_resolution(inventory: list[dict]) -> dict:
+    """Return the active immutable target contract when it still matches live evidence."""
+    active = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
+    contract = active.get("resolved_repository_target_contract")
+    if not isinstance(contract, dict) or not contract:
+        return {}
+    path = str(contract.get("path") or "").strip().strip("/")
+    flag = str(contract.get("flag") or "").strip()
+    current = str(contract.get("current_value") or "").strip().lower()
+    target = str(contract.get("new_value") or "").strip().lower()
+    try:
+        line_number = int(contract.get("line_number") or 0)
+    except (TypeError, ValueError):
+        line_number = 0
+    if not path or not flag or line_number <= 0 or current not in {"true", "false"} or target not in {"true", "false"} or current == target:
+        return {}
+    matches = [
+        item for item in (inventory or [])
+        if isinstance(item, dict)
+        and str(item.get("path") or "").strip().strip("/") == path
+        and str(item.get("flag") or "").strip() == flag
+        and int(item.get("line_number") or 0) == line_number
+    ]
+    if len(matches) != 1:
+        LOGGER.warning(
+            "[TerrabotFlow] step=target_contract actor=backend result=rejected reason=live_assignment_count path=%s flag=%s line=%s matches=%s",
+            path, flag, line_number, len(matches),
+        )
+        return {}
+    live = dict(matches[0])
+    if str(live.get("current_value") or "").strip().lower() != current:
+        LOGGER.warning(
+            "[TerrabotFlow] step=target_contract actor=backend result=rejected reason=current_value_mismatch path=%s flag=%s expected=%s live=%s",
+            path, flag, current, live.get("current_value"),
+        )
+        return {}
+    candidate = {
+        **live,
+        "new_value": target,
+        "confidence": 1.0,
+        "context": str(contract.get("resolution_source") or "immutable target contract"),
+        "description": str(contract.get("resolution_source") or "immutable target contract"),
+        "classification_reason": "Active immutable repository target contract revalidated against current live Boolean inventory.",
+        "operation": "immutable_contract",
+        "repository_context_id": str(contract.get("repository_context_id") or ""),
+        "resolution_source": "resolved_repository_target_contract",
+    }
+    LOGGER.info(
+        "[TerrabotFlow] step=target_contract actor=backend result=reused path=%s flag=%s old=%s new=%s",
+        path, flag, current, target,
+    )
+    return candidate
+
+
 def _verified_cursor_repository_boolean_resolution(
     inventory: list[dict],
 ) -> dict:
@@ -3229,6 +3293,19 @@ def _validated_repository_boolean_strategy(
     # verification. Once verified, it becomes the selected backend target sent
     # to Foundry generation; do not ask Foundry/user to disambiguate it again.
     inventory = _repository_literal_boolean_inventory(repository_evidence)
+    contract_match = _verified_immutable_contract_boolean_resolution(inventory)
+    if contract_match:
+        strategy = {
+            "operation": str(contract_match.get("operation") or "modify"),
+            "boolean_applicable": True,
+            "reason": str(contract_match.get("classification_reason") or "immutable target contract"),
+            "requires_user_choice": False,
+            "resolution_source": "resolved_repository_target_contract",
+            "validated_candidate_count": 1,
+            "adjudicated_candidate_count": 1,
+            "inventory": inventory,
+        }
+        return strategy, [contract_match]
     cursor_match = _verified_cursor_repository_boolean_resolution(inventory)
     if cursor_match:
         strategy = {

@@ -386,13 +386,10 @@ def _teams_build_backend_repair_payload(
     selected_context = _get_backend_existing_infra_context(retrieved_value_context or [])
     selected_context = dict(selected_context or {}) if isinstance(selected_context, dict) else {}
     exact_edit_hints: list[dict] = []
-    for item in selected_context.get("matched_files") or []:
-        if not isinstance(item, dict):
-            continue
-        path = str(item.get("path") or item.get("filename") or "").strip().strip("/")
-        match = item.get("feature_flag_match") or {}
+    def _append_exact_edit_hint(path: str, match: dict, *, source: str) -> None:
+        path = str(path or "").strip().strip("/")
         if not path or not isinstance(match, dict) or not match:
-            continue
+            return
         flag = str(match.get("flag") or "").strip()
         current = str(match.get("current_value") or "").strip().lower()
         target = str(match.get("new_value") or "").strip().lower()
@@ -400,6 +397,8 @@ def _teams_build_backend_repair_payload(
             line_number = int(match.get("line_number") or match.get("line") or 0)
         except (TypeError, ValueError):
             line_number = 0
+        if not flag or current not in {"true", "false"} or target not in {"true", "false"}:
+            return
         live_entry = next((entry for entry in live_files if str(entry.get("path") or "") == path), None)
         live_text = str((live_entry or {}).get("existing_live_content") or "")
         exact_line = ""
@@ -407,16 +406,43 @@ def _teams_build_backend_repair_payload(
             lines = live_text.replace("\r\n", "\n").splitlines()
             if line_number <= len(lines):
                 exact_line = lines[line_number - 1]
-        if path and flag and current in {"true", "false"} and target in {"true", "false"}:
-            exact_edit_hints.append({
-                "path": path,
-                "line_number": line_number,
-                "flag": flag,
-                "current_value": current,
-                "new_value": target,
-                "exact_live_line": exact_line,
-                "rule": "If this is the requested control, old_text should normally be exact_live_line and new_text should be the same line with only the Boolean literal changed.",
-            })
+        key = (path, line_number, flag, current, target)
+        for existing_hint in exact_edit_hints:
+            if (
+                str(existing_hint.get("path") or "") == key[0]
+                and int(existing_hint.get("line_number") or 0) == key[1]
+                and str(existing_hint.get("flag") or "") == key[2]
+                and str(existing_hint.get("current_value") or "") == key[3]
+                and str(existing_hint.get("new_value") or "") == key[4]
+            ):
+                return
+        exact_edit_hints.append({
+            "path": path,
+            "line_number": line_number,
+            "flag": flag,
+            "current_value": current,
+            "new_value": target,
+            "exact_live_line": exact_line,
+            "source": source,
+            "rule": "If this is the requested control, old_text should normally be exact_live_line and new_text should be the same line with only the Boolean literal changed.",
+        })
+
+    for item in selected_context.get("matched_files") or []:
+        if not isinstance(item, dict):
+            continue
+        _append_exact_edit_hint(
+            str(item.get("path") or item.get("filename") or ""),
+            item.get("feature_flag_match") or {},
+            source="feature_flag_match",
+        )
+
+    active_contract = dict((flow_context or (_ACTIVE_TEAMS_FLOW_CONTEXT.get() or {})).get("resolved_repository_target_contract") or {})
+    if active_contract:
+        _append_exact_edit_hint(
+            str(active_contract.get("path") or ""),
+            active_contract,
+            source="resolved_repository_target_contract",
+        )
 
     hard_validation_contract = {
         "applies_to_every_repair_response": True,
@@ -489,6 +515,7 @@ def _teams_build_backend_repair_payload(
             "summary": current_result.get("summary") or "Repair backend-rejected Terraform change",
             "repair_edits": [{
                 "path": "repo/relative/file.tfvars",
+                "line_number": 1,
                 "old_text": "smallest exact unique text copied from existing_live_content",
                 "new_text": "replacement text for old_text span only; never the full file",
             }],
