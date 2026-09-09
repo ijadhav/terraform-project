@@ -6,7 +6,7 @@ import hashlib
 import hmac
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
 from html import escape as xml_escape
 from typing import Any
@@ -65,12 +65,59 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+
+
+def _parse_utc(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _lease_duration_seconds(default: int = 900) -> int:
+    try:
+        configured = int(os.getenv("TERRABOT_TEST_RUNNER_LEASE_SECONDS", str(default)))
+    except (TypeError, ValueError):
+        configured = default
+    return max(120, min(configured, 21600))
+
+
+def _lease_expiry(now: datetime | None = None, lease_seconds: int | None = None) -> str:
+    base = now or datetime.now(timezone.utc)
+    seconds = _lease_duration_seconds() if lease_seconds is None else max(120, min(int(lease_seconds or 0), 21600))
+    return (base + timedelta(seconds=seconds)).isoformat()
+
+
+def _lease_is_active(entity: dict[str, Any], *, now: datetime | None = None) -> bool:
+    status = str((entity or {}).get("status") or "").strip().lower()
+    if status != "running":
+        return False
+    expires = _parse_utc((entity or {}).get("lease_expires_at"))
+    return bool(expires and expires > (now or datetime.now(timezone.utc)))
+
 def save_run(run: dict[str, Any]) -> None:
     item = dict(run or {})
     run_id = str(item.get("run_id") or "").strip()
     owner_hash = str(item.get("requester_hash") or "").strip()
     if not run_id or not owner_hash:
         raise ValueError("run_id and requester_hash are required for automated-test state.")
+    existing_lease: dict[str, Any] = {}
+    if str(item.get("status") or "").strip().lower() == "running" and not item.get("lease_expires_at"):
+        try:
+            existing = dict(_table_client().get_entity(partition_key=owner_hash, row_key=f"run::{run_id}"))
+            existing_lease = {
+                "lease_owner": str(existing.get("lease_owner") or ""),
+                "lease_acquired_at": str(existing.get("lease_acquired_at") or ""),
+                "lease_expires_at": str(existing.get("lease_expires_at") or ""),
+            }
+        except Exception:
+            existing_lease = {}
     entity = {
         "PartitionKey": owner_hash,
         "RowKey": f"run::{run_id}",
@@ -90,19 +137,19 @@ def save_run(run: dict[str, Any]) -> None:
         "report": str(item.get("report") or "")[:60000],
         "discovery_errors_json": json.dumps(item.get("discovery_errors") or [], ensure_ascii=False)[:60000],
         "conversation_reference_json": json.dumps(item.get("conversation_reference") or {}, ensure_ascii=False)[:60000],
-        "lease_owner": str(item.get("lease_owner") or "")[:128],
-        "lease_acquired_at": str(item.get("lease_acquired_at") or ""),
-        "lease_expires_at": str(item.get("lease_expires_at") or ""),
+        "lease_owner": str(item.get("lease_owner") or existing_lease.get("lease_owner") or "")[:128],
+        "lease_acquired_at": str(item.get("lease_acquired_at") or existing_lease.get("lease_acquired_at") or ""),
+        "lease_expires_at": str(item.get("lease_expires_at") or existing_lease.get("lease_expires_at") or ""),
     }
     _table_client().upsert_entity(entity=entity, mode=UpdateMode.REPLACE)
 
 
-def acquire_run_lease(owner_hash: str, run_id: str, *, worker_id: str, lease_seconds: int = 21600) -> bool:
-    """Atomically claim one queued automated-test run for a single worker.
+def acquire_run_lease(owner_hash: str, run_id: str, *, worker_id: str, lease_seconds: int = 900) -> bool:
+    """Atomically claim a queued/retry run or take over an expired running lease.
 
-    Azure Queue messages can be delivered more than once and multiple Functions
-    hosts may process the same run_id concurrently. This conditional Table update
-    makes sequential mean one worker per run, not only one thread per worker.
+    A stale Azure Functions invocation can leave the run row in status=running.
+    The lease expiry, not the permanent status value, is the source of truth for
+    whether a replacement worker may continue the run.
     """
     owner = str(owner_hash or "").strip()
     run = str(run_id or "").strip()
@@ -115,44 +162,94 @@ def acquire_run_lease(owner_hash: str, run_id: str, *, worker_id: str, lease_sec
         entity = dict(table.get_entity(partition_key=owner, row_key=row_key))
     except Exception:
         return False
+
+    now_dt = datetime.now(timezone.utc)
+    now = now_dt.isoformat()
     status = str(entity.get("status") or "").strip().lower()
-    if status not in {"queued", "retry", ""}:
+    active_owner = str(entity.get("lease_owner") or "").strip()
+    expires_at = _parse_utc(entity.get("lease_expires_at"))
+    running_active = bool(status == "running" and active_owner and expires_at and expires_at > now_dt)
+
+    if status in {"completed", "failed", "cancelled"}:
         return False
-    acquired_at = utc_now()
-    try:
-        from datetime import timedelta
-        expires_at = (datetime.now(timezone.utc) + timedelta(seconds=max(60, int(lease_seconds or 21600)))).isoformat()
-    except Exception:
-        expires_at = ""
+    if running_active and active_owner != worker:
+        return False
+    if status not in {"queued", "retry", "", "running"}:
+        return False
+
     entity.update({
         "status": "running",
-        "started_at": str(entity.get("started_at") or acquired_at),
-        "updated_at": acquired_at,
+        "started_at": str(entity.get("started_at") or now),
+        "updated_at": now,
         "lease_owner": worker[:128],
-        "lease_acquired_at": acquired_at,
-        "lease_expires_at": expires_at,
+        "lease_acquired_at": now,
+        "lease_expires_at": _lease_expiry(now_dt, lease_seconds),
     })
     etag = entity.get("etag") or entity.get("ETag") or entity.get("_etag")
     try:
         if MatchConditions is not None and etag:
             table.update_entity(entity=entity, mode=UpdateMode.REPLACE, etag=etag, match_condition=MatchConditions.IfNotModified)
         else:
-            # Last-resort local/legacy SDK fallback: update only after the queued-state check above.
             table.update_entity(entity=entity, mode=UpdateMode.REPLACE)
         return True
     except Exception:
         return False
 
 
-def release_run_lease(owner_hash: str, run_id: str, *, worker_id: str) -> None:
-    """Best-effort lease cleanup after a terminal run state is saved."""
+def renew_run_lease(owner_hash: str, run_id: str, *, worker_id: str, lease_seconds: int = 900) -> bool:
+    """Extend the active worker lease. Returns False if this worker no longer owns it."""
+    owner = str(owner_hash or "").strip()
+    run = str(run_id or "").strip()
+    worker = str(worker_id or "").strip()
+    if not owner or not run or not worker:
+        return False
+    table = _table_client()
+    try:
+        entity = dict(table.get_entity(partition_key=owner, row_key=f"run::{run}"))
+    except Exception:
+        return False
+    if str(entity.get("lease_owner") or "") != worker:
+        return False
+    if str(entity.get("status") or "").strip().lower() != "running":
+        return False
+    now_dt = datetime.now(timezone.utc)
+    entity.update({
+        "updated_at": now_dt.isoformat(),
+        "lease_expires_at": _lease_expiry(now_dt, lease_seconds),
+    })
+    try:
+        table.update_entity(entity=entity, mode=UpdateMode.MERGE)
+        return True
+    except Exception:
+        return False
+
+
+def active_run_lease(owner_hash: str, run_id: str) -> dict[str, Any]:
+    """Return a small snapshot describing whether a running lease is still active."""
     try:
         entity = dict(_table_client().get_entity(partition_key=owner_hash, row_key=f"run::{run_id}"))
+    except Exception:
+        return {"active": False}
+    return {
+        "active": _lease_is_active(entity),
+        "status": str(entity.get("status") or ""),
+        "lease_owner": str(entity.get("lease_owner") or ""),
+        "lease_expires_at": str(entity.get("lease_expires_at") or ""),
+    }
+
+
+def release_run_lease(owner_hash: str, run_id: str, *, worker_id: str) -> None:
+    """Best-effort lease cleanup after normal completion/failure."""
+    try:
+        table = _table_client()
+        entity = dict(table.get_entity(partition_key=owner_hash, row_key=f"run::{run_id}"))
         if str(entity.get("lease_owner") or "") != str(worker_id or ""):
             return
+        entity["lease_owner"] = ""
+        entity["lease_acquired_at"] = ""
         entity["lease_expires_at"] = ""
         entity["updated_at"] = utc_now()
-        _table_client().update_entity(entity=entity, mode=UpdateMode.MERGE)
+        table.update_entity(entity=entity, mode=UpdateMode.MERGE)
     except Exception:
         return
 

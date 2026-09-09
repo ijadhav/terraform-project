@@ -28,6 +28,7 @@ import os
 import re
 import secrets
 import time
+import threading
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
@@ -3072,6 +3073,37 @@ def start_automated_test_run(core: Any, data: dict) -> tuple[dict, int]:
     }, 202
 
 
+
+
+def _test_runner_lease_seconds() -> int:
+    try:
+        configured = int(os.getenv("TERRABOT_TEST_RUNNER_LEASE_SECONDS", "900"))
+    except (TypeError, ValueError):
+        configured = 900
+    return max(120, min(configured, 21600))
+
+
+def _test_runner_lease_heartbeat(owner_hash: str, run_id: str, worker_id: str, stop_event: threading.Event) -> None:
+    lease_seconds = _test_runner_lease_seconds()
+    interval = max(30, min(lease_seconds // 3, 180))
+    renew = getattr(terrabot_test_state, "renew_run_lease", None)
+    if not callable(renew):
+        return
+    while not stop_event.wait(interval):
+        try:
+            ok = bool(renew(owner_hash, run_id, worker_id=worker_id, lease_seconds=lease_seconds))
+            _diag(
+                "test_run_lease_heartbeat",
+                level="info" if ok else "warning",
+                run_id=run_id,
+                worker_id=worker_id,
+                renewed=ok,
+            )
+            if not ok:
+                return
+        except Exception as exc:
+            _diag("test_run_lease_heartbeat_failed", level="warning", run_id=run_id, worker_id=worker_id, error=exc)
+
 def execute_automated_test_job(core: Any, job: dict) -> str:
     """Run one queued test job with durable progress and bounded parallelism."""
     run_id = str((job or {}).get("run_id") or "").strip()
@@ -3097,28 +3129,61 @@ def execute_automated_test_job(core: Any, job: dict) -> str:
         "conversation_reference": (job or {}).get("conversation_reference") or {},
     }
     worker_id = uuid.uuid4().hex
-    acquired = True
+    lease_seconds = _test_runner_lease_seconds()
+    lease_acquired = False
+    heartbeat_stop = threading.Event()
+    heartbeat_thread: threading.Thread | None = None
     acquire_fn = getattr(terrabot_test_state, "acquire_run_lease", None)
     if callable(acquire_fn):
-        acquired = bool(acquire_fn(owner_hash, run_id, worker_id=worker_id))
-    if not acquired:
+        lease_acquired = bool(acquire_fn(owner_hash, run_id, worker_id=worker_id, lease_seconds=lease_seconds))
+    else:
+        lease_acquired = True
+    if not lease_acquired:
         existing = terrabot_test_state.load_run(owner_hash, run_id) or {}
+        lease_snapshot_fn = getattr(terrabot_test_state, "active_run_lease", None)
+        lease_snapshot = lease_snapshot_fn(owner_hash, run_id) if callable(lease_snapshot_fn) else {}
+        active = bool((lease_snapshot or {}).get("active"))
         _diag(
             "test_run_worker_duplicate_suppressed",
             level="warning",
             run_id=run_id,
             worker_id=worker_id,
             existing_status=existing.get("status") or "",
-            lease_owner=existing.get("lease_owner") or "",
+            lease_owner=(lease_snapshot or {}).get("lease_owner") or existing.get("lease_owner") or "",
+            lease_expires_at=(lease_snapshot or {}).get("lease_expires_at") or existing.get("lease_expires_at") or "",
+            active_lease=active,
         )
-        return str(existing.get("report") or "Terrabot automated test run is already running on another worker.")
+        if active:
+            # A healthy worker owns this run; this duplicate queue delivery can
+            # finish normally and Azure may delete only this duplicate message.
+            return str(existing.get("report") or "Terrabot automated test run is already running on another worker.")
+        # No active lease could be proven. Raise so Azure leaves the queue
+        # message retryable instead of deleting the only continuation trigger.
+        raise RuntimeError(f"Terrabot automated test run {run_id} has no active lease; leaving queue message retryable.")
+
+    claimed_state = terrabot_test_state.load_run(owner_hash, run_id) or {}
     run_state["lease_owner"] = worker_id
+    run_state["lease_acquired_at"] = str(claimed_state.get("lease_acquired_at") or terrabot_test_state.utc_now())
+    run_state["lease_expires_at"] = str(claimed_state.get("lease_expires_at") or "")
     terrabot_test_state.save_run(run_state)
+    # Do not carry a stale lease expiry through later REPLACE saves; save_run
+    # preserves the current table lease when running updates omit these fields.
+    run_state.pop("lease_acquired_at", None)
+    run_state.pop("lease_expires_at", None)
+    heartbeat_thread = threading.Thread(
+        target=_test_runner_lease_heartbeat,
+        args=(owner_hash, run_id, worker_id, heartbeat_stop),
+        name=f"terrabot-test-lease-{run_id[-6:]}",
+        daemon=True,
+    )
+    heartbeat_thread.start()
     _diag(
         "test_run_worker_started",
         run_id=run_id,
+        worker_id=worker_id,
         cloud=cloud_filter,
         requested_cases=count,
+        lease_expires_at=run_state.get("lease_expires_at", ""),
         max_parallel_cases=_MAX_PARALLEL_CASES,
     )
 
@@ -3267,6 +3332,9 @@ def execute_automated_test_job(core: Any, job: dict) -> str:
                 "note": "Cursor result validation temporarily disabled; using agent self-validation + backend validation.",
             },
             "report": report,
+            "lease_owner": "",
+            "lease_acquired_at": "",
+            "lease_expires_at": "",
         })
         terrabot_test_state.save_run(run_state)
         _diag(
@@ -3284,6 +3352,9 @@ def execute_automated_test_job(core: Any, job: dict) -> str:
             "completed_at": terrabot_test_state.utc_now(),
             "duration_ms": int((time.monotonic() - started) * 1000),
             "error": str(exc),
+            "lease_owner": "",
+            "lease_acquired_at": "",
+            "lease_expires_at": "",
         })
         terrabot_test_state.save_run(run_state)
         _diag("test_run_worker_failed", level="error", run_id=run_id, error=exc)
@@ -3294,6 +3365,21 @@ def execute_automated_test_job(core: Any, job: dict) -> str:
             f"Error: `{str(exc)[:1500]}`\n\n"
             f"Search Function App logs with `run_id={run_id}` for the complete trace."
         )
+    finally:
+        if lease_acquired:
+            heartbeat_stop.set()
+            if heartbeat_thread is not None:
+                try:
+                    heartbeat_thread.join(timeout=5)
+                except Exception:
+                    pass
+            release_fn = getattr(terrabot_test_state, "release_run_lease", None)
+            if callable(release_fn):
+                try:
+                    release_fn(owner_hash, run_id, worker_id=worker_id)
+                    _diag("test_run_lease_released", run_id=run_id, worker_id=worker_id)
+                except Exception as release_exc:
+                    _diag("test_run_lease_release_failed", level="warning", run_id=run_id, worker_id=worker_id, error=release_exc)
 
 def handle_teams_automated_test_request(core: Any, data: dict) -> tuple[dict, int]:
     """Queue a private test run or return durable status; never block Teams."""
