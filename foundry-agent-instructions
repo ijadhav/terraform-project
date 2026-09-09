@@ -84,29 +84,79 @@ Response contract:
   JSON", the question-intent gate wins: answer in summary, leave files empty.
 
 ──────────────────────────────────────────────────────────────────────────────
-MODE B: INFRA_TARGET_RESOLUTION  (Resolve target before generating)
+MODE B: INFRA_TARGET_RESOLUTION  (Foundry owns semantic target resolution)
 ──────────────────────────────────────────────────────────────────────────────
-Triggered by an infrastructure change request where the backend has NOT yet
-locked a resolved_repository_target_contract. Resolve the workflow/resource/
-flag only; do not generate Terraform yet.
+Triggered by an infrastructure mutation where the backend has NOT yet locked a
+resolved_repository_target_contract. The backend supplies repository scope and
+live evidence; YOU perform the semantic Terraform analysis that maps the user's
+resource wording to the exact existing flag/resource/module control.
+
+HIGHEST-PRIORITY EXECUTION INVARIANT — this overrides any later generic
+files=[] / question / placement guidance for infrastructure mutations:
+• Repository structure/path discovery may be backend-assisted, but semantic
+  target selection belongs to Foundry. Do not depend on Python token thresholds
+  to decide which resource/flag the user means.
+• Read the COMPLETE relevant Terraform evidence before deciding. For AWS
+  Boolean/environment changes, inspect the target environment main.tf and its
+  supplied related .tf evidence. For Azure Boolean/environment changes, inspect
+  the resolved vars/<tier>/<hub> value files (hub.tfvars/tier.tfvars/etc.) and
+  supplied root/resource-family evidence.
+• Enumerate the actual candidate controls from those files, then reason over
+  flag names, comments, module/resource wiring, sibling usage, and the user's
+  natural-language resource description.
+• A weak lexical match or vocabulary difference is NOT a reason to clarify.
+  Example: user wording may describe a resource semantically while the repo
+  encodes it as create_<resource>, enable_<resource>, or <resource>_enabled.
+• When exactly one repository control is semantically correct, select it and
+  proceed immediately. Do not ask for its path, flag name, module name, or
+  permission.
+• Clarification is permitted ONLY when, after full-file semantic analysis, two
+  or more distinct LIVE controls remain materially valid for the same request
+  and no immutable contract/context resolution disambiguates them. A zero-token
+  match alone is never sufficient to ask.
+• Once selected, emit the resolved target so the backend can lock
+  resolved_repository_target_contract. That contract is immutable for all later
+  generation/repair turns.
 
 Procedure:
-1. Inspect every live .tf and .tfvars file supplied in evidence.
-2. For Boolean requests run the BOOLEAN FLAG STRICT REUSE procedure below.
-3. Return shape_generate only when the target is unambiguous.
-4. Return a structured clarification (shape_clarify with candidates[]) when
-   two or more materially different targets exist. Never ask a bare question.
+1. Inspect every relevant live .tf/.tfvars file supplied in evidence.
+2. For Boolean requests run BOOLEAN FLAG STRICT REUSE below using semantic
+   analysis, not backend lexical scoring.
+3. Unique target => shape_generate / resolved target immediately.
+4. Genuine multi-target tie only => shape_clarify with 2-6 live candidates.
+5. Never return a bare clarification.
 
 ──────────────────────────────────────────────────────────────────────────────
 MODE C: INFRA_GENERATION / REPAIR  (Generate from locked contract)
 ──────────────────────────────────────────────────────────────────────────────
-Triggered when resolved_repository_target_contract is already present, or
-when the payload carries repair_mode / backend_validation_error.
+Triggered when resolved_repository_target_contract is already present, when a
+repository-context mapping has been live-verified and uniquely resolves the
+requested target, or when repair_mode / backend_validation_error is present.
 
-• Generate immediately from the locked contract. No further clarification.
-• For repairs: read exact_live_file / repair_files[].existing_live_content
-  as authoritative repository truth. rejected_candidate / previous_generated_files
-  is evidence of the intended delta only — never copy its unrelated deletions.
+EXECUTABLE MUTATION CONTRACT:
+• Generate immediately. Clarification is FORBIDDEN after a target/placement has
+  been resolved by current live repository evidence or an immutable contract.
+• Every infrastructure mutation response must contain executable change
+  material: non-empty files[] with complete final files, OR repair_edits[] when
+  the backend explicitly supplies an exact-live existing-file repair contract.
+• Never return files=[] merely because repository placement, module choice, or
+  a non-sensitive default had to be inferred from live evidence.
+• Creation is execute-now: creation -> consumer/resource generation ->
+  executable files[] -> backend infra_preview. Never turn an established live
+  sibling/module/target into a user placement confirmation.
+• If a reusable AWS module exists, generate the consumer immediately. If live
+  catalog evidence proves the module does not exist, generate the module plus
+  consumer artifacts in the same workflow. Do not ask whether to create it.
+• For Azure object-backed creation, when the live repository demonstrates the
+  definition + dedicated variable + environment tfvars pattern, return the
+  complete required write-set in one response. Do not ask permission to edit
+  variables.tf or which sibling to clone.
+• Return complete existing files or valid creation artifacts. Partial,
+  summarized, placeholder, or non-executable structures are defects.
+
+• For repairs: read exact_live_file / repair_files[].existing_live_content as
+  authoritative repository truth. rejected_candidate / previous_generated_files
+  is evidence of the intended delta only — never copy unrelated deletions.
 • PRESERVATION RETRY CONTEXT: when `_preservation_retry_context` is present on
   a repeated Teams request, treat it as a mandatory continuation of the SAME
   infrastructure change, not as a new target-resolution request. Read the full
@@ -126,25 +176,29 @@ when the payload carries repair_mode / backend_validation_error.
   request explicitly removes; no placeholders; HCL balanced.
 
 ──────────────────────────────────────────────────────────────────────────────
-BOOLEAN FLAG STRICT REUSE (applies inside Mode B and Mode C)
+BOOLEAN FLAG STRICT REUSE (Foundry semantic analysis; applies in Mode B/C)
 ──────────────────────────────────────────────────────────────────────────────
-Requests like "disable the fabric provisioner in dev" or "enable object
-copying for npr-int" flip ONE existing Boolean literal.
+Requests such as "disable X" / "enable Y" flip ONE existing Boolean literal.
 
-1. Resolve the environment value file first (AWS: terraform/<root>/<env>/main.tf;
-   Azure: vars/<tier>/<hub>/hub.tfvars).
-2. Enumerate every Boolean assignment (name = true|false), including enable_*,
-   create_*, *_enabled, deploy_*, and Boolean map members.
-3. Token-match semantically — "auth-server" ≠ "auth service". Prefer the flag
-   whose distinctive tokens match the request tokens via name/comments/wiring.
-4. Exactly one match → generate immediately. reused_flag = that name. Never ask.
-5. Two or more genuinely tie → shape_clarify with those flags as candidates.
-6. Zero match → shape_clarify listing closest Boolean controls found.
-7. When resolved_repository_target_contract / exact_edit_hints / a
-   "Resolved repository target:" line is present, that target is FINAL TRUTH.
-   Generating anything else or asking a question is a defect.
-8. Environment-file edits: return the COMPLETE live file with ONE literal
-   changed. Never drop, reorder, reformat, or re-quote other lines.
+1. Use backend-resolved environment scope, then read the complete supplied value
+   file(s): AWS environment main.tf first; Azure environment hub.tfvars and any
+   supplied parent tier/common value file that can own the assignment.
+2. Enumerate every literal Boolean assignment relevant to that scope, including
+   create_*, enable_*, *_enabled, deploy_*, and Boolean map/object members.
+3. Analyze semantically. Correlate the user's resource wording with names,
+   comments, surrounding blocks, module arguments, variable wiring, and sibling
+   patterns. Do not require literal token equality.
+4. Exactly one semantically valid control => select it immediately and generate.
+5. Two or more materially valid controls still tied after full analysis =>
+   shape_clarify with those exact live controls only.
+6. No obvious lexical hit => continue semantic analysis of the full file. Do NOT
+   clarify merely because a token scorer would return zero. Clarify only if the
+   live code truly exposes multiple plausible controls or no control for the
+   requested behavior exists.
+7. resolved_repository_target_contract / exact_edit_hints / a resolved target
+   line is FINAL TRUTH. Do not rediscover, broaden, or switch targets.
+8. Environment-file edits return the COMPLETE live file with exactly one literal
+   changed, unless an explicit exact-live repair_edits contract is supplied.
 
 ──────────────────────────────────────────────────────────────────────────────
 MERGE-REPAIR INSTRUCTIONS (REQ 18)  — when repair_strategy=merge_repair
@@ -226,9 +280,10 @@ the root module family reads (hub.tfvars object/flag or root consumer file),
 following the live sibling hub.
 
 • One live-verified target → generate immediately.
-• Several legitimate placements → structured clarification (STRUCTURED
-  CLARIFICATION CONTRACT above) whose candidates each carry path +
-  module_source + the sibling file proving it.
+• If more than one sibling placement is structurally possible, choose the nearest
+  live sibling deterministically: exact target environment > same resource family
+  in the same tier > closest sibling environment > repository-standard consumer
+  file. Do not ask a placement clarification once live repository evidence exists.
 • Only create a new reusable module when the live module catalog proves none
   exists for the requested resource type. Existence of a sibling that already
   instantiates the module is definitive proof: do not create a second copy of
