@@ -1151,6 +1151,44 @@ def commit_terraform_files_to_branch_for_teams_with_self_correction(
         max_attempts=effective_max_attempts,
         last_error=str(last_error)[:300],
     )
+    active_after_exhaustion = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
+    diagnostic_push_allowed = bool(
+        active_after_exhaustion.get("allow_failed_validation_branch_push")
+        or active_after_exhaustion.get("test_allow_failed_validation_branch_push")
+    )
+    if diagnostic_push_allowed and current_result.get("files"):
+        try:
+            _teams_diag_log(
+                "commit_pipeline_exhausted_diagnostic_push_start",
+                level="warning",
+                thread=thread_id,
+                files=len(current_result.get("files") or []),
+                last_error=str(last_error)[:500],
+            )
+            branch_writer = globals().get("_TEAMS_SAFE_PREVIOUS_COMMIT_TO_BRANCH")
+            if not callable(branch_writer):
+                branch_writer = globals().get("commit_terraform_files_to_branch_for_teams")
+            diagnostic_result = branch_writer(current_result, prompt, thread_id)
+            if isinstance(diagnostic_result, dict):
+                diagnostic_result = dict(diagnostic_result)
+                diagnostic_result["validation_bypassed"] = True
+                diagnostic_result["validation_bypass_reason"] = str(last_error or "validation exhausted")[:2000]
+                diagnostic_result["failed_validation_branch"] = True
+                diagnostic_result.setdefault("mode", "branch_created")
+                _teams_diag_log(
+                    "commit_pipeline_exhausted_diagnostic_push_success",
+                    level="warning",
+                    thread=thread_id,
+                    branch=diagnostic_result.get("branch") or diagnostic_result.get("branch_name") or "",
+                )
+                return diagnostic_result
+        except Exception as diagnostic_push_error:
+            _teams_diag_log(
+                "commit_pipeline_exhausted_diagnostic_push_failed",
+                level="error",
+                thread=thread_id,
+                error=str(diagnostic_push_error)[:500],
+            )
     # Keep raw validator details in backend diagnostics only. Teams should never
     # receive preservation/truncation internals such as repository line counts.
     raise ValueError(

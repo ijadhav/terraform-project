@@ -2820,30 +2820,35 @@ def _teams_attach_repository_context(agent_input: str, active: dict) -> str:
     retrieved = bool(selected_ids)
     attached = bool(context_block)
     if retrieved and not attached:
-        # A retrieved-but-unattached context state is a backend invariant
-        # violation. Do not call Foundry with a different evidence view than
-        # the reuse diagnostics report.
+        # Self-heal this invariant before the Foundry call. The formatter can
+        # return an empty block for records that are still valid continuation
+        # evidence; attach a compact raw record block instead of aborting or
+        # reporting retrieved=true/attached=false.
+        context_block = _teams_required_repository_context_block(search_result, selected_ids)
+        attached = bool(context_block)
         diagnostics = dict(active.get("repository_context_test_diagnostics") or {})
         diagnostics.update({
             "searched": True,
             "retrieved": True,
-            "attached": False,
-            "generation_attached": False,
+            "attached": attached,
+            "generation_attached": attached,
             "context_ids": selected_ids,
-            "attachment_invariant_failed": True,
+            "attachment_invariant_repaired": attached,
         })
         active["repository_context_test_diagnostics"] = diagnostics
-        LOGGER.error(
-            "[TerrabotDiag] event=repository_context_attachment_invariant_failed "
-            "repo=%s/%s retrieved=true attached=false context_ids=%s",
+        LOGGER.warning(
+            "[TerrabotDiag] event=repository_context_attachment_invariant_repaired "
+            "repo=%s/%s retrieved=true attached=%s context_ids=%s",
             owner,
             repo,
+            attached,
             ",".join(selected_ids)[:800],
         )
-        raise ValueError(
-            "REPOSITORY_CONTEXT_ATTACHMENT_REQUIRED: repository context was retrieved "
-            "but was not attached to the Foundry generation payload. Generation aborted."
-        )
+        if not attached:
+            raise ValueError(
+                "REPOSITORY_CONTEXT_ATTACHMENT_REQUIRED: repository context was retrieved "
+                "but could not be serialized into the Foundry generation payload."
+            )
     LOGGER.info(
         "[TerrabotDiag] event=repository_context_selection_complete repo=%s/%s selected_count=%s selected_ids=%s",
         owner, repo, len(selected_ids), ",".join(selected_ids)[:800],

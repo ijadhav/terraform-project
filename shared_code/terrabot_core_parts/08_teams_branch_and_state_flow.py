@@ -2352,6 +2352,15 @@ def _handle_teams_chat_request_safe(data: dict):
         "repository_context_reuse_required": _teams_truthy(
             request_data.get("repository_context_reuse_required")
         ),
+        # Automated-test diagnostic transport: when explicitly requested by the
+        # harness, still push the last generated candidate to an isolated test
+        # branch after all validation/repair attempts are exhausted so humans
+        # can inspect the actual model output. Production requests never set
+        # this flag.
+        "allow_failed_validation_branch_push": _teams_truthy(
+            request_data.get("allow_failed_validation_branch_push")
+            or request_data.get("test_allow_failed_validation_branch_push")
+        ),
         "resume_after_repository_clarification": _teams_truthy(
             request_data.get("resume_after_repository_clarification")
         ),
