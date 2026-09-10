@@ -833,7 +833,10 @@ def _teams_get_valid_backend_repair(
             working_payload["repair_response_violation"] = (
                 "Your immediately previous INTERNAL repair response was rejected by backend validation. "
                 f"Repair-response error: {exc}. Re-read repair_files[].existing_live_content and return a NEW repair_edits[] response. "
-                "For every existing file, old_text must be copied exactly from existing_live_content; do not repair from rejected_agent_result."
+                "No infra change was found in the rejected/byte-identical code. Use the original_user_request, "
+                "resolved_repository_target, exact_edit_hints, and the exact existing GitHub file content in repair_files[].existing_live_content. "
+                "For every existing file, old_text must be copied exactly from existing_live_content; do not repair from rejected_agent_result. "
+                "The next response must still satisfy every other validator, not only this one failure."
             )
             working_payload["mandatory_next_output"] = {
                 "json_only": True,
@@ -900,12 +903,10 @@ def commit_terraform_files_to_branch_for_teams_with_self_correction(
     configured_attempts = min(5, max(1, int(max_attempts or MAX_TEAMS_SELF_CORRECTION_ATTEMPTS or 5)))
     active_repair_context = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
     immutable_target = active_repair_context.get("resolved_repository_target_contract")
-    # A live-verified single Boolean already has an exact target and transition.
-    # One generation pass + one surgical repair pass is sufficient; additional
-    # outer passes only repeat the same candidate after the internal repair loop
-    # has already exhausted protocol/validation corrections. Complex non-Boolean
-    # requests retain the historical configured outer bound.
-    effective_max_attempts = min(configured_attempts, 2) if isinstance(immutable_target, dict) and immutable_target else configured_attempts
+    # Keep the full configured outer retry depth for immutable Boolean edits as
+    # well. The target remains locked, but the agent receives enough chances to
+    # correct byte-identical or stale-value repair responses.
+    effective_max_attempts = configured_attempts
     _teams_diag_log(
         "commit_pipeline_start",
         thread=thread_id,
@@ -913,7 +914,7 @@ def commit_terraform_files_to_branch_for_teams_with_self_correction(
         max_attempts=effective_max_attempts,
         configured_max_attempts=configured_attempts,
         repair_rounds=effective_max_attempts - 1,
-        internal_repair_attempts=1 if isinstance(immutable_target, dict) and immutable_target else 3,
+        internal_repair_attempts=3,
         immutable_target=bool(isinstance(immutable_target, dict) and immutable_target),
     )
 
@@ -1095,7 +1096,7 @@ def commit_terraform_files_to_branch_for_teams_with_self_correction(
                 current_result = _teams_get_valid_backend_repair(
                     repair_payload,
                     current_result,
-                    max_response_attempts=(1 if isinstance(immutable_target, dict) and immutable_target else 3),
+                    max_response_attempts=3,
                     conversation_id=thread_id,
                 )
                 fp = _candidate_fingerprint(current_result)
@@ -1130,20 +1131,18 @@ def commit_terraform_files_to_branch_for_teams_with_self_correction(
                     attempt=f"{attempt}/{effective_max_attempts}",
                     error=str(repair_call_error)[:200],
                 )
-                # _teams_get_valid_backend_repair already performs its bounded
-                # internal response retries. Re-validating the unchanged rejected
-                # current_result in another OUTER pass cannot improve the diff and
-                # caused the repeated identical failures seen in E2E logs. Stop the
-                # correction chain here; transport/API retries belong inside the
-                # agent call helper, not as another Terraform validation round.
+                # Keep the outer loop alive. The next pass rebuilds the repair
+                # payload from the same exact live GitHub baseline and includes
+                # the prior byte-identical/no-change feedback, instead of giving
+                # up after one exhausted internal repair batch.
                 _teams_diag_log(
-                    "repair_chain_stopped_no_new_candidate",
+                    "repair_chain_continuing_after_no_new_candidate",
                     level="warning",
                     thread=thread_id,
                     attempt=f"{attempt}/{effective_max_attempts}",
                     reason="internal_repair_exhausted_without_valid_new_candidate",
                 )
-                break
+                continue
 
     _teams_diag_log(
         "commit_pipeline_exhausted",

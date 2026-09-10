@@ -286,6 +286,7 @@ def _build_cursor_instruction(cases: Sequence[Any], run_id: str) -> str:
             "6. The prompts should describe the requested behavior naturally. Avoid exposing the expected file path or implementation details unless natural user language requires them.",
             "7. Vary infrastructure language across cases so Terrabot is exercised like a real infra team: creation/provisioning, enablement, disablement/decommissioning/deletion wording, and targeted modification/update wording. Keep each prompt consistent with the immutable desired transition and repository semantics; do not ask for destructive deletion when the immutable test is only a reversible Boolean toggle unless repository evidence shows that users naturally describe that toggle as decommissioning/removal.",
             "8. Prefer developer-style descriptions of the resource behavior over Terraform identifier wording. Use repository vocabulary and nearby module/resource semantics, not a direct humanization of the flag name.",
+            "8a. For creation/provisioning cases, include the concrete resource family from the immutable alias or repository evidence. Do not use vague nouns such as thing, stuff, item, generic setup, or piece as the only resource description.",
             "9. Return JSON only. Do not wrap it in Markdown and do not add commentary.",
             "",
             "Primary Terraform authoring context:",

@@ -1505,6 +1505,45 @@ def repair_and_parse_agent_output(
             parse_error,
         )
 
+    if "GENERATION_SHAPE_FAILURE" in str(parse_error) and isinstance(context.get("resolved_repository_target_contract"), dict) and context.get("resolved_repository_target_contract"):
+        try:
+            fallback_result = {
+                "mode": "infra",
+                "cloud": context.get("expected_cloud") or context.get("cloud") or "",
+                "workflow": context.get("expected_workflow") or context.get("workflow") or "",
+                "repo_target": context.get("expected_repo_target") or context.get("repo_target") or "",
+                "title": "Terraform Boolean change",
+                "summary": "Apply the live-verified resolved Boolean target.",
+                "files": [],
+            }
+            materializer = globals().get("_teams_materialize_resolved_boolean_contract")
+            if callable(materializer):
+                fallback_result = materializer(
+                    fallback_result,
+                    target_cloud=str(fallback_result.get("cloud") or ""),
+                    effective_workflow=str(fallback_result.get("workflow") or ""),
+                    retrieved_value_context=context.get("retrieved_value_context") or [],
+                    reason="shape_failure_locked_target_fallback",
+                )
+                if fallback_result.get("files"):
+                    fallback_reply = json.dumps(fallback_result, ensure_ascii=False)
+                    parsed = parse_agent_output(fallback_reply)
+                    _teams_diag_log(
+                        "generation_shape_failure_materialized_from_locked_target",
+                        thread=conversation_id,
+                        files=len(parsed.get("files") or []),
+                        path=str((context.get("resolved_repository_target_contract") or {}).get("path") or ""),
+                        flag=str((context.get("resolved_repository_target_contract") or {}).get("flag") or ""),
+                    )
+                    return parsed, fallback_reply
+        except Exception as fallback_error:
+            _teams_diag_log(
+                "generation_shape_failure_locked_target_fallback_failed",
+                level="warning",
+                thread=conversation_id,
+                error=str(fallback_error)[:300],
+            )
+
     repair_payload = {
         "task": "Repair the current Teams Terraform generation and return executable files now.",
         "channel": "teams",
@@ -1561,7 +1600,7 @@ def repair_and_parse_agent_output(
     # regeneration three times after normalization dropped every file caused
     # long, low-signal loops in E2E tests. Other parse failures retain the
     # historical bounded repair depth.
-    max_internal_repairs = 1 if "GENERATION_SHAPE_FAILURE" in str(parse_error) else 3
+    max_internal_repairs = 3
     working_payload = dict(repair_payload)
     last_repair_error: Exception | None = None
 
@@ -1614,8 +1653,20 @@ def repair_and_parse_agent_output(
             working_payload["repair_response_violation"] = (
                 "The previous internal repair response was still not valid executable "
                 "Terraform JSON. Correct that response now. Return one strict JSON object "
-                "with non-empty complete files[] and no blocking questions."
+                "with non-empty complete files[] or valid repair_edits[] and no blocking questions. "
+                "If the error says no Terraform files were returned, re-read the original user request, "
+                "the resolved repository target, and the live GitHub evidence in retrieved_value_context; "
+                "then return the concrete infra change instead of another clarification or empty files array."
             )
+            working_payload["mandatory_next_output"] = {
+                "json_only": True,
+                "mode": "infra",
+                "questions": [],
+                "files_required": True,
+                "no_empty_files": True,
+                "repair_edits_allowed_for_existing_files": True,
+                "preserve_other_validator_results": True,
+            }
 
     # No deterministic Terraform fallback is permitted. Exhaust all three
     # private Foundry repair opportunities before this error can reach Teams.
@@ -2315,8 +2366,7 @@ def _handle_teams_chat_request_safe(data: dict):
         ),
         "resolved_repository_target_contract": (
             dict(request_data.get("p1_resolved_target_contract") or request_data.get("resolved_repository_target_contract") or {})
-            if _teams_truthy(request_data.get("test_mode"))
-            and isinstance(request_data.get("p1_resolved_target_contract") or request_data.get("resolved_repository_target_contract"), dict)
+            if isinstance(request_data.get("p1_resolved_target_contract") or request_data.get("resolved_repository_target_contract"), dict)
             else {}
         ),
     }

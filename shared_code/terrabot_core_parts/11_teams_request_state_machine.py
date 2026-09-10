@@ -2904,23 +2904,21 @@ def _prompt_guard_validate_terraform_shape(agent_result: dict) -> None:
 
 
 def _deterministic_resolved_flag_verdict(agent_result: dict, resolved_feature_flag: dict) -> str:
-    """Return 'pass'/'fail'/'unknown' for a backend-resolved Boolean flip.
+    """Mechanically validate an already-resolved Boolean target.
 
-    Run ctx-20260906-182925 lost two of three internal repair attempts to
-    agent_self_validation FALSE POSITIVES on a byte-correct one-line boolean
-    flip ("generated output did not match the current request" and a confused
-    verdict about the evidence payload). For a target that repository
-    resolution has ALREADY literally verified (path + flag + current -> new
-    value), the check is mechanical: the generated file for that path must
-    assign the flag to new_value and must not still assign it current_value.
-    When that holds, skip the nondeterministic model call entirely; when it
-    provably fails, reject without a model call; anything else falls through
-    to the model as before.
+    Prefer the backend/live line_number anchor. If the exact line now contains
+    new_value, pass even if unrelated occurrences of the same token appear in a
+    large tfvars file. If that anchored line still contains current_value, fail.
+    Fall back to whole-file assignment detection only when no anchor is present.
     """
     flag = str((resolved_feature_flag or {}).get("flag") or "").strip()
     path = str((resolved_feature_flag or {}).get("path") or "").strip().strip("/")
     new_value = str((resolved_feature_flag or {}).get("new_value") or "").strip().lower()
     current_value = str((resolved_feature_flag or {}).get("current_value") or "").strip().lower()
+    try:
+        line_number = int((resolved_feature_flag or {}).get("line_number") or 0)
+    except (TypeError, ValueError):
+        line_number = 0
     if not flag or not path or new_value not in {"true", "false"} or current_value not in {"true", "false"}:
         return "unknown"
     target_content = ""
@@ -2934,9 +2932,24 @@ def _deterministic_resolved_flag_verdict(agent_result: dict, resolved_feature_fl
     if not target_content:
         return "unknown"
     assignment = re.compile(
-        rf'(?m)^\s*"?{re.escape(flag)}"?\s*[:=]\s*(true|false)\b'
+        rf'^\s*"?{re.escape(flag)}"?\s*[:=]\s*(true|false)\b',
+        re.IGNORECASE,
     )
-    values = [match.group(1).lower() for match in assignment.finditer(target_content)]
+    lines = target_content.replace("\r\n", "\n").splitlines()
+    if line_number > 0 and line_number <= len(lines):
+        match = assignment.search(lines[line_number - 1])
+        if match:
+            value = match.group(1).lower()
+            if value == new_value:
+                return "pass"
+            if value == current_value:
+                return "fail"
+
+    values = [match.group(1).lower() for match in re.finditer(
+        rf'(?m)^\s*"?{re.escape(flag)}"?\s*[:=]\s*(true|false)\b',
+        target_content,
+        re.IGNORECASE,
+    )]
     if not values:
         return "unknown"
     if all(value == new_value for value in values):

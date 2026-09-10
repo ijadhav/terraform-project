@@ -1519,6 +1519,251 @@ def _teams_materialize_initial_immutable_boolean_response(
         return agent_reply
 
 
+def _teams_bool_literal(value: Any) -> str:
+    text = str(value if value is not None else "").strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return "true"
+    if text in {"0", "false", "no", "off"}:
+        return "false"
+    return text
+
+
+def _teams_iter_context_files(value: Any):
+    """Yield repo-relative path/content pairs from nested backend evidence."""
+    stack = [value]
+    seen_containers: set[int] = set()
+    while stack:
+        current = stack.pop()
+        if isinstance(current, dict):
+            identity = id(current)
+            if identity in seen_containers:
+                continue
+            seen_containers.add(identity)
+            path = str(current.get("path") or current.get("filename") or "").strip().strip("/")
+            content = current.get("content")
+            if path and isinstance(content, str) and content:
+                yield path, content
+            for nested in current.values():
+                if isinstance(nested, (dict, list, tuple)):
+                    stack.append(nested)
+        elif isinstance(current, (list, tuple)):
+            stack.extend(reversed(list(current)))
+
+
+def _teams_find_live_content_for_contract(
+    *,
+    target_path: str,
+    agent_result: dict,
+    retrieved_value_context: list | None,
+    target_cloud: str,
+    effective_workflow: str,
+) -> tuple[str, str]:
+    """Find complete live/current content for an immutable target path."""
+    target_path = str(target_path or "").strip().strip("/")
+    for item in agent_result.get("files") or []:
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("filename") or item.get("path") or "").strip().strip("/")
+        content = item.get("content")
+        if path == target_path and isinstance(content, str) and content:
+            return content, "agent_result"
+
+    for path, content in _teams_iter_context_files(retrieved_value_context or []):
+        if path == target_path:
+            return content, "retrieved_value_context"
+
+    active = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
+    for path, content in _teams_iter_context_files(active):
+        if path == target_path:
+            return content, "active_flow_context"
+
+    refs: list[str] = []
+    for value in (
+        active.get("context_branch"),
+        active.get("existing_branch"),
+        active.get("source_branch"),
+        active.get("branch"),
+    ):
+        ref = str(value or "").strip().replace("refs/heads/", "")
+        if ref and ref not in refs:
+            refs.append(ref)
+    try:
+        repo_target = normalize_repo_target(
+            target_cloud,
+            repo_target=active.get("expected_repo_target") or active.get("repo_target"),
+            workflow=effective_workflow,
+        )
+    except Exception:
+        repo_target = str(active.get("expected_repo_target") or active.get("repo_target") or "")
+    try:
+        ref = str(_teams_remote_context_branch(target_cloud, repo_target, effective_workflow) or "").strip()
+        if ref and ref not in refs:
+            refs.append(ref)
+    except Exception:
+        pass
+    try:
+        ref = str(github_resolve_base_branch_for_cloud(target_cloud, repo_target=repo_target, workflow=effective_workflow) or "").strip()
+        if ref and ref not in refs:
+            refs.append(ref)
+    except Exception:
+        pass
+    for ref in refs:
+        try:
+            live = github_get_file_content(
+                target_cloud,
+                target_path,
+                ref,
+                repo_target=repo_target or None,
+                workflow=effective_workflow or None,
+            )
+        except Exception:
+            live = None
+        if live is not None:
+            return str(live), f"github:{ref}"
+    return "", ""
+
+
+def _teams_apply_boolean_contract_to_content(content: str, contract: dict) -> tuple[str, str]:
+    """Apply an already-resolved path/flag/current->new contract to one file."""
+    flag = str(contract.get("flag") or "").strip()
+    current = _teams_bool_literal(contract.get("current_value"))
+    target = _teams_bool_literal(contract.get("new_value"))
+    try:
+        line_number = int(contract.get("line_number") or 0)
+    except (TypeError, ValueError):
+        line_number = 0
+    if not flag or current not in {"true", "false"} or target not in {"true", "false"} or current == target:
+        raise ValueError("Immutable Boolean contract is incomplete or has no value transition.")
+    text = str(content or "").replace("\r\n", "\n")
+    if not text:
+        raise ValueError("Immutable Boolean target content is empty.")
+    pattern = re.compile(
+        rf'^(?P<prefix>\s*"?{re.escape(flag)}"?\s*[:=]\s*)(?P<value>true|false)(?P<suffix>\s*(?:#.*)?)$',
+        re.IGNORECASE,
+    )
+    lines = text.split("\n")
+
+    def replace_line(index: int) -> tuple[str, str]:
+        line = lines[index]
+        match = pattern.match(line)
+        if not match:
+            raise ValueError(f"Line {index + 1} does not assign {flag}.")
+        value = match.group("value").lower()
+        if value == target:
+            return text, "already_target_value"
+        if value != current:
+            raise ValueError(
+                f"Line {index + 1} assigns {flag}={value}; expected current value {current}."
+            )
+        lines[index] = match.group("prefix") + target + match.group("suffix")
+        return "\n".join(lines), "line_number"
+
+    if line_number > 0 and line_number <= len(lines):
+        try:
+            return replace_line(line_number - 1)
+        except ValueError:
+            # Fall through to unique assignment matching; the line anchor is an
+            # edit hint, not the semantic identity when harmless line drift occurs.
+            pass
+
+    matches = [(idx, pattern.match(line)) for idx, line in enumerate(lines)]
+    matches = [(idx, match) for idx, match in matches if match]
+    current_matches = [(idx, match) for idx, match in matches if match.group("value").lower() == current]
+    target_matches = [(idx, match) for idx, match in matches if match.group("value").lower() == target]
+    if len(current_matches) == 1:
+        return replace_line(current_matches[0][0])
+    if not current_matches and len(target_matches) == 1:
+        return text, "already_target_value"
+    raise ValueError(
+        f"Could not identify one live {flag}={current} assignment to materialize the immutable Boolean contract."
+    )
+
+
+def _teams_materialize_resolved_boolean_contract(
+    agent_result: dict,
+    *,
+    target_cloud: str,
+    effective_workflow: str,
+    retrieved_value_context: list | None,
+    reason: str,
+) -> dict:
+    """Ensure a live-verified immutable Boolean contract is executable.
+
+    This is not semantic generation. The semantic target has already been
+    selected and live-verified. This helper only applies that exact literal
+    transition to complete live bytes when Foundry omitted the file, returned a
+    stale value, or repeated an unchanged candidate.
+    """
+    active = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
+    contract = active.get("resolved_repository_target_contract")
+    if not isinstance(contract, dict) or not contract.get("path") or not contract.get("flag"):
+        return agent_result
+    target_path = str(contract.get("path") or "").strip().strip("/")
+    if not target_path:
+        return agent_result
+    result = dict(agent_result or {})
+    files = [dict(item) for item in (result.get("files") or []) if isinstance(item, dict)]
+    content, source = _teams_find_live_content_for_contract(
+        target_path=target_path,
+        agent_result={**result, "files": files},
+        retrieved_value_context=retrieved_value_context,
+        target_cloud=target_cloud,
+        effective_workflow=effective_workflow,
+    )
+    if not content:
+        return result
+    try:
+        final_content, materialization_source = _teams_apply_boolean_contract_to_content(content, contract)
+    except Exception as exc:
+        _teams_diag_log(
+            "immutable_boolean_contract_materialization_failed",
+            level="warning",
+            path=target_path,
+            flag=str(contract.get("flag") or ""),
+            reason=reason,
+            error=str(exc)[:300],
+        )
+        return result
+
+    replaced = False
+    for item in files:
+        path = str(item.get("filename") or item.get("path") or "").strip().strip("/")
+        if path == target_path:
+            item["filename"] = target_path
+            item["content"] = final_content
+            replaced = True
+            break
+    if not replaced:
+        files.append({"filename": target_path, "content": final_content})
+    result["files"] = files
+    result["workflow"] = effective_workflow or result.get("workflow")
+    result["cloud"] = target_cloud or result.get("cloud")
+    if not result.get("repo_target") and target_cloud:
+        try:
+            result["repo_target"] = normalize_repo_target(target_cloud, workflow=effective_workflow)
+        except Exception:
+            pass
+    diagnostics = active.get("repository_context_test_diagnostics")
+    context_id = str(contract.get("repository_context_id") or contract.get("context_id") or "").strip()
+    if isinstance(diagnostics, dict) and context_id:
+        used = {str(value).strip() for value in (diagnostics.get("used_context_ids") or []) if str(value).strip()}
+        used.add(context_id)
+        diagnostics["used_context_ids"] = sorted(used)
+        diagnostics["reused"] = True
+        diagnostics["mandatory_reuse_satisfied"] = True
+        active["repository_context_test_diagnostics"] = diagnostics
+    _teams_diag_log(
+        "immutable_boolean_contract_materialized",
+        path=target_path,
+        flag=str(contract.get("flag") or ""),
+        reason=reason,
+        content_source=source,
+        materialization_source=materialization_source,
+        files=len(files),
+    )
+    return result
+
+
 def handle_chat_request(data: dict):
     data = data or {}
 
@@ -3965,6 +4210,47 @@ def handle_chat_request(data: dict):
             # repair_edits response is now a normal full-file generation result.
             agent_clarification = _teams_intercept_agent_questions(agent_reply)
             if agent_clarification is not None:
+                creation_like_request = bool(
+                    re.search(r"\b(create|add|provision|deploy|build|make|one more|another|additional|new)\b", effective_prompt, re.IGNORECASE)
+                    or any(
+                        isinstance(item, dict)
+                        and item.get("source") == "backend_existing_infra_code_match"
+                        and (item.get("invocation_generation") or item.get("operation") == "existing_invocation_creation")
+                        for item in (retrieved_value_context or [])
+                    )
+                )
+                if creation_like_request:
+                    no_question_corrective = None
+                    if target_cloud == "azure":
+                        no_question_corrective = _teams_azure_object_backed_no_question_corrective(
+                            effective_prompt, retrieved_value_context
+                        )
+                    if not no_question_corrective:
+                        no_question_corrective = _teams_flagless_creation_corrective(
+                            effective_prompt, retrieved_value_context
+                        )
+                    if no_question_corrective:
+                        _teams_diag_log(
+                            "agent_creation_clarification_forced_to_generation",
+                            thread=conversation_id,
+                            cloud=target_cloud,
+                            workflow=effective_workflow,
+                            clarification=str(agent_clarification)[:240],
+                        )
+                        conversation_id, agent_reply = call_agent(conversation_id, no_question_corrective)
+                        agent_reply = _teams_apply_agent_identity(
+                            agent_reply, target_cloud, effective_workflow
+                        )
+                        agent_reply = _teams_materialize_initial_immutable_boolean_response(
+                            agent_reply,
+                            target_cloud=target_cloud,
+                            effective_workflow=effective_workflow,
+                            effective_prompt=effective_prompt,
+                            retrieved_value_context=retrieved_value_context,
+                            retrieved_module_context=retrieved_module_context,
+                        )
+                        agent_clarification = _teams_intercept_agent_questions(agent_reply)
+            if agent_clarification is not None:
                 return {
                     "ok": False,
                     "mode": "clarification",
@@ -4050,11 +4336,13 @@ def handle_chat_request(data: dict):
                     # exposed to Teams. The backend validates only; it never repairs HCL.
                     validation_error = None
                     repair_feedback = ""
-                    # Complex changes retain the configured bounded depth. A
-                    # live-verified immutable Boolean needs at most one initial
-                    # validation plus one exact-live surgical repair. Continuing
-                    # through five outer rounds only repeats protocol failures and
-                    # increases latency without changing the target or baseline.
+                    # Keep the full bounded validation depth for every workflow,
+                    # including immutable Boolean edits. The previous immutable-
+                    # Boolean fast path capped this loop at 2, so a recoverable
+                    # exact-edit/materialization failure exhausted before Foundry
+                    # received enough corrective turns. The target remains locked;
+                    # the extra attempts only give the same target contract more
+                    # opportunities to converge.
                     configured_validation_passes = min(
                         5, max(1, int(MAX_TEAMS_SELF_CORRECTION_ATTEMPTS or 5))
                     )
@@ -4066,12 +4354,8 @@ def handle_chat_request(data: dict):
                         and immutable_target.get("path")
                         and immutable_target.get("flag")
                     )
-                    generation_validation_passes = (
-                        min(configured_validation_passes, 2)
-                        if immutable_boolean
-                        else configured_validation_passes
-                    )
-                    internal_repair_attempts = 2 if immutable_boolean else 3
+                    generation_validation_passes = configured_validation_passes
+                    internal_repair_attempts = 3
                     # REQ 2: Build immutable hard_validation_contract once before any
                     # generation/repair turn. The same contract is passed into self-validation,
                     # every repair payload, and the final commit validation.
@@ -4088,6 +4372,13 @@ def handle_chat_request(data: dict):
                         paths=",".join(sorted(_hard_val_contract.get("allowed_paths") or []))[:200],
                         boolean_target=bool(_hard_val_contract.get("boolean_target")),
                         preservation_mode=_hard_val_contract.get("preservation_mode",""),
+                    )
+                    agent_result = _teams_materialize_resolved_boolean_contract(
+                        agent_result,
+                        target_cloud=target_cloud,
+                        effective_workflow=effective_workflow,
+                        retrieved_value_context=retrieved_value_context,
+                        reason="pre_validation_locked_target",
                     )
                     _teams_diag_log(
                         "generation_validation_loop_start",
@@ -4363,6 +4654,13 @@ def handle_chat_request(data: dict):
                                         candidate_result["cloud"],
                                         candidate_result.get("repo_target"),
                                         effective_workflow,
+                                    )
+                                    candidate_result = _teams_materialize_resolved_boolean_contract(
+                                        candidate_result,
+                                        target_cloud=target_cloud,
+                                        effective_workflow=effective_workflow,
+                                        retrieved_value_context=retrieved_value_context,
+                                        reason="internal_repair_locked_target",
                                     )
                                     if _teams_repair_candidate_is_identical(agent_result, candidate_result):
                                         raise ValueError(

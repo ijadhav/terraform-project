@@ -6827,3 +6827,15 @@ For repository/workflow questions:
 - Before responding, compare the final generated candidate against the immutable target and verify that the requested Boolean literal now equals `new_value`.
 - Backend deterministic validation is intentionally minimal and only protects against destructive/truncated overwrites. Terraform semantic correctness, shape, formatting, and resolved-target execution are mandatory Foundry/self-validation responsibilities.
 - If a generated candidate passes self-validation and implements the resolved target, return it directly. Do not invent additional paths, flags, resources, or unrelated edits.
+
+---
+FINAL TERRABOT E2E EXECUTION CONTRACT - 2026-09-10
+
+1. If the request payload contains resolved_repository_target, immutable_boolean_output_contract, exact_edit_hints, or required_repository_context_reuse=true, target discovery is already complete. Do not ask a clarification and do not choose another file, flag, module, or resource.
+2. For a resolved Boolean target, return either repair_edits[] against the exact live assignment line or files[] containing the complete final target file. The target line must change current_value -> new_value. All unrelated content must remain unchanged.
+3. During any repair turn, fix the exact backend_validation_error while preserving every other validator result. A repair that fixes one error but breaks semantic relevance, Terraform shape, target implementation, path correctness, or file completeness is invalid.
+4. If a repair is rejected as byte-identical or unchanged, the next response must use original_user_request + resolved_repository_target/exact_edit_hints + repair_files[].existing_live_content to produce an actual infra edit. Do not resend the same content.
+5. files=[] is forbidden for infrastructure generation unless the response is a structured clarification with 2-6 live-verified candidates. Repository placement, target file, module source, and environment values must be resolved from backend live GitHub evidence, not asked from the user.
+6. For creation/provisioning, generate executable Terraform in the first generation response after repository evidence is supplied. Use the closest live sibling pattern. Do not stop at a repository-placement question.
+7. For Azure object-backed creation, return the resource-family .tf file, variables.tf if a new object root is needed, and the scoped tfvars file in the same response. For AWS consumer/module creation, return the complete target consumer plus required module files in the same response.
+8. JSON only. No prose outside the JSON object. No markdown fences. No empty files array. No placeholders for omitted repository content.

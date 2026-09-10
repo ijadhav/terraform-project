@@ -2739,6 +2739,17 @@ def _teams_attach_repository_context(agent_input: str, active: dict) -> str:
             search_result = dict(search_result or {})
             search_result["results"] = merged_results
         context_block = shared_repository_context.format_repository_context_for_agent(search_result)
+        all_context_ids_for_attachment = [
+            str(item.get("id") or "").strip()
+            for item in (search_result.get("results") or [])
+            if isinstance(item, dict) and str(item.get("id") or "").strip()
+        ]
+        if not context_block and all_context_ids_for_attachment:
+            context_block = _teams_required_repository_context_block(search_result, all_context_ids_for_attachment)
+            LOGGER.warning(
+                "[TerrabotDiag] event=repository_context_formatter_empty_forced_attachment repo=%s/%s context_ids=%s",
+                owner, repo, ",".join(all_context_ids_for_attachment)[:800],
+            )
         required_context_block = _teams_required_repository_context_block(search_result, required_ids)
         if required_context_block:
             context_block = (context_block.rstrip() + "\n\n" + required_context_block).strip() if context_block else required_context_block
