@@ -51,7 +51,16 @@ TEST_COMMAND_RE = re.compile(
 )
 TEST_MODE_COMMAND_RE = re.compile(
     r"^\s*run\s+tests\s+(regression|exploration|context-regression|mixed)"
-    r"(?:\s+(aws|azure|all))?(?:\s+(\d{1,2}))?\s*$",
+    r"(?:\s+(aws|azure|all))?(?:\s+(same))?(?:\s+(\d{1,2}))?\s*$",
+    re.IGNORECASE,
+)
+TEST_REPEAT_RE = re.compile(
+    r"^\s*run\s+tests\s+repeat\s+([A-Za-z0-9._:-]+)\s*$",
+    re.IGNORECASE,
+)
+TEST_SAME_SUFFIX_RE = re.compile(
+    r"^\s*run\s+tests\s+(regression|exploration|context-regression|mixed)"
+    r"(?:\s+(aws|azure|all))?\s+(\d{1,2})\s+same\s*$",
     re.IGNORECASE,
 )
 TEST_STATUS_RE = re.compile(
@@ -102,15 +111,20 @@ def _diag(event: str, level: str = "info", **fields: Any) -> None:
 
 def is_automated_test_command(prompt: str) -> bool:
     value = str(prompt or "").strip()
-    return bool(TEST_COMMAND_RE.fullmatch(value) or TEST_MODE_COMMAND_RE.fullmatch(value) or TEST_STATUS_RE.fullmatch(value))
+    return bool(TEST_COMMAND_RE.fullmatch(value) or TEST_MODE_COMMAND_RE.fullmatch(value) or TEST_SAME_SUFFIX_RE.fullmatch(value) or TEST_REPEAT_RE.fullmatch(value) or TEST_STATUS_RE.fullmatch(value))
 
 
 def _parse_command(prompt: str) -> tuple[str, int]:
     value = str(prompt or "").strip()
+    suffix_match = TEST_SAME_SUFFIX_RE.fullmatch(value)
+    if suffix_match:
+        cloud = str(suffix_match.group(2) or "all").lower()
+        count = int(suffix_match.group(3) or _DEFAULT_CASES)
+        return cloud, max(1, min(count, _MAX_CASES))
     mode_match = TEST_MODE_COMMAND_RE.fullmatch(value)
     if mode_match:
         cloud = str(mode_match.group(2) or "all").lower()
-        count = int(mode_match.group(3) or _DEFAULT_CASES)
+        count = int(mode_match.group(4) or _DEFAULT_CASES)
         return cloud, max(1, min(count, _MAX_CASES))
     match = TEST_COMMAND_RE.fullmatch(value)
     if not match:
@@ -121,7 +135,8 @@ def _parse_command(prompt: str) -> tuple[str, int]:
 
 
 def _parse_test_mode(prompt: str) -> str:
-    match = TEST_MODE_COMMAND_RE.fullmatch(str(prompt or "").strip())
+    value = str(prompt or "").strip()
+    match = TEST_MODE_COMMAND_RE.fullmatch(value) or TEST_SAME_SUFFIX_RE.fullmatch(value)
     return str(match.group(1) if match else "regression").lower()
 
 
@@ -650,15 +665,15 @@ def _build_creation_prompt(alias: str, environment: str, *, phase: int, nonce: s
     name = f"tb-{nonce}"
     templates = (
         [
-            "could you add a fresh {vague} setup in {env} named {name}",
-            "we need another {vague} service around {env}; call it {name}",
-            "please provision one more {vague} thing for {env} as {name}",
+            "create another {vague} resource in {env} named {name} using the existing repository pattern",
+            "provision a new {vague} in {env} named {name} following the existing Terraform module pattern",
+            "add another {vague} instance in {env} named {name} using the repository's existing infrastructure pattern",
         ]
         if phase == 1
         else [
-            "set up a new {vague} piece in {env} named {name}",
-            "can {env} get another {vague} instance called {name}",
-            "create a fresh {vague} workload for {env}; use {name}",
+            "create one more {vague} resource in {env} named {name} using the same repository pattern",
+            "add another {vague} instance to {env} called {name} following the existing Terraform pattern",
+            "provision an additional {vague} in {env} named {name} using the established repository convention",
         ]
     )
     return secrets.choice(templates).format(vague=vague, env=env, name=name)
@@ -712,6 +727,21 @@ def _derive_creation_case_for_repository(
 
         safe_modules = [m for m in module_names if _module_is_safe_creation_candidate(m, paths)]
 
+        # Creation cases must be backed by at least one real sibling consumer.
+        # This prevents synthetic prompts for modules that exist in the catalog
+        # but have no proven repository consumption pattern.
+        sibling_consumers: dict[str, str] = {}
+        for sibling_path in environment_paths[:60]:
+            try:
+                sibling_content = core.github_get_file_content_by_repo(spec.owner, spec.repo, sibling_path, ref=spec.branch) or ""
+            except Exception:
+                continue
+            for module_name in safe_modules:
+                if module_name in sibling_consumers:
+                    continue
+                if re.search(rf"modules/{re.escape(module_name)}(?:\b|\")", sibling_content, re.IGNORECASE):
+                    sibling_consumers[module_name] = sibling_path
+
         for env_path in environment_paths[:12]:
             environment = _infer_environment(env_path, "aws")
             if not _candidate_environment_is_valid(core, spec, env_path, environment):
@@ -720,8 +750,11 @@ def _derive_creation_case_for_repository(
             if not content:
                 continue
             for module_name in safe_modules[:30]:
-                # Select a real reusable module that is not already consumed in
-                # this environment, avoiding an already-exists false failure.
+                # Select only a reusable module with a proven sibling consumer,
+                # and ensure it is not already consumed in this target environment.
+                sibling_path = sibling_consumers.get(module_name, "")
+                if not sibling_path or sibling_path == env_path:
+                    continue
                 if re.search(rf"modules/{re.escape(module_name)}(?:\b|\")", content, re.IGNORECASE):
                     continue
                 alias = _humanize_flag(module_name) or module_name.replace("_", " ")
@@ -741,7 +774,7 @@ def _derive_creation_case_for_repository(
                     alias=alias,
                     current_value=False,
                     desired_value=True,
-                    evidence_line=f"terraform/modules/{module_name}",
+                    evidence_line=f"terraform/modules/{module_name}; sibling consumer: {sibling_path}",
                     phase1_prompt=phase1,
                     phase2_prompt=phase2,
                 )
@@ -3038,6 +3071,110 @@ def _status_report(aad_object_id: str, requested_run_id: str = "") -> tuple[dict
     return {"ok": status != "failed", "mode": "automated_test_status", "run_id": run_id, "reply": "\n".join(lines)}, 200
 
 
+def _replay_source_run_id(prompt: str) -> str:
+    repeat = TEST_REPEAT_RE.fullmatch(str(prompt or "").strip())
+    return str(repeat.group(1) or "").strip() if repeat else ""
+
+
+def _same_prompts_requested(prompt: str) -> bool:
+    value = str(prompt or "").strip()
+    suffix = TEST_SAME_SUFFIX_RE.fullmatch(value)
+    if suffix:
+        return True
+    match = TEST_MODE_COMMAND_RE.fullmatch(value)
+    return bool(match and str(match.group(3) or "").lower() == "same")
+
+
+def _case_manifest(cases: list[TestCase]) -> list[dict[str, Any]]:
+    return [{
+        "case_id": c.case_id, "case_type": c.case_type, "cloud": c.cloud,
+        "owner": c.owner, "repo": c.repo, "branch": c.branch, "commit_sha": c.commit_sha,
+        "path": c.path, "environment": c.environment, "flag": c.flag, "alias": c.alias,
+        "current_value": c.current_value, "desired_value": c.desired_value,
+        "evidence_line": c.evidence_line, "phase1_prompt": c.phase1_prompt,
+        "phase2_prompt": c.phase2_prompt,
+    } for c in cases]
+
+
+def _cases_from_manifest(core: Any, manifest: list[dict[str, Any]], run_id: str) -> list[TestCase]:
+    rebuilt: list[TestCase] = []
+    for item in manifest or []:
+        if not isinstance(item, dict):
+            continue
+        cloud = str(item.get("cloud") or "").lower()
+        repo = str(item.get("repo") or "")
+        owner = str(item.get("owner") or getattr(core, "GITHUB_OWNER", "") or "")
+        branch = str(item.get("branch") or (getattr(core, "GITHUB_AWS_BASE_BRANCH", "main") if cloud == "aws" else getattr(core, "GITHUB_AZURE_BASE_BRANCH", "main")) or "main")
+        path = str(item.get("path") or "")
+        flag = str(item.get("flag") or "")
+        current_value = bool(item.get("current_value", False))
+        desired_value = bool(item.get("desired_value", not current_value))
+        # Replay keeps the exact prompts but refreshes the commit SHA. Boolean cases
+        # also refresh the current literal so stale manifests fail explicitly rather than
+        # silently changing semantic targets.
+        try:
+            commit_sha = str(core.github_get_base_branch_sha_by_repo(owner, repo, branch) or item.get("commit_sha") or "")
+        except Exception:
+            commit_sha = str(item.get("commit_sha") or "")
+        if flag and path:
+            try:
+                live = core.github_get_file_content_by_repo(owner, repo, path, ref=branch) or ""
+                m = re.search(rf"(?m)^\s*{re.escape(flag)}\s*=\s*(true|false)\s*(?:#.*)?$", live, re.IGNORECASE)
+                if not m or (m.group(1).lower() == "true") != current_value:
+                    raise ValueError(f"Replay target changed in live repository: {path}::{flag}")
+            except Exception as exc:
+                raise ValueError(f"Cannot replay {item.get('case_id')}: {exc}") from exc
+        rebuilt.append(TestCase(
+            case_id=str(item.get("case_id") or f"replay-{run_id[-6:]}") ,
+            case_type=str(item.get("case_type") or "boolean_context"), cloud=cloud,
+            owner=owner, repo=repo, branch=branch, commit_sha=commit_sha, path=path,
+            environment=str(item.get("environment") or _infer_environment(path, cloud)),
+            flag=flag, alias=str(item.get("alias") or (_humanize_flag(flag) if flag else "repository resource")),
+            current_value=current_value, desired_value=desired_value,
+            evidence_line=str(item.get("evidence_line") or ""),
+            phase1_prompt=str(item.get("phase1_prompt") or ""),
+            phase2_prompt=str(item.get("phase2_prompt") or ""),
+        ))
+    return rebuilt
+
+
+def _manifest_from_saved_case_rows(core: Any, owner_hash: str, source_run_id: str) -> list[dict[str, Any]]:
+    source = terrabot_test_state.load_run(owner_hash, source_run_id) or {}
+    try:
+        manifest = json.loads(str(source.get("case_manifest_json") or "[]"))
+    except Exception:
+        manifest = []
+    if manifest:
+        return manifest
+    rows = terrabot_test_state.load_case_results(owner_hash, source_run_id)
+    owner = str(getattr(core, "GITHUB_OWNER", "") or "")
+    result = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        cloud = str(row.get("cloud") or "").lower()
+        repo = str(row.get("repo") or (getattr(core, "GITHUB_AWS_REPO", "") if cloud == "aws" else getattr(core, "GITHUB_AZURE_REPO", "")))
+        flag = str(row.get("expected_flag") or "")
+        path = str(row.get("expected_path") or "")
+        current = False
+        if flag and path:
+            branch = str(getattr(core, "GITHUB_AWS_BASE_BRANCH", "main") if cloud == "aws" else getattr(core, "GITHUB_AZURE_BASE_BRANCH", "main"))
+            live = core.github_get_file_content_by_repo(owner, repo, path, ref=branch) or ""
+            m = re.search(rf"(?m)^\s*{re.escape(flag)}\s*=\s*(true|false)\s*(?:#.*)?$", live, re.IGNORECASE)
+            if not m:
+                continue
+            current = m.group(1).lower() == "true"
+        result.append({
+            "case_id": row.get("test_case_id"), "case_type": row.get("case_type"), "cloud": cloud,
+            "owner": owner, "repo": repo, "branch": "main", "path": path,
+            "environment": row.get("environment"), "flag": flag,
+            "alias": _humanize_flag(flag) if flag else "repository resource",
+            "current_value": current, "desired_value": (not current) if flag else True,
+            "evidence_line": "", "phase1_prompt": row.get("prompt"), "phase2_prompt": row.get("phase2_prompt"),
+        })
+    return result
+
+
 def start_automated_test_run(core: Any, data: dict) -> tuple[dict, int]:
     """Authorize, persist and enqueue a run; never execute Foundry work inline."""
     del core
@@ -3049,8 +3186,18 @@ def start_automated_test_run(core: Any, data: dict) -> tuple[dict, int]:
     if status_match:
         return _status_report(aad_object_id, str(status_match.group(1) or "").strip())
 
-    cloud_filter, count = _parse_command(prompt)
-    run_mode = _parse_test_mode(prompt)
+    replay_source_run_id = _replay_source_run_id(prompt)
+    same_requested = _same_prompts_requested(prompt)
+    if replay_source_run_id:
+        source = terrabot_test_state.load_run(terrabot_test_state.requester_hash(aad_object_id), replay_source_run_id)
+        if not source:
+            return {"ok": False, "mode": "automated_test", "reply": f"Replay source run `{replay_source_run_id}` was not found."}, 404
+        cloud_filter = str(source.get("cloud_filter") or "all")
+        count = int(source.get("requested_cases") or 4)
+        run_mode = str(source.get("run_mode") or "mixed")
+    else:
+        cloud_filter, count = _parse_command(prompt)
+        run_mode = _parse_test_mode(prompt)
     run_id = _new_run_id()
     owner_hash = terrabot_test_state.requester_hash(aad_object_id)
     conversation_reference = (data or {}).get("conversation_reference") or {}
@@ -3064,6 +3211,8 @@ def start_automated_test_run(core: Any, data: dict) -> tuple[dict, int]:
         "run_mode": run_mode,
         "created_at": terrabot_test_state.utc_now(),
         "conversation_reference": conversation_reference,
+        "replay_source_run_id": replay_source_run_id,
+        "same_prompts_requested": same_requested,
     }
     terrabot_test_state.save_run(state)
     job = {
@@ -3075,6 +3224,8 @@ def start_automated_test_run(core: Any, data: dict) -> tuple[dict, int]:
         "run_mode": run_mode,
         "requested_cases": count,
         "conversation_reference": conversation_reference,
+        "replay_source_run_id": replay_source_run_id,
+        "same_prompts_requested": same_requested,
         "created_at": state["created_at"],
     }
     try:
@@ -3146,8 +3297,16 @@ def execute_automated_test_job(core: Any, job: dict) -> str:
     if not run_id:
         raise ValueError("Queued automated-test job is missing run_id.")
     _assert_authorized(aad_object_id)
-    cloud_filter, count = _parse_command(prompt)
-    run_mode = str((job or {}).get("run_mode") or _parse_test_mode(prompt)).lower()
+    replay_source_run_id = str((job or {}).get("replay_source_run_id") or _replay_source_run_id(prompt)).strip()
+    same_requested = bool((job or {}).get("same_prompts_requested") or _same_prompts_requested(prompt))
+    if replay_source_run_id:
+        source = terrabot_test_state.load_run(owner_hash, replay_source_run_id) or {}
+        cloud_filter = str(source.get("cloud_filter") or (job or {}).get("cloud_filter") or "all")
+        count = int(source.get("requested_cases") or (job or {}).get("requested_cases") or 4)
+        run_mode = str(source.get("run_mode") or (job or {}).get("run_mode") or "mixed").lower()
+    else:
+        cloud_filter, count = _parse_command(prompt)
+        run_mode = str((job or {}).get("run_mode") or _parse_test_mode(prompt)).lower()
     started = time.monotonic()
     run_state = {
         "run_id": run_id,
@@ -3235,18 +3394,34 @@ def execute_automated_test_job(core: Any, job: dict) -> str:
                     _diag("repository_context_revalidation_completed", run_id=run_id, repo=f"{spec.owner}/{spec.repo}", **stats)
                 except Exception as exc:
                     _diag("repository_context_revalidation_failed", level="warning", run_id=run_id, repo=f"{spec.owner}/{spec.repo}", error=exc)
-        cases, discovery_errors = _derive_test_cases(core, cloud_filter, count, run_id, run_mode=run_mode)
+        replay_manifest: list[dict[str, Any]] = []
+        if replay_source_run_id:
+            replay_manifest = _manifest_from_saved_case_rows(core, owner_hash, replay_source_run_id)
+        elif same_requested:
+            previous = terrabot_test_state.latest_completed_run(owner_hash, run_mode=run_mode, cloud_filter=cloud_filter, requested_cases=count)
+            if previous:
+                replay_source_run_id = str(previous.get("run_id") or "")
+                replay_manifest = _manifest_from_saved_case_rows(core, owner_hash, replay_source_run_id)
+        if replay_manifest:
+            cases = _cases_from_manifest(core, replay_manifest, run_id)
+            discovery_errors = []
+            _diag("test_cases_replayed", run_id=run_id, replay_source_run_id=replay_source_run_id, cases=len(cases))
+        else:
+            cases, discovery_errors = _derive_test_cases(core, cloud_filter, count, run_id, run_mode=run_mode)
         # When enabled, Cursor now actively authors the mutation prompts from the
         # pinned repositories instead of being only a post-run validator. Target
         # metadata remains immutable; Cursor varies realistic developer language
         # across creation/provisioning, modification, enable/disable and
         # decommission/delete-style requests while preserving test intent.
         try:
-            cases = cursor_prompt_provider.apply_cursor_generated_prompts(
-                cases,
-                run_id=run_id,
-                log_event=_diag,
-            )
+            if not replay_manifest:
+                cases = cursor_prompt_provider.apply_cursor_generated_prompts(
+                    cases,
+                    run_id=run_id,
+                    log_event=_diag,
+                )
+            else:
+                _diag("cursor_prompt_generation_skipped_for_replay", run_id=run_id, replay_source_run_id=replay_source_run_id)
         except Exception as exc:
             # Respect the provider's fail-open/fail-closed behavior. The helper
             # only raises when configured fail-open=false.
@@ -3257,6 +3432,9 @@ def execute_automated_test_job(core: Any, job: dict) -> str:
                 error=exc,
             )
             raise
+        run_state["case_manifest"] = _case_manifest(cases)
+        run_state["replay_source_run_id"] = replay_source_run_id
+        terrabot_test_state.save_run(run_state)
         result = TestRunResult(run_id=run_id, requested_cases=count, discovery_errors=discovery_errors)
         indexed_cases = list(enumerate(cases, start=1))
         completed_by_index: dict[int, TestCaseResult] = {}

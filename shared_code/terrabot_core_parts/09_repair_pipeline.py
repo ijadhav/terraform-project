@@ -851,6 +851,22 @@ def _teams_get_valid_backend_repair(
     )
 
 
+def _teams_backend_error_is_nonrepairable(error: Exception | str) -> bool:
+    """Return True for backend routing/evidence defects Foundry cannot repair."""
+    text = str(error or "").lower()
+    markers = (
+        "repository_context_attachment_required",
+        "resolved_target_contract_invalid",
+        "creation_write_contract",
+        "creation_workflow_routing",
+        "generated modification path",
+        "is not present in the live repository evidence for this request",
+        "cross-environment",
+        "repository mismatch",
+    )
+    return any(marker in text for marker in markers)
+
+
 def commit_terraform_files_to_branch_for_teams_with_self_correction(
     agent_result: dict,
     prompt: str,
@@ -897,7 +913,7 @@ def commit_terraform_files_to_branch_for_teams_with_self_correction(
         max_attempts=effective_max_attempts,
         configured_max_attempts=configured_attempts,
         repair_rounds=effective_max_attempts - 1,
-        internal_repair_attempts=2 if isinstance(immutable_target, dict) and immutable_target else 3,
+        internal_repair_attempts=1 if isinstance(immutable_target, dict) and immutable_target else 3,
         immutable_target=bool(isinstance(immutable_target, dict) and immutable_target),
     )
 
@@ -951,6 +967,14 @@ def commit_terraform_files_to_branch_for_teams_with_self_correction(
                 attempt=f"{attempt}/{effective_max_attempts}",
                 error=str(backend_error)[:300],
             )
+            if _teams_backend_error_is_nonrepairable(backend_error):
+                _teams_diag_log(
+                    "backend_validation_nonrepairable", level="error", thread=thread_id,
+                    attempt=f"{attempt}/{effective_max_attempts}",
+                    reason="routing_or_repository_evidence_contract_must_be_rebuilt_before_foundry_repair",
+                    error=str(backend_error)[:500],
+                )
+                break
             if attempt >= effective_max_attempts:
                 break
             LOGGER.warning(
@@ -1071,7 +1095,7 @@ def commit_terraform_files_to_branch_for_teams_with_self_correction(
                 current_result = _teams_get_valid_backend_repair(
                     repair_payload,
                     current_result,
-                    max_response_attempts=(2 if isinstance(immutable_target, dict) and immutable_target else 3),
+                    max_response_attempts=(1 if isinstance(immutable_target, dict) and immutable_target else 3),
                     conversation_id=thread_id,
                 )
                 fp = _candidate_fingerprint(current_result)

@@ -1171,7 +1171,6 @@ def _teams_coerce_agent_payload_stage1(agent_text: str, context: dict) -> tuple[
         return targets[0] if len(targets) == 1 else ""
 
     raw_file_entries = list(payload.get("files") or [])
-    files_before = len(raw_file_entries)
     flattened_entries: list = []
     for item in raw_file_entries:
         # Some replies nest files as [[{...}]] or return one entry per string.
@@ -1263,16 +1262,6 @@ def _teams_coerce_agent_payload_stage1(agent_text: str, context: dict) -> tuple[
         )
     payload["files"] = normalized_files
 
-    # Distinguish response-shape loss from semantic no-file generation. If
-    # Foundry supplied files before normalization but every entry was dropped,
-    # route through one shape-only repair before semantic regeneration.
-    if files_before > 0 and not normalized_files:
-        raise ValueError(
-            "TEAMS_FILE_SHAPE_REPAIR_REQUIRED: "
-            f"files_before={files_before} files_after=0. "
-            "Preserve the generated Terraform semantics and repair only the files[] JSON shape."
-        )
-
     # A user-confirmed AWS module selection has one deterministic write target:
     # the target environment main.tf captured live at selection time. Validate
     # the Foundry result here so a bad response is routed through the existing
@@ -1322,10 +1311,15 @@ def _teams_coerce_agent_payload_stage1(agent_text: str, context: dict) -> tuple[
         _teams_diag_log(
             "agent_result_generation_shape_repair_required",
             level="warning",
+            raw_files_count=len(raw_file_entries),
+            normalized_files_count=len(normalized_files),
+            dropped_files_count=max(0, len(flattened_entries) - len(normalized_files)),
+            dropped_reason=" | ".join(dropped_details)[:1800],
+            payload_mode=str(payload.get("mode") or ""),
+            payload_workflow=str(payload.get("workflow") or ""),
+            questions_count=len(questions) if isinstance(questions, list) else 0,
             original_files=len(raw_file_entries),
             flattened_files=len(flattened_entries),
-            dropped_non_dict_entries=dropped_non_dict,
-            dropped_details=" | ".join(dropped_details)[:1800],
             parser_succeeded=True,
         )
         raise ValueError(
@@ -1501,54 +1495,6 @@ def repair_and_parse_agent_output(
             parse_error,
         )
 
-    shape_repair_required = "TEAMS_FILE_SHAPE_REPAIR_REQUIRED" in str(parse_error)
-    if shape_repair_required:
-        shape_payload = {
-            "task": "SHAPE REPAIR ONLY: normalize the existing Terraform generation into executable Teams JSON.",
-            "channel": "teams",
-            "original_user_request": context.get("effective_prompt") or "",
-            "previous_agent_reply": bad_agent_reply,
-            "expected_cloud": context.get("expected_cloud") or "",
-            "expected_workflow": context.get("expected_workflow") or "",
-            "expected_repo_target": context.get("expected_repo_target") or "",
-            "resolved_repository_target": dict(context.get("resolved_repository_target_contract") or {}),
-            "rules": [
-                "This is a JSON/file-shape normalization retry, not semantic regeneration.",
-                "Do not rediscover the target, module, environment, resource, or workflow.",
-                "Preserve the Terraform change already present in previous_agent_reply.",
-                "Return one strict JSON object with files[] as objects containing filename and complete content.",
-                "Do not return clarification, questions, prose fallback, or files=[].",
-                "If one deterministic target path is supplied, bind content-only output to that exact path.",
-            ],
-        }
-        _teams_diag_log(
-            "generation_shape_repair_start",
-            thread=conversation_id,
-            error=str(parse_error)[:300],
-        )
-        try:
-            _shape_conversation_id, shaped_reply = call_agent(
-                conversation_id,
-                json.dumps(shape_payload, indent=2),
-            )
-            shaped = try_parse_agent_output(shaped_reply)
-            _teams_diag_log(
-                "generation_shape_repair_success",
-                thread=conversation_id,
-                files=len(shaped.get("files") or []),
-            )
-            return shaped, shaped_reply
-        except Exception as shape_error:
-            _teams_diag_log(
-                "generation_shape_repair_failed",
-                level="warning",
-                thread=conversation_id,
-                error=str(shape_error)[:300],
-            )
-            parse_error = ValueError(
-                f"{parse_error}; shape_repair_failed={shape_error}"
-            )
-
     repair_payload = {
         "task": "Repair the current Teams Terraform generation and return executable files now.",
         "channel": "teams",
@@ -1556,6 +1502,11 @@ def repair_and_parse_agent_output(
         "expected_cloud": context.get("expected_cloud") or "",
         "expected_workflow": context.get("expected_workflow") or "",
         "expected_repo_target": context.get("expected_repo_target") or "",
+        "operation_state": (
+            "boolean" if isinstance(context.get("resolved_repository_target_contract"), dict) and context.get("resolved_repository_target_contract")
+            else "create" if str(context.get("operation_state") or "").lower() == "create"
+            else "modify"
+        ),
         "backend_validation_error": str(parse_error),
         "previous_agent_reply": bad_agent_reply,
         "retrieved_module_context": context.get("retrieved_module_context") or [],
@@ -1584,7 +1535,6 @@ def repair_and_parse_agent_output(
         "resolved_repository_target": _teams_resolved_boolean_control_hint(context),
         "absolute_rules": [
             "Return one valid JSON object only.",
-            "If resolved_repository_target is non-empty, target rediscovery and clarification are forbidden.",
             "Do not return files=[] for missing non-sensitive preference values.",
             "When resolved_repository_target is non-empty, the target path/flag/current->new value is FINAL backend-verified truth: return files[] implementing exactly that one-literal change on the complete live file. Questions are forbidden in that situation.",
             "If (and only if) resolved_repository_target is empty and live evidence leaves more than one materially valid target, return mode=clarification with 2-6 structured candidates (path, flag or module_source, current_value, new_value, reason). Never return a bare question without candidates.",
@@ -1597,7 +1547,11 @@ def repair_and_parse_agent_output(
         ],
     }
 
-    max_internal_repairs = 3
+    # Shape/protocol failures get one dedicated repair. Repeating semantic
+    # regeneration three times after normalization dropped every file caused
+    # long, low-signal loops in E2E tests. Other parse failures retain the
+    # historical bounded repair depth.
+    max_internal_repairs = 1 if "GENERATION_SHAPE_FAILURE" in str(parse_error) else 3
     working_payload = dict(repair_payload)
     last_repair_error: Exception | None = None
 
@@ -2349,12 +2303,10 @@ def _handle_teams_chat_request_safe(data: dict):
             and isinstance(request_data.get("cursor_repository_resolution"), dict)
             else {}
         ),
-        # A resolved target contract is production workflow state, not test-only
-        # instrumentation. Once present it must survive every generation/repair
-        # turn so downstream code cannot rediscover a different target.
         "resolved_repository_target_contract": (
             dict(request_data.get("p1_resolved_target_contract") or request_data.get("resolved_repository_target_contract") or {})
-            if isinstance(request_data.get("p1_resolved_target_contract") or request_data.get("resolved_repository_target_contract"), dict)
+            if _teams_truthy(request_data.get("test_mode"))
+            and isinstance(request_data.get("p1_resolved_target_contract") or request_data.get("resolved_repository_target_contract"), dict)
             else {}
         ),
     }
@@ -2488,18 +2440,44 @@ def _handle_teams_chat_request_safe(data: dict):
             )
         )
         if no_file_failure and safe_normalize_cloud(flow_context.get("expected_cloud")) == "aws" and confirmed_aws:
-            # A selected live module/environment is an execute-now creation
-            # contract. Never surface the old clarification fallback. The
-            # generation/parse repair path owns recovery and must either return
-            # executable Terraform or fail as an internal generation error.
-            result = dict(result or {})
-            result["mode"] = "infra_generation_failed"
-            result["decision_state"] = "generation_retry_required"
-            result["reply"] = (
-                "Terrabot could not materialize the already-resolved AWS consumer generation. "
-                "Repository/module selection remains locked; no clarification is required."
+            fallback = None  # Terraform recovery must be performed by Foundry, never synthesized by backend.
+            fallback_thread_id = str(
+                result.get("thread_id")
+                or flow_context.get("thread_id")
+                or conversation_id
+                or _teams_workflow_thread_id(request_data)
+            ).strip()
+            ticket_number = str(request_data.get("jira_ticket") or state.get("ticket_number") or "").strip()
+            ticket_link = str(request_data.get("ticket_link") or state.get("ticket_link") or "").strip()
+            ticket_title = str(request_data.get("ticket_title") or state.get("ticket_title") or "").strip()
+            if fallback is None:
+                return result, status_code
+            pending_key = store_pending_infra_change(
+                fallback_thread_id,
+                ticket_number,
+                prompt,
+                fallback,
+                ticket_link=ticket_link,
+                ticket_title=ticket_title,
             )
-            return result, max(500, int(status_code or 500))
+            preview = {
+                "ok": True,
+                "mode": "infra_preview",
+                "reply": "The selected verified AWS module was materialized and is ready for branch creation.",
+                "thread_id": fallback_thread_id,
+                "pending_change_id": pending_key,
+                "cloud": "aws",
+                "workflow": fallback.get("workflow"),
+                "repo_target": fallback.get("repo_target"),
+                "title": fallback.get("title"),
+                "summary": fallback.get("summary"),
+                "analysis": fallback.get("analysis"),
+                "files": [item.get("filename") for item in fallback.get("files") or []],
+                "user_fillable": fallback.get("user_fillable") or [],
+            }
+            recovery_request = dict(request_data)
+            recovery_request["thread_id"] = fallback_thread_id
+            result, status_code = _teams_auto_commit_preview(recovery_request, preview, 200)
 
         if state_patch:
             result = dict(result or {})

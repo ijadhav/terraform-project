@@ -167,11 +167,12 @@ def _remember_prompt_author_target_binding(
     flag = str(_case_value(case, "flag") or "").strip()
     current_value = _case_value(case, "current_value")
     desired_value = _case_value(case, "desired_value")
-    if (
-        not run_key
-        or not case_id
-        or not path_value
-        or not flag
+    case_type = str(_case_value(case, "case_type") or "").strip()
+    is_boolean = case_type == "boolean_context"
+    if not run_key or not case_id or not path_value:
+        return
+    if is_boolean and (
+        not flag
         or not isinstance(current_value, bool)
         or not isinstance(desired_value, bool)
         or current_value == desired_value
@@ -183,6 +184,7 @@ def _remember_prompt_author_target_binding(
         "case_id": case_id,
         "repository": f"{_case_value(case, 'owner')}/{_case_value(case, 'repo')}",
         "commit_sha": str(_case_value(case, "commit_sha") or "").strip(),
+        "case_type": case_type,
         "path": path_value,
         "flag": flag,
         "current_value": current_value,
@@ -195,6 +197,12 @@ def _remember_prompt_author_target_binding(
         "cursor_agent_id": str(cursor_agent_id or "").strip(),
         "cursor_run_id": str(cursor_run_id or "").strip(),
         "provenance": "cursor_prompt_author_target_binding",
+        "creation_target": ({
+            "target_consumer_path": path_value,
+            "environment": str(_case_value(case, "environment") or "").strip(),
+            "alias": str(_case_value(case, "alias") or "").strip(),
+            "module_hint": str(_case_value(case, "evidence_line") or "").strip(),
+        } if not is_boolean else {}),
     }
     with _PROMPT_AUTHOR_BINDINGS_LOCK:
         _PROMPT_AUTHOR_BINDINGS[(run_key, case_id)] = binding
@@ -590,6 +598,61 @@ def _validated_prompts(
     return by_id
 
 
+def _repair_prompt_generation_protocol(
+    *,
+    session: Any,
+    base_url: str,
+    headers: dict[str, str],
+    request_timeout: float,
+    poll_interval: float,
+    invalid_result: str,
+    validation_error: str,
+    run_id: str,
+    expected_commit: str,
+    case_ids: list[str],
+    log_event: Callable[..., None] | None,
+) -> dict[str, Any]:
+    """One bounded format-only repair for a completed prompt-author response."""
+    try:
+        run_timeout = _float_setting("TERRABOT_CURSOR_PROMPT_PROTOCOL_REPAIR_TIMEOUT_SECONDS", 45.0, 15.0, 120.0)
+        prior = str(invalid_result or "")[:16000]
+        instruction = "\n".join([
+            "Repair ONLY the JSON response format of an already-completed Terrabot test-prompt generation result.",
+            "Do not inspect repositories, do not change prompt semantics, and do not invent new targets or evidence.",
+            f"Previous response validation error: {validation_error}",
+            "Return exactly one raw JSON object. No markdown fences or commentary.",
+            f"schema_version must be exactly {_SCHEMA_VERSION}.",
+            f"repository_commit_sha must be exactly {expected_commit}.",
+            "cases must contain exactly these case_id values: " + ", ".join(case_ids),
+            "Each case object must contain case_id, phase1_prompt, phase2_prompt. Preserve the wording already present in the prior result whenever possible.",
+            "Prior Cursor result:", prior,
+            "FINAL: emit the JSON object itself and nothing else.",
+        ])
+        payload = {
+            "name": f"Terrabot prompt protocol repair {run_id}"[:100],
+            "mode": "plan", "prompt": {"text": instruction},
+            "workOnCurrentBranch": False, "autoCreatePR": False, "skipReviewerRequest": True,
+        }
+        _emit("cursor_prompt_protocol_repair_started", log_event=log_event, run_id=run_id, validation_error=validation_error, result_preview=prior[:1000])
+        created = _http_json(session, "POST", f"{base_url}/v1/agents", headers=headers, timeout=request_timeout, payload=payload)
+        agent_id, cursor_run_id, initial_run = _extract_agent_and_run(created)
+        try:
+            cursor_run_id = _resolve_run_id(session, agent_id, cursor_run_id, base_url=base_url, headers=headers, timeout=request_timeout)
+            repaired_text, _terminal = _wait_for_result(
+                session, agent_id, cursor_run_id, initial_run, base_url=base_url, headers=headers,
+                request_timeout=request_timeout, run_timeout=run_timeout, poll_interval=poll_interval,
+                run_label=f"{run_id}:prompt-protocol-repair", log_event=log_event,
+            )
+            parsed = _parse_result_text(repaired_text)
+            _emit("cursor_prompt_protocol_repair_completed", log_event=log_event, run_id=run_id, cursor_agent_id=agent_id, cursor_run_id=cursor_run_id)
+            return parsed
+        finally:
+            _archive_agent_best_effort(session, agent_id, base_url=base_url, headers=headers, timeout=request_timeout, run_label=f"{run_id}:prompt-protocol-repair", log_event=log_event)
+    except Exception as exc:
+        _emit("cursor_prompt_protocol_repair_failed", level="warning", log_event=log_event, run_id=run_id, error=exc)
+        return {}
+
+
 def _generate_for_group(
     cases: Sequence[Any],
     *,
@@ -720,8 +783,24 @@ def _generate_for_group(
                 repo=f"{owner}/{repo}",
                 reported_branches=len(pushed_branches),
             )
-        parsed = _parse_result_text(result_text)
-        prompts = _validated_prompts(parsed, cases, commit_sha)
+        try:
+            parsed = _parse_result_text(result_text)
+            prompts = _validated_prompts(parsed, cases, commit_sha)
+        except CursorPromptError as exc:
+            _emit(
+                "cursor_prompt_generation_invalid_result", level="warning", log_event=log_event,
+                run_id=run_id, repo=f"{owner}/{repo}", commit_sha=commit_sha,
+                error=str(exc), result_preview=str(result_text or "")[:1200],
+            )
+            parsed = _repair_prompt_generation_protocol(
+                session=session, base_url=base_url, headers=headers, request_timeout=request_timeout,
+                poll_interval=poll_interval, invalid_result=result_text, validation_error=str(exc),
+                run_id=run_id, expected_commit=commit_sha,
+                case_ids=[str(_case_value(case, "case_id")) for case in cases], log_event=log_event,
+            )
+            if not parsed:
+                raise
+            prompts = _validated_prompts(parsed, cases, commit_sha)
 
         generated: list[Any] = []
         for case in cases:

@@ -6747,3 +6747,74 @@ These rules apply when the backend request contains `test_mode=true`, `mode=infr
 5. Azure creation: for a create/add/provision request against tf-azure-hub, generate the resource-family consumer .tf, the target environment hub.tfvars object assignment, and variables.tf when a new root object variable is introduced. Do not ask for file/module permission when environment and resource family are inferable from backend evidence.
 6. Repository Q&A is read-only chat. Do not emit Terraform JSON/files for repo_qna prompts. Answer plainly from repository evidence.
 7. Self-validation before final response: reject your own answer if it asks the user for repository paths/modules/flags that are already present in live evidence, if it omits files[] for a mutation, or if it returns non-object file entries.
+
+
+# TERRABOT COORDINATED E2E CONTRACT ADDENDUM — 2026-09-10
+
+This section is authoritative when it conflicts with older creation/modification/repair wording.
+
+## 1. Canonical executable file contract
+- Every infrastructure generation response must return one JSON object.
+- Every executable file must use exactly: `{"filename":"repo-relative/path.tf|.tfvars","content":"COMPLETE FINAL CONTENT"}`.
+- Do not mix `path`, `text`, `terraform`, partial blocks, markdown fences, nested `files`, or prose in `files[]`.
+- Existing files must contain complete final repository content. New files must contain complete executable HCL.
+- `questions=[]` whenever repository evidence already resolves the target/workflow/placement.
+
+## 2. Explicit operation state
+Treat the backend-provided `operation_state` as authoritative:
+- `boolean`: exact immutable Boolean mutation only.
+- `create`: create/instantiate the requested infrastructure according to the repository's existing creation pattern.
+- `modify`: modify an already-existing resource/file with a minimal localized delta.
+Never downgrade `create` into `modify`, and never ask for a file/path merely because creation may require a new file.
+
+## 3. Boolean fast path
+When `resolved_repository_target` or `resolved_repository_target_contract` contains path + line_number + flag + current_value + new_value:
+- semantic target resolution is complete and MUST NOT be repeated;
+- do not inspect alternative flags or paths;
+- return exactly one `repair_edits[]` edit when the caller explicitly permits surgical edit output, otherwise return the complete final file;
+- change only the literal `true|false` value on the exact live assignment;
+- preserve indentation, comments, whitespace, and every unrelated byte;
+- never return clarification;
+- if the supplied live file no longer contains that exact control, return a repository-evidence mismatch diagnostic rather than selecting a replacement target.
+
+## 4. AWS tf-devops creation workflow
+For AWS creation requests in `tf-devops`:
+- reusable modules are under `terraform/modules/<resource_family>`;
+- environment consumers are under `terraform/dev_aws`, `terraform/prod_aws`, or `terraform/dev_services_aws`;
+- when an existing reusable module is verified, model the new consumer on a real sibling consumer supplied by the backend and instantiate it in the resolved target environment;
+- when the backend proves no suitable module exists, create the reusable module and its target-environment consumer in the same response;
+- when target environment `main.tf` is supplied as the consumer file, preserve its entire live content and add only the new sibling module block;
+- use the exact repository-relative local module source supplied by the backend;
+- never create generic files such as `resource.tf` or `service.tf` unless a supplied repository sibling proves that exact file-placement convention;
+- do not ask the user to confirm module creation after the original request already asked to create/provision/add the resource.
+
+## 5. Azure tf-azure-hub creation workflow
+For Azure creation requests in `tf-azure-hub`:
+- environment-specific values live under `vars/<tier>/<environment>/...`;
+- use the backend-resolved target environment only; evidence from another environment is a sibling example, never a write target;
+- inspect the supplied root resource-family definition file(s), `variables.tf`, target environment values files, and sibling resource examples before generation;
+- when the backend supplies `required_write_set`, return every required path in the same response;
+- when the backend supplies `permitted_new_paths`, new files may be created only at those paths;
+- if a new tfvars root object/assignment requires a new root variable declaration, return the complete updated `variables.tf` too;
+- preserve existing target tfvars/definition files exactly except for the requested addition;
+- do not invent `private_lb.tf`, `load_balancer.tf`, or any other new path unless that path or its exact repository naming convention is explicitly authorized by live evidence / `permitted_new_paths`.
+
+## 6. Creation write contract
+When provided:
+`creation_write_contract = {existing_paths, permitted_new_paths, required_write_set, sibling_examples}`
+obey it exactly:
+- files in `existing_paths`: return complete final content with only the requested addition;
+- files in `permitted_new_paths`: may be newly created if required by the repository pattern;
+- every path in `required_write_set` must be returned;
+- no other path may be returned;
+- use `sibling_examples` to reproduce repository naming, wiring, tags, variables, outputs, and placement.
+
+## 7. Repair classification
+Do not attempt semantic regeneration for a backend routing/evidence error. If the backend reports that its creation/modification/path contract is internally inconsistent, preserve the existing semantic target and return only the requested protocol/shape correction when possible. Never switch environment/repository/path merely to make a validator pass.
+
+## 8. Repository Q&A
+For repository/workflow questions:
+- prefer durable repository context plus current live GitHub tree/files and repository documentation;
+- PR context is supplemental only when the question explicitly concerns a PR, recent/in-flight change, merge/review state, or why a recent change was made;
+- answer stable repository layout/workflow questions from current repository evidence without requiring a PR match;
+- do not route repository Q&A into infrastructure generation.

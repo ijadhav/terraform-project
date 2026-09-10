@@ -140,6 +140,9 @@ def save_run(run: dict[str, Any]) -> None:
         "lease_owner": str(item.get("lease_owner") or existing_lease.get("lease_owner") or "")[:128],
         "lease_acquired_at": str(item.get("lease_acquired_at") or existing_lease.get("lease_acquired_at") or ""),
         "lease_expires_at": str(item.get("lease_expires_at") or existing_lease.get("lease_expires_at") or ""),
+        "case_manifest_json": json.dumps(item.get("case_manifest") or [], ensure_ascii=False)[:60000],
+        "replay_source_run_id": str(item.get("replay_source_run_id") or "")[:128],
+        "same_prompts_requested": bool(item.get("same_prompts_requested")),
     }
     _table_client().upsert_entity(entity=entity, mode=UpdateMode.REPLACE)
 
@@ -373,6 +376,35 @@ def load_run(owner_hash: str, run_id: str) -> dict[str, Any] | None:
         return dict(_table_client().get_entity(partition_key=owner_hash, row_key=f"run::{run_id}"))
     except Exception:
         return None
+
+
+def latest_completed_run(
+    owner_hash: str,
+    *,
+    run_mode: str = "",
+    cloud_filter: str = "",
+    requested_cases: int = 0,
+) -> dict[str, Any] | None:
+    """Return the latest completed run matching replay constraints."""
+    rows = _table_client().query_entities(
+        query_filter=f"PartitionKey eq '{owner_hash}' and entity_type eq 'run'"
+    )
+    candidates = []
+    for raw in rows:
+        row = dict(raw)
+        if str(row.get("status") or "").lower() != "completed":
+            continue
+        if run_mode and str(row.get("run_mode") or "").lower() != str(run_mode).lower():
+            continue
+        if cloud_filter and str(row.get("cloud_filter") or "").lower() != str(cloud_filter).lower():
+            continue
+        if requested_cases and int(row.get("requested_cases") or 0) != int(requested_cases):
+            continue
+        candidates.append(row)
+    if not candidates:
+        return None
+    candidates.sort(key=lambda row: str(row.get("created_at") or ""), reverse=True)
+    return candidates[0]
 
 
 def _canonicalized_resource(account: str, parsed_url) -> str:

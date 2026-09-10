@@ -1055,6 +1055,49 @@ def _teams_validate_agent_preserved_existing_file(path: str, generated: str, con
         return
 
 
+def _teams_canonicalize_generated_files(agent_result: dict) -> dict:
+    """Normalize generated files exactly once to filename/content for all validators."""
+    result = dict(agent_result or {})
+    canonical: list[dict] = []
+    seen: set[str] = set()
+    for item in result.get("files") or []:
+        if not isinstance(item, dict):
+            continue
+        raw_path = str(item.get("filename") or item.get("path") or "").strip()
+        content = item.get("content")
+        if not isinstance(content, str):
+            for key in ("final_content", "text", "terraform", "file_content", "new_content"):
+                if isinstance(item.get(key), str):
+                    content = item.get(key)
+                    break
+        if not raw_path or not isinstance(content, str):
+            continue
+        try:
+            normalized = normalize_iac_relative_path(raw_path, allow_tfvars=True).strip("/")
+        except Exception:
+            normalized = raw_path.strip("/")
+        if not normalized or normalized in seen:
+            continue
+        canonical.append({"filename": normalized, "content": content})
+        seen.add(normalized)
+    result["files"] = canonical
+    return result
+
+
+def _teams_active_operation_state(agent_result: dict | None = None) -> str:
+    """Return the explicit request-local write policy: boolean/create/modify."""
+    active = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
+    if isinstance(active.get("resolved_repository_target_contract"), dict) and active.get("resolved_repository_target_contract"):
+        return "boolean"
+    explicit = str(active.get("operation_state") or (agent_result or {}).get("operation_state") or "").strip().lower()
+    if explicit in {"boolean", "create", "modify"}:
+        return explicit
+    prompt = str(active.get("effective_prompt") or (agent_result or {}).get("user_prompt") or "")
+    if active.get("active") and _teams_is_existing_invocation_creation(prompt):
+        return "create"
+    return "modify"
+
+
 def enforce_modification_uses_backend_matched_files(agent_result: dict, retrieved_value_context: list | None) -> dict:
     """Validate agent-chosen paths and aggregate independent deterministic failures.
 
@@ -1063,10 +1106,41 @@ def enforce_modification_uses_backend_matched_files(agent_result: dict, retrieve
     receives one repair package containing every known path/preservation/companion
     failure instead of discovering them across sequential repair rounds.
     """
+    agent_result = _teams_canonicalize_generated_files(agent_result)
     context = _get_backend_existing_infra_context(retrieved_value_context)
     validation_errors: list[str] = []
+    operation_state = _teams_active_operation_state(agent_result)
 
-    if not isinstance(context, dict) or not context.get("agent_resolves_target"):
+    if operation_state == "create":
+        result = agent_result
+        creation_context = context if isinstance(context, dict) else {}
+        active = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
+        write_contract = dict(active.get("creation_write_contract") or creation_context.get("creation_write_contract") or {})
+        existing_paths = {
+            _teams_context_file_identity(item)
+            for item in list(creation_context.get("matched_files") or []) + list(creation_context.get("environment_files") or [])
+            if isinstance(item, dict) and _teams_context_file_identity(item)
+        }
+        permitted_new = {str(v or "").strip().strip("/") for v in write_contract.get("permitted_new_paths") or [] if str(v or "").strip()}
+        required_write_set = {str(v or "").strip().strip("/") for v in write_contract.get("required_write_set") or [] if str(v or "").strip()}
+        returned = {str((f or {}).get("filename") or "").strip().strip("/") for f in result.get("files") or [] if isinstance(f, dict)}
+        if permitted_new:
+            for path in sorted(returned - existing_paths - permitted_new):
+                validation_errors.append(
+                    f"Generated creation path `{path}` is not authorized by creation_write_contract.permitted_new_paths."
+                )
+        if required_write_set and not required_write_set.issubset(returned):
+            validation_errors.append(
+                "Creation output is missing required write-set file(s): " + ", ".join(sorted(required_write_set - returned))
+            )
+        for file_data in result.get("files") or []:
+            path = str(file_data.get("filename") or "").strip().strip("/")
+            if path in existing_paths:
+                try:
+                    _teams_validate_agent_preserved_existing_file(path, str(file_data.get("content") or ""), creation_context)
+                except ValueError as exc:
+                    validation_errors.append(str(exc))
+    elif not isinstance(context, dict) or not context.get("agent_resolves_target"):
         try:
             result = _VALIDATED_PREVIOUS_ENFORCE_MOD_PATHS(agent_result, retrieved_value_context)
         except ValueError as exc:
@@ -1111,7 +1185,7 @@ def enforce_modification_uses_backend_matched_files(agent_result: dict, retrieve
     # Creation companion completeness is part of the same deterministic batch.
     active = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
     effective_prompt = str(active.get("effective_prompt") or agent_result.get("user_prompt") or "")
-    if active.get("active") and _teams_is_existing_invocation_creation(effective_prompt):
+    if active.get("active") and (operation_state == "create" or _teams_is_existing_invocation_creation(effective_prompt)):
         creation_context = _get_backend_existing_infra_context(retrieved_value_context)
         creation_context = creation_context if isinstance(creation_context, dict) else {}
         companions = {
@@ -1139,10 +1213,8 @@ def enforce_modification_uses_backend_matched_files(agent_result: dict, retrieve
         # Stable de-duplication keeps the repair prompt concise when two guards
         # report the same underlying preservation problem.
         unique_errors = list(dict.fromkeys(error for error in validation_errors if error))
-        raise ValueError(
-            "BACKEND_MODIFICATION_VALIDATION_FAILED_MULTIPLE: "
-            + " | ".join(unique_errors)
-        )
+        prefix = "BACKEND_CREATION_VALIDATION_FAILED_MULTIPLE" if operation_state == "create" else "BACKEND_MODIFICATION_VALIDATION_FAILED_MULTIPLE"
+        raise ValueError(prefix + ": " + " | ".join(unique_errors))
     return result
 
 

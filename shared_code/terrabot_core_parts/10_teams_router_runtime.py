@@ -1887,6 +1887,15 @@ def _teams_chat_repo_targets(cloud: str) -> dict:
     return {}
 
 
+def _teams_question_needs_pr_context(prompt: str) -> bool:
+    """Use PR evidence only for questions explicitly about recent/in-flight PR work."""
+    text = str(prompt or "").strip().lower()
+    return bool(re.search(
+        r"\b(pr|pull request|merge request|open pr|draft pr|merged|merge|review|raised|pending change|in flight|in-flight|recent change|who changed|why changed)\b",
+        text,
+    ))
+
+
 def _teams_build_chat_grounding_context(
     prompt: str,
     teams_conversation_id: str,
@@ -1924,33 +1933,33 @@ def _teams_build_chat_grounding_context(
         except Exception:
             LOGGER.debug("Skipping live repo chat context", exc_info=True)
 
-        try:
-            pr_result = agent_pr_context.build_pr_context_block(
-                prompt,
-                repo_info["owner"],
-                repo_info["repo"],
-                token=GITHUB_TOKEN,
-                cloud=cloud,
-            )
-            pr_matches = pr_result.get("matches") or []
-            pr_context_block = pr_result.get("context_block") or ""
-        except Exception:
-            LOGGER.debug("Skipping pull request chat context", exc_info=True)
+        if _teams_question_needs_pr_context(prompt):
+            try:
+                pr_result = agent_pr_context.build_pr_context_block(
+                    prompt,
+                    repo_info["owner"],
+                    repo_info["repo"],
+                    token=GITHUB_TOKEN,
+                    cloud=cloud,
+                )
+                pr_matches = pr_result.get("matches") or []
+                pr_context_block = pr_result.get("context_block") or ""
+            except Exception:
+                LOGGER.debug("Skipping pull request chat context", exc_info=True)
     else:
-        # Cloud/repo could not be resolved from the question. Still check
-        # both configured repositories for a relevant open pull request so a
-        # cloud-agnostic infra question can find matching in-flight work.
-        try:
-            pr_result = agent_pr_context.build_multi_repo_pr_context_block(
-                prompt,
-                GITHUB_OWNER,
-                {"aws": GITHUB_AWS_REPO, "azure": GITHUB_AZURE_REPO},
-                token=GITHUB_TOKEN,
-            )
-            pr_matches = pr_result.get("matches") or []
-            pr_context_block = pr_result.get("context_block") or ""
-        except Exception:
-            LOGGER.debug("Skipping multi-repo pull request chat context", exc_info=True)
+        # PR lookup is supplemental and only runs for an explicit PR/recent-work question.
+        if _teams_question_needs_pr_context(prompt):
+            try:
+                pr_result = agent_pr_context.build_multi_repo_pr_context_block(
+                    prompt,
+                    GITHUB_OWNER,
+                    {"aws": GITHUB_AWS_REPO, "azure": GITHUB_AZURE_REPO},
+                    token=GITHUB_TOKEN,
+                )
+                pr_matches = pr_result.get("matches") or []
+                pr_context_block = pr_result.get("context_block") or ""
+            except Exception:
+                LOGGER.debug("Skipping multi-repo pull request chat context", exc_info=True)
 
     shared_context_blocks: list[str] = []
     context_targets = []
@@ -2005,6 +2014,36 @@ def _teams_build_chat_grounding_context(
     }
 
 
+def _teams_store_grounded_repository_qna(prompt: str, answer: str, grounding: dict) -> None:
+    """Persist a repository Q&A conclusion only when current live evidence exists."""
+    try:
+        cloud = str((grounding or {}).get("cloud") or "").strip().lower()
+        repo_info = _teams_chat_repo_targets(cloud)
+        evidence_paths = [str(v) for v in ((grounding or {}).get("repo_paths") or []) if str(v)][:8]
+        if not repo_info or not evidence_paths or not str(answer or "").strip():
+            return
+        branch, sha = _repository_context_branch_and_sha(repo_info["owner"], repo_info["repo"], repo_info["branch"])
+        if not sha:
+            return
+        candidate = {
+            "category": "repository_qna",
+            "subject": re.sub(r"\s+", " ", str(prompt or "")).strip()[:500],
+            "scope": "repository",
+            "statement": re.sub(r"\s+", " ", str(answer or "")).strip()[:4000],
+            "confidence": 0.90,
+            "validation_summary": "Repository Q&A grounded in current live GitHub evidence before indexing.",
+            "evidence": [{"path": path, "excerpt": "", "reason": "Live repository path used to ground this Q&A answer."} for path in evidence_paths],
+        }
+        add_repository_context(
+            repo_info["owner"], repo_info["repo"], sha, candidate,
+            evidence_branch=branch,
+            source_task_hash=hashlib.sha256((str(prompt) + "\0" + str(answer) + "\0" + sha).encode()).hexdigest(),
+        )
+        LOGGER.info("[TerrabotDiag] event=repository_qna_context_stored repo=%s/%s paths=%s", repo_info["owner"], repo_info["repo"], ",".join(evidence_paths)[:600])
+    except Exception as exc:
+        LOGGER.warning("[TerrabotDiag] event=repository_qna_context_store_failed error=%s", exc)
+
+
 def _teams_plain_chat_reply(
     prompt: str,
     teams_conversation_id: str = "",
@@ -2050,6 +2089,8 @@ def _teams_plain_chat_reply(
             reply = str(candidate or "").strip()
             if not reply or agent_reply_looks_like_infra_json(reply) or looks_like_infra_payload(reply):
                 reply = "I did not detect a new infrastructure change request. Please state the change explicitly when you want Terraform generated."
+            elif grounding.get("repo_paths"):
+                _teams_store_grounded_repository_qna(prompt, reply, grounding)
         except Exception:
             reply = "I did not detect a new infrastructure change request. Please state the change explicitly when you want Terraform generated."
 
