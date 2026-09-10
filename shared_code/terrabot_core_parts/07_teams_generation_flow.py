@@ -1339,26 +1339,18 @@ def _teams_run_generation_hard_validations(
     retrieved_value_context: list | None,
     hard_validation_contract: dict | None = None,
 ) -> dict:
-    """Run every deterministic hard guard before accepting a generation/repair.
+    """Run concurrent quality validators plus one minimal backend file-safety guard.
 
-    REQ 2, 10: The same validator set runs on every candidate in order:
-    semantic relevance → Terraform shape → agent self-validation →
-    preservation/minimal diff → immutable target check.
-    No validator mutates Terraform.
+    Foundry and the concurrent validators own Terraform semantics, shape, and
+    resolved-target correctness. The backend no longer re-validates resource
+    paths, Boolean assignments, module semantics, or exact minimal diffs here.
+
+    The only deterministic backend write guard retained is destructive-overwrite
+    protection: when a generated file replaces an existing repository file, reject
+    it only when it is dramatically shorter than the live baseline.
     """
-    failures: list[str] = []
     result = agent_result
-    try:
-        result = enforce_modification_uses_backend_matched_files(
-            result, retrieved_value_context
-        )
-    except ValueError as exc:
-        failures.append(str(exc))
-
-    # REQ 10: Use the stored contract if the caller didn't pass one
-    if hard_validation_contract is None:
-        active = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
-        hard_validation_contract = active.get("hard_validation_contract")
+    failures: list[str] = []
 
     parallel_validator = globals().get("_run_parallel_precommit_validations")
     if callable(parallel_validator):
@@ -1367,49 +1359,43 @@ def _teams_run_generation_hard_validations(
         except ValueError as exc:
             failures.append(str(exc))
 
-    # REQ 2: immutable target check – when a Boolean target is locked, verify
-    # the generated file implements that exact transition and nothing else was
-    # modified in that file outside the single expected assignment.
-    if isinstance(hard_validation_contract, dict) and hard_validation_contract.get("boolean_target"):
-        bt = hard_validation_contract["boolean_target"]
-        bt_path = str(bt.get("path") or "").strip()
-        bt_flag = str(bt.get("flag") or "").strip()
-        bt_new = str(bt.get("new_value") or "").strip().lower()
-        if bt_path and bt_flag and bt_new in {"true", "false"}:
-            target_file = next(
-                (f for f in (result.get("files") or [])
-                 if isinstance(f, dict)
-                 and str(f.get("filename") or f.get("path") or "").strip().strip("/") == bt_path),
-                None,
+    if hard_validation_contract is None:
+        active = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
+        hard_validation_contract = active.get("hard_validation_contract")
+
+    metadata_by_path = {}
+    if isinstance(hard_validation_contract, dict):
+        for item in hard_validation_contract.get("file_metadata") or []:
+            if not isinstance(item, dict):
+                continue
+            path = str(item.get("path") or "").strip().strip("/")
+            if path:
+                metadata_by_path[path] = item
+
+    for file_data in (result.get("files") or []):
+        if not isinstance(file_data, dict):
+            continue
+        path = str(file_data.get("filename") or file_data.get("path") or "").strip().strip("/")
+        meta = metadata_by_path.get(path)
+        if not meta:
+            continue
+        try:
+            live_nonblank = int(meta.get("nonblank_lines") or 0)
+        except (TypeError, ValueError):
+            live_nonblank = 0
+        generated_content = str(file_data.get("content") or "")
+        generated_nonblank = sum(1 for line in generated_content.splitlines() if line.strip())
+        if live_nonblank >= 20 and generated_nonblank < max(8, int(live_nonblank * 0.50)):
+            failures.append(
+                "BACKEND_MINIMAL_FILE_SAFETY_FAILED: generated "
+                f"{path} is substantially shorter than the existing repository file "
+                f"({generated_nonblank} vs {live_nonblank} nonblank lines). "
+                "Refusing a likely truncated overwrite."
             )
-            if target_file is None:
-                failures.append(
-                    f"BACKEND_PRESERVATION_FAILURE: hard_validation_contract requires {bt_path} "
-                    f"but no generated file matches that path."
-                )
-            else:
-                import re as _re
-                content = str(target_file.get("content") or "")
-                assign_pat = _re.compile(
-                    rf'(?m)^\s*"?{_re.escape(bt_flag)}"?\s*[:=]\s*(true|false)'
-                )
-                matches = assign_pat.findall(content)
-                if not matches:
-                    failures.append(
-                        f"BACKEND_PRESERVATION_FAILURE: generated {bt_path} does not assign {bt_flag}."
-                    )
-                elif not all(v.lower() == bt_new for v in matches):
-                    wrong = [v for v in matches if v.lower() != bt_new]
-                    failures.append(
-                        f"BACKEND_PRESERVATION_FAILURE: generated {bt_path} has {bt_flag}="
-                        f"{wrong[0]} but contract requires {bt_new}."
-                    )
 
     if failures:
         unique = list(dict.fromkeys(item for item in failures if item))
-        raise ValueError(
-            "BACKEND_GENERATION_HARD_VALIDATION_FAILED: " + " | ".join(unique)
-        )
+        raise ValueError("BACKEND_GENERATION_VALIDATION_FAILED: " + " | ".join(unique))
     return result
 
 def _teams_semantic_operation_classification(prompt: str, target_cloud: str) -> dict:

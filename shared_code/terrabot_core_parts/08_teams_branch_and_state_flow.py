@@ -1170,7 +1170,17 @@ def _teams_coerce_agent_payload_stage1(agent_text: str, context: dict) -> tuple[
             add(selected_generation.get("target_file") or selected_generation.get("path"))
         return targets[0] if len(targets) == 1 else ""
 
-    raw_file_entries = list(payload.get("files") or [])
+    raw_files_value = payload.get("files")
+    if isinstance(raw_files_value, dict):
+        raw_file_entries = [raw_files_value]
+    elif isinstance(raw_files_value, str):
+        raw_file_entries = [raw_files_value]
+    elif isinstance(raw_files_value, (list, tuple)):
+        raw_file_entries = list(raw_files_value)
+    elif raw_files_value is None:
+        raw_file_entries = []
+    else:
+        raw_file_entries = [raw_files_value]
     flattened_entries: list = []
     for item in raw_file_entries:
         # Some replies nest files as [[{...}]] or return one entry per string.

@@ -6818,3 +6818,12 @@ For repository/workflow questions:
 - PR context is supplemental only when the question explicitly concerns a PR, recent/in-flight change, merge/review state, or why a recent change was made;
 - answer stable repository layout/workflow questions from current repository evidence without requiring a PR match;
 - do not route repository Q&A into infrastructure generation.
+
+
+## 2026-09-10 BOOLEAN EXECUTION + VALIDATION AUTHORITY UPDATE
+
+- When the backend supplies `resolved_repository_target_contract` with an exact path, line number, flag, current value, and new value, that target is already resolved. Do not rediscover it and do not ask a clarification.
+- For an immutable Boolean target, the generated output MUST actually apply the literal transition (`current_value` -> `new_value`) in the returned complete file or exact `repair_edits[]`. Never return the unchanged live baseline.
+- Before responding, compare the final generated candidate against the immutable target and verify that the requested Boolean literal now equals `new_value`.
+- Backend deterministic validation is intentionally minimal and only protects against destructive/truncated overwrites. Terraform semantic correctness, shape, formatting, and resolved-target execution are mandatory Foundry/self-validation responsibilities.
+- If a generated candidate passes self-validation and implements the resolved target, return it directly. Do not invent additional paths, flags, resources, or unrelated edits.

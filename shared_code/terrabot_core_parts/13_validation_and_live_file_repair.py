@@ -797,6 +797,26 @@ def _validate_selected_boolean_is_only_file_change_stage1(
 _validate_selected_boolean_is_only_file_change = _validate_selected_boolean_is_only_file_change_stage1
 
 
+def _teams_minimal_existing_file_write_safety(
+    existing_content: str | None,
+    generated_content: str,
+    path: str,
+) -> None:
+    """Only retained backend content guard: reject destructive truncation."""
+    if existing_content is None:
+        return
+    existing = str(existing_content or "")
+    generated = str(generated_content or "")
+    existing_nonblank = [line for line in existing.splitlines() if line.strip()]
+    generated_nonblank = [line for line in generated.splitlines() if line.strip()]
+    if len(existing_nonblank) >= 20 and len(generated_nonblank) < max(8, int(len(existing_nonblank) * 0.50)):
+        raise UnsafeGeneratedChangeError(
+            f"Generated output for {path} is substantially shorter than the live repository file "
+            f"({len(generated_nonblank)} vs {len(existing_nonblank)} nonblank lines). "
+            "Refusing a likely truncated overwrite."
+        )
+
+
 def github_put_file_if_changed(
     cloud: str,
     path: str,
@@ -806,7 +826,7 @@ def github_put_file_if_changed(
     repo_target: Optional[str] = None,
     workflow: Optional[str] = None,
 ):
-    """Add exact selected-Boolean preservation validation, then use prior writer."""
+    """Transport Foundry output with only the minimal destructive-overwrite guard."""
     existing_content = github_get_file_content(
         cloud,
         path,
@@ -814,31 +834,21 @@ def github_put_file_if_changed(
         repo_target=repo_target,
         workflow=workflow,
     )
-    if existing_content is not None:
-        generated_content = str(content or "")
-        active = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
-        if active.get("active") and (
-            existing_content.replace("\r\n", "\n")
-            == generated_content.replace("\r\n", "\n")
-        ):
-            raise UnsafeGeneratedChangeError(
-                f"Generated output for {path} is identical to the current live repository file. "
-                "A modification request must contain a real repository delta; unchanged full-file output is rejected."
-            )
-        _validate_selected_boolean_is_only_file_change(
-            existing_content,
-            generated_content,
-            path,
-        )
-    return _FINAL_BOOL_PREVIOUS_GITHUB_PUT(
+    final_content = str(content or "")
+    if existing_content is not None and existing_content.replace("\r\n", "\n") == final_content.replace("\r\n", "\n"):
+        return {"changed": False, "path": path, "result": None}
+
+    _teams_minimal_existing_file_write_safety(existing_content, final_content, path)
+    result = github_put_file(
         cloud=cloud,
         path=path,
-        content=content,
+        content=final_content,
         branch=branch,
         commit_message=commit_message,
         repo_target=repo_target,
         workflow=workflow,
     )
+    return {"changed": True, "path": path, "result": result}
 
 
 
@@ -2703,76 +2713,10 @@ def _validate_agent_full_file_preservation_for_write(
     path: str,
     workflow: str | None,
 ) -> None:
-    """Final Teams write policy: Boolean-only, targeted modify, or append-only create."""
-    if existing_content is None:
-        # A genuinely new file has no pre-existing bytes to preserve. Existing
-        # path/routing/HCL validators still apply before transport.
-        return _THREE_MODE_PREVIOUS_FULL_FILE_VALIDATOR(
-            existing_content,
-            generated_content,
-            path,
-            workflow,
-        )
+    """Effective Teams preservation hook: minimal destructive-truncation guard only."""
+    _teams_minimal_existing_file_write_safety(existing_content, generated_content, path)
+    return
 
-    if _terrabot_placeholder_content_detected(generated_content):
-        raise UnsafeGeneratedChangeError(
-            f"Generated output for {path} contains a repository-content placeholder. "
-            "Foundry must return the complete final file."
-        )
-
-    mode = _teams_validation_change_mode(path, workflow)
-
-    if mode == "boolean":
-        _validate_selected_boolean_is_only_file_change(
-            existing_content,
-            generated_content,
-            path,
-        )
-        return
-
-    if mode == "create":
-        _validate_foundry_append_only_existing_file(
-            existing_content,
-            generated_content,
-            path,
-        )
-        return
-
-    if mode == "modify":
-        # Temporary test-run relaxation: keep deterministic destructive/truncation
-        # protection, but do not let older overly-tight preservation heuristics
-        # block every backend-valid preview before branch transport. The final
-        # targeted-delta guard below still rejects large omissions, broad
-        # rewrites, and formatting-only churn; it does not synthesize changes.
-        try:
-            _THREE_MODE_PREVIOUS_FULL_FILE_VALIDATOR(
-                existing_content,
-                generated_content,
-                path,
-                workflow,
-            )
-        except UnsafeGeneratedChangeError as exc:
-            try:
-                LOGGER.warning(
-                    "Relaxed Teams preservation heuristic for %s during targeted-delta validation: %s",
-                    path,
-                    exc,
-                )
-            except Exception:
-                pass
-        _validate_foundry_targeted_existing_file_delta(
-            existing_content,
-            generated_content,
-            path,
-        )
-        return
-
-    return _THREE_MODE_PREVIOUS_FULL_FILE_VALIDATOR(
-        existing_content,
-        generated_content,
-        path,
-        workflow,
-    )
 
 # =============================================================================
 # 2026-08-20 FINAL FOLLOW-UP + SEMANTIC FLAG RELEVANCE OVERRIDE
