@@ -1798,8 +1798,9 @@ def _commit_terraform_files_to_branch_for_teams_v1(
             state["environment_path"] = repo_path.rsplit("/", 1)[0]
 
     repo = github_repo_for_cloud(cloud, repo_target=repo_target, workflow=workflow)
-    branch_url = f"https://github.com/{GITHUB_OWNER}/{repo}/tree/{branch_name}"
-    compare_url = f"https://github.com/{GITHUB_OWNER}/{repo}/compare/{base_branch}...{branch_name}"
+    _urls = _terrabot_github_branch_urls(GITHUB_OWNER, repo, base_branch, branch_name)
+    branch_url = _urls["branch_url"]
+    compare_url = _urls["compare_url"]
     branch_history = list(state.get("branch_history") or [])
     if branch_name not in branch_history:
         branch_history.append(branch_name)
@@ -1817,6 +1818,7 @@ def _commit_terraform_files_to_branch_for_teams_v1(
         "compare_url": compare_url,
         "branch_history": branch_history[-20:],
         "has_open_pr": bool(state.get("has_open_pr")) if branch_reused else False,
+        "request_identity": dict(agent_result.get("_terrabot_request_identity") or {}),
     })
     set_last_selected_cloud(thread_id, cloud)
     return {
@@ -1837,6 +1839,7 @@ def _commit_terraform_files_to_branch_for_teams_v1(
         "state": state,
         "branch_reused": branch_reused,
         "created_new_branch": created_new_branch,
+        "request_identity": dict(agent_result.get("_terrabot_request_identity") or {}),
         "message": (
             "Terraform changes were committed to the existing Terrabot GitHub branch."
             if branch_reused else
@@ -4951,6 +4954,21 @@ def _validate_azure_object_backed_three_file_write_set(
                         f"The concrete {target_root} object does not match the "
                         f"nearest sibling {source_root} field shape."
                     )
+
+def _terrabot_github_branch_urls(owner: str, repo: str, base_branch: str, branch_name: str) -> dict:
+    """Build stable GitHub URLs once at commit time; downstream must reuse these exact values."""
+    try:
+        from urllib.parse import quote as _quote
+        branch_ref = _quote(str(branch_name or ""), safe="/")
+        base_ref = _quote(str(base_branch or ""), safe="/")
+    except Exception:
+        branch_ref = str(branch_name or "")
+        base_ref = str(base_branch or "")
+    return {
+        "branch_url": f"https://github.com/{owner}/{repo}/tree/{branch_ref}",
+        "compare_url": f"https://github.com/{owner}/{repo}/compare/{base_ref}...{branch_ref}",
+    }
+
 
 def commit_terraform_files_to_branch_for_teams_stage1(agent_result: dict, prompt: str, thread_id: str) -> dict:
     """Apply Teams modifications surgically, then use the existing branch writer."""

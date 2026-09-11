@@ -2094,7 +2094,18 @@ def _teams_plain_chat_reply(
         except Exception:
             reply = "I did not detect a new infrastructure change request. Please state the change explicitly when you want Terraform generated."
 
-    return {"ok": True, "mode": "chat", "reply": reply}, 200
+    source_paths = list(grounding.get("repo_paths") or [])[:12] if isinstance(grounding, dict) else []
+    if source_paths and normalized not in greetings:
+        reply = reply.rstrip() + "\n\nRepository evidence: " + ", ".join(f"`{path}`" for path in source_paths)
+    return {
+        "ok": True,
+        "mode": "chat",
+        "foundry_intent": "repo_qna" if source_paths else "chat",
+        "reply": reply,
+        "analysis": "Repository Q&A answer grounded in live GitHub repository evidence." if source_paths else "",
+        "source_paths_used": source_paths,
+        "repository_qna": bool(source_paths),
+    }, 200
 
 
 def _teams_compact_agent_input(agent_input: str, max_chars: int = 90000) -> str:
@@ -2794,6 +2805,7 @@ def _teams_attach_repository_context(agent_input: str, active: dict) -> str:
             str(value).strip() for value in (diagnostics.get("context_ids") or []) if str(value).strip()
         }
         merged_ids.update(context_ids)
+        merged_ids.update(required_ids)
         stages = [str(value) for value in (diagnostics.get("attachment_stages") or []) if str(value)]
         if context_block and "generation" not in stages:
             stages.append("generation")
@@ -2832,7 +2844,7 @@ def _teams_attach_repository_context(agent_input: str, active: dict) -> str:
             "retrieved": True,
             "attached": attached,
             "generation_attached": attached,
-            "context_ids": selected_ids,
+            "context_ids": sorted(set(selected_ids) | set(required_ids)),
             "attachment_invariant_repaired": attached,
         })
         active["repository_context_test_diagnostics"] = diagnostics

@@ -6839,3 +6839,24 @@ FINAL TERRABOT E2E EXECUTION CONTRACT - 2026-09-10
 6. For creation/provisioning, generate executable Terraform in the first generation response after repository evidence is supplied. Use the closest live sibling pattern. Do not stop at a repository-placement question.
 7. For Azure object-backed creation, return the resource-family .tf file, variables.tf if a new object root is needed, and the scoped tfvars file in the same response. For AWS consumer/module creation, return the complete target consumer plus required module files in the same response.
 8. JSON only. No prose outside the JSON object. No markdown fences. No empty files array. No placeholders for omitted repository content.
+
+
+---
+
+## Terrabot E2E final production guardrails -
+
+These rules refine the existing Terraform generation contract without replacing earlier repository-specific guidance.
+
+1. **Repository context reuse is mandatory when supplied.** If the backend supplies `shared_repository_context`, `required_repository_context_ids`, `resolved_repository_target`, or `immutable_boolean_output_contract`, read those sections before target selection. Revalidate the mapped path/flag/module/resource against current live files, then generate immediately. Do not ask a clarification for file path, flag name, module name, or permission when the supplied context remains live-valid.
+
+2. **No unrelated-output repairs.** When a validator reports `PROMPT_OUTPUT_MISMATCH` or says generated module/resource references are unrelated to the user request, discard the unrelated generated files and reselect from the backend-supplied live evidence. The next response must modify or create only the resource behavior named in `original_user_request`. Do not keep any prior module/resource just because it appeared in a rejected candidate.
+
+3. **All validators must remain satisfied after a repair.** A repair response must fix the reported validator failure while still satisfying Terraform shape, semantic relevance, agent self-validation, preservation, path authorization, HCL completeness, and branch-write safety. Never trade one validator failure for another.
+
+4. **Generation must not drop Terraform files.** If the task is an infrastructure mutation and live evidence/resolved target is present, return executable Terraform output: non-empty `files[]` with complete final files, or `repair_edits[]` when the backend explicitly requests surgical edits. Do not return `files=[]`, prose-only answers, or a clarification as a substitute for code.
+
+5. **Boolean-context continuation.** For Phase 2 or follow-up Boolean requests, if repository context or a resolved target identifies one live Boolean assignment, change exactly that one literal value and preserve every other byte/line. `questions=[]` is required.
+
+6. **Branch/request isolation.** Treat each user request as independent unless the backend explicitly says `reuse_existing_branch=true`. Do not reuse files, branch names, repair candidates, or generated output from any previous request.
+
+7. **Azure/AWS creation isolation.** Resource-creation output must contain only the creation requested in the current prompt. Do not commit Boolean-toggle output or a previous request's files into a creation branch.

@@ -564,6 +564,65 @@ def _teams_extract_ticket_link_from_prompt(prompt: str) -> str:
     )
     return (match.group(0).rstrip(".,);]") if match else "")
 
+
+def _terrabot_request_identity_from_data(data: dict, conversation_id: str, prompt: str, agent_result: dict | None = None) -> dict:
+    """Request-local ownership marker used to prevent cross-request branch contamination."""
+    import hashlib as _hashlib
+    result = dict(agent_result or {}) if isinstance(agent_result, dict) else {}
+    files = []
+    for item in result.get("files") or []:
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("filename") or item.get("path") or "").strip().strip("/")
+        if path:
+            files.append(path)
+    return {
+        "conversation_id": str(conversation_id or "").strip(),
+        "teams_conversation_id": str((data or {}).get("teams_conversation_id") or (data or {}).get("conversation_id") or "").strip(),
+        "automated_test_phase": str((data or {}).get("automated_test_phase") or ""),
+        "automated_test_case_id": str((data or {}).get("automated_test_case_id") or ""),
+        "automated_test_case_type": str((data or {}).get("automated_test_case_type") or ""),
+        "cloud": str(result.get("cloud") or (data or {}).get("cloud") or (data or {}).get("requested_cloud") or "").strip().lower(),
+        "workflow": str(result.get("workflow") or (data or {}).get("workflow") or "").strip(),
+        "repo_target": str(result.get("repo_target") or (data or {}).get("repo_target") or "").strip(),
+        "prompt_sha256": _hashlib.sha256(str(prompt or "").strip().encode("utf-8")).hexdigest(),
+        "files": files,
+    }
+
+
+def _terrabot_attach_request_identity(agent_result: dict, data: dict, conversation_id: str, prompt: str) -> dict:
+    result = dict(agent_result or {})
+    result["_terrabot_request_identity"] = _terrabot_request_identity_from_data(data, conversation_id, prompt, result)
+    return result
+
+
+def _terrabot_validate_pending_request_identity(pending: dict, data: dict, conversation_id: str) -> None:
+    """Fail closed when a pending preview belongs to a different test/request."""
+    expected = (data or {}).get("expected_pending_request_identity") or {}
+    agent_result = (pending or {}).get("agent_result") or {}
+    actual = agent_result.get("_terrabot_request_identity") if isinstance(agent_result, dict) else {}
+    if not isinstance(actual, dict) or not actual:
+        # Legacy pending records remain supported. New previews carry this marker.
+        return
+    errors = []
+    pending_thread = str((pending or {}).get("thread_id") or "").strip()
+    if pending_thread and str(conversation_id or "").strip() and pending_thread != str(conversation_id or "").strip():
+        errors.append(f"pending thread {pending_thread} != current thread {conversation_id}")
+    for key in ("automated_test_case_id", "cloud"):
+        wanted = str((expected or {}).get("case_id" if key == "automated_test_case_id" else key) or (data or {}).get(key) or "").strip().lower()
+        got = str(actual.get(key) or "").strip().lower()
+        if wanted and got and wanted != got:
+            errors.append(f"{key} mismatch expected={wanted} actual={got}")
+    expected_conversation = str((expected or {}).get("conversation_id") or (data or {}).get("teams_conversation_id") or (data or {}).get("conversation_id") or "").strip()
+    actual_conversation = str(actual.get("teams_conversation_id") or actual.get("conversation_id") or "").strip()
+    if expected_conversation and actual_conversation and expected_conversation != actual_conversation:
+        errors.append(f"conversation mismatch expected={expected_conversation} actual={actual_conversation}")
+    if errors:
+        raise ValueError(
+            "PENDING_CHANGE_OWNERSHIP_MISMATCH: refusing to commit a Terraform preview from another request: "
+            + "; ".join(errors)
+        )
+
 def _teams_backend_flag_enable_envelope(
     prompt: str,
     retrieved_value_context: list | None,
@@ -1849,6 +1908,18 @@ def handle_chat_request(data: dict):
             pending = get_pending_infra_change_by_id(pending_change_id)
             if not pending:
                 return {"ok": False, "mode": "chat", "reply": "There are no pending infrastructure changes to commit."}, 400
+            try:
+                _terrabot_validate_pending_request_identity(pending, data, conversation_id)
+            except ValueError as ownership_error:
+                return {
+                    "ok": False,
+                    "mode": "pending_change_mismatch",
+                    "reply": "Terrabot refused to commit because the pending Terraform preview belongs to a different request. Start a fresh generation for this change.",
+                    "thread_id": conversation_id,
+                    "pending_change_id": pending_change_id,
+                    "diagnostic_code": "PENDING_CHANGE_OWNERSHIP_MISMATCH",
+                    "diagnostic_detail": str(ownership_error),
+                }, 409
             token = (data.get("github_token") or _ACTIVE_GITHUB_TOKEN.get() or "").strip()
             if not token:
                 return {"ok": False, "mode": "github_auth_required", "reply": "Connect GitHub before Terrabot creates the branch."}, 401
@@ -1895,7 +1966,15 @@ def handle_chat_request(data: dict):
             return {
                 "ok": True,
                 "mode": "branch_created",
-                "reply": branch_result["message"],
+                "reply": (
+                    branch_result.get("message") or "Terraform changes were committed to a Terrabot GitHub branch."
+                ) + (
+                    f"\n\nRepository: `{branch_result.get('repo') or pending.get('agent_result', {}).get('repo_target') or ''}`"
+                    f"\nBranch: `{branch_result.get('branch') or ''}`"
+                    f"\nBranch URL: {branch_result.get('branch_url') or ''}"
+                    f"\nCompare URL: {branch_result.get('compare_url') or ''}"
+                    f"\nGenerated files: {', '.join(branch_result.get('files') or []) if branch_result.get('files') else 'No changed files reported'}"
+                ),
                 "thread_id": conversation_id,
                 "pending_change_id": pending_change_id,
                 "branch": branch_result["branch"],
@@ -2582,6 +2661,7 @@ def handle_chat_request(data: dict):
                          retrieved_value_context,
                     )
 
+                    agent_result = _terrabot_attach_request_identity(agent_result, data, conversation_id, repo_creation_prompt)
                     pending_key = store_pending_infra_change(
                         conversation_id,
                         ticket_number,
@@ -3162,6 +3242,7 @@ def handle_chat_request(data: dict):
                         requested_repo_name=requested_repo_name,
                     )
 
+                    agent_result = _terrabot_attach_request_identity(agent_result, data, conversation_id, repo_creation_prompt)
                     pending_key = store_pending_infra_change(
                         conversation_id,
                         ticket_number,
@@ -5008,6 +5089,7 @@ def handle_chat_request(data: dict):
                         }, 200
 
             try:
+                agent_result = _terrabot_attach_request_identity(agent_result, data, conversation_id, effective_prompt)
                 pending_key = store_pending_infra_change(
                     conversation_id,
                     ticket_number,
@@ -5017,6 +5099,7 @@ def handle_chat_request(data: dict):
                     ticket_title=ticket_title,
                 )
             except TypeError:
+                agent_result = _terrabot_attach_request_identity(agent_result, data, conversation_id, effective_prompt)
                 pending_key = store_pending_infra_change(
                     conversation_id,
                     ticket_number,

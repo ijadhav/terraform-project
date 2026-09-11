@@ -1479,6 +1479,16 @@ def _commit_preview_to_test_branch(
         "automated_test_phase": 1,
         "allow_failed_validation_branch_push": True,
         "test_allow_failed_validation_branch_push": True,
+        "expected_pending_request_identity": {
+            "run_id": run_id,
+            "case_id": case.case_id,
+            "case_type": case.case_type,
+            "conversation_id": str(original_request.get("teams_conversation_id") or original_request.get("conversation_id") or ""),
+            "cloud": case.cloud,
+            "repo": case.repo,
+            "path": case.path,
+            "flag": case.flag,
+        },
     })
     return helper(commit_request, preview, 200)
 
@@ -2825,6 +2835,19 @@ def _escape_table(value: Any, limit: int = 56) -> str:
     return text
 
 
+def _markdown_link(label: Any, url: Any, label_limit: int = 42) -> str:
+    raw_url = str(url or "").strip()
+    if not raw_url:
+        return "N/A"
+    label_text = re.sub(r"\s+", " ", str(label or raw_url)).strip() or "branch"
+    label_text = label_text.replace("|", "\\|")
+    if len(label_text) > label_limit:
+        label_text = label_text[: label_limit - 1] + "…"
+    # Do not truncate the href; Teams/GitHub need the exact branch URL.
+    safe_url = raw_url.replace(")", "%29").replace(" ", "%20")
+    return f"[{label_text}]({safe_url})"
+
+
 def _status(value: bool) -> str:
     return "PASS" if value else "FAIL"
 
@@ -2943,7 +2966,7 @@ def format_test_run_report(run: TestRunResult) -> str:
                     _status(item.expected_target_found),
                     _status(item.phase1_file_generated),
                     _status(item.validation_ok),
-                    _escape_table(item.branch_url or "N/A", 50),
+                    _markdown_link(item.branch_name or "branch", item.branch_url),
                     _status(item.branch_pushed),
                     context_status,
                     p2_context_status,
@@ -2970,7 +2993,7 @@ def format_test_run_report(run: TestRunResult) -> str:
                     _escape_table(check.get("question_id") or "", 22),
                     _escape_table(check.get("repository") or "", 32),
                     _escape_table(check.get("question") or "", 60),
-                    _escape_table(check.get("terrabot_answer") or "", 80),
+                    _escape_table((check.get("terrabot_answer") or "") + ((" Evidence: " + ", ".join(check.get("evidence_paths") or [])[:120]) if check.get("evidence_paths") else ""), 110),
                     _status(bool(check.get("backend_ok"))),
                     _escape_table(check.get("backend_intent") or "", 40),
                 ])
@@ -3042,11 +3065,10 @@ def format_test_run_report(run: TestRunResult) -> str:
                 reasons.append("creation test case was invalid (singleton/gated module)")
             branch_note = ""
             if item.branch_url:
-                branch_note = f" branch=[{item.branch_name or 'view'}]({item.branch_url})"
+                branch_note = " branch=" + _markdown_link(item.branch_name or "branch", item.branch_url, 64)
             elif item.branch_name:
                 branch_note = f" branch={item.branch_name}"
-            if item.diag_branch_url:
-                branch_note += f" diag=[{item.diag_branch_name or 'diag'}]({item.diag_branch_url})"
+            # Diagnostic branches are kept in JSON artifacts, but omitted from the Teams summary to avoid confusing users.
             lines.append(f"- `{item.case.case_id}`:{branch_note} {_escape_table('; '.join(reasons), 360)}")
 
     if run.discovery_errors:

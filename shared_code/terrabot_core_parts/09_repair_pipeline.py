@@ -477,6 +477,16 @@ def _teams_build_backend_repair_payload(
         "resolved_repository_target": dict((flow_context or (_ACTIVE_TEAMS_FLOW_CONTEXT.get() or {})).get("resolved_repository_target_contract") or {}),
         "hard_validation_contract": hard_validation_contract,
         "exact_edit_hints": exact_edit_hints,
+        "semantic_relevance_repair_rules": (
+            [
+                "PROMPT_OUTPUT_MISMATCH repair: the previous files referenced Terraform modules/resources unrelated to original_user_request.",
+                "Discard unrelated generated module/resource references and reselect the target from resolved_repository_target, exact_edit_hints, retrieved_value_context, and live repair_files only.",
+                "The repaired output must modify/create only the resource behavior named by original_user_request; do not keep otel_collector, patch management, monitoring, IAM, LB, or any other module unless the current user request explicitly asks for it.",
+                "Before returning, compare every generated module/resource label and source against original_user_request and backend evidence; if unrelated, remove it and regenerate the correct file.",
+            ]
+            if "prompt_output_mismatch" in str(backend_error).lower() or "unrelated to the current request" in str(backend_error).lower()
+            else []
+        ),
         "expected_cloud": current_result.get("cloud"),
         "expected_workflow": current_result.get("workflow"),
         "expected_repo_target": current_result.get("repo_target"),
