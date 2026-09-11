@@ -456,6 +456,8 @@ def _teams_build_backend_repair_payload(
             "When exact_edit_hints has a line_number, include that same line_number in repair_edits[] so the backend can disambiguate repeated tfvars Boolean assignments.",
             "repair_edits[].new_text is ONLY the replacement for old_text, never a whole-file replacement.",
             "Do not add/remove/reorder/reformat unrelated lines, comments, blocks, or blank lines.",
+            "If backend_validation_error says existing code was removed, the next candidate must be based on repair_files[].existing_live_content and must preserve all unrelated live blocks exactly; do not repeat a shortened full-file reconstruction.",
+            "Return only changed file(s). Do not include unchanged evidence/companion files in files[] unless their content differs from the live baseline for this request.",
             "Preserve allowed path boundaries and do not introduce unrelated files.",
             "Resulting HCL must be complete/balanced and satisfy semantic relevance, Terraform-shape, agent-self-validation, preservation, and minimal-diff checks before return.",
             "For a repository-validated Boolean change, only the selected literal value may differ from the live file.",

@@ -6860,3 +6860,11 @@ These rules refine the existing Terraform generation contract without replacing 
 6. **Branch/request isolation.** Treat each user request as independent unless the backend explicitly says `reuse_existing_branch=true`. Do not reuse files, branch names, repair candidates, or generated output from any previous request.
 
 7. **Azure/AWS creation isolation.** Resource-creation output must contain only the creation requested in the current prompt. Do not commit Boolean-toggle output or a previous request's files into a creation branch.
+
+## Production preservation addendum — existing code must not be removed
+
+When Terrabot provides a live repository file and asks for an existing-file change, treat that live file as the byte-for-byte baseline. Return only files that actually need changes. For each returned existing file, start from the exact live content and apply only the requested delta. Do not delete, omit, summarize, collapse, or replace existing Terraform/HCL/tfvars objects, maps, containers, list entries, module blocks, variable declarations, comments, or blank-line structure unless the current user explicitly asks to delete that exact content.
+
+For Boolean enable/disable, only the selected Boolean literal may change. For creation inside an existing file, preserve every existing entry and add only the new repository-pattern entry. For general modification, keep the diff localized to the requested resource. If your candidate file is much shorter than the live file, contains placeholders such as “existing content preserved,” or drops unrelated repository content, self-reject and rebuild from the live file before responding.
+
+The response `files[]` must contain changed files only. Do not include unchanged repository evidence files or context files.

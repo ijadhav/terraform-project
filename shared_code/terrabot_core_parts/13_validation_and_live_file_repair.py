@@ -802,18 +802,89 @@ def _teams_minimal_existing_file_write_safety(
     generated_content: str,
     path: str,
 ) -> None:
-    """Only retained backend content guard: reject destructive truncation."""
+    """Reject destructive existing-file rewrites while preserving working flows.
+
+    This guard is deliberately semantic-neutral: it does not choose a Terraform
+    target, merge generated HCL, or repair code. It only prevents the class of
+    bad branch diff where Foundry returns a shortened/reconstructed existing
+    file and deletes unrelated live repository blocks. Creation and modification
+    outputs may still add or replace the requested local block, but they must not
+    remove a large portion of the current file unless the user explicitly asked
+    for deletion.
+    """
     if existing_content is None:
         return
-    existing = str(existing_content or "")
-    generated = str(generated_content or "")
-    existing_nonblank = [line for line in existing.splitlines() if line.strip()]
-    generated_nonblank = [line for line in generated.splitlines() if line.strip()]
-    if len(existing_nonblank) >= 20 and len(generated_nonblank) < max(8, int(len(existing_nonblank) * 0.50)):
+    existing = str(existing_content or "").replace("\r\n", "\n")
+    generated = str(generated_content or "").replace("\r\n", "\n")
+    if existing == generated:
+        return
+
+    if _terrabot_placeholder_content_detected(generated):
         raise UnsafeGeneratedChangeError(
-            f"Generated output for {path} is substantially shorter than the live repository file "
-            f"({len(generated_nonblank)} vs {len(existing_nonblank)} nonblank lines). "
-            "Refusing a likely truncated overwrite."
+            f"Generated output for {path} contains a placeholder for existing repository content. "
+            "Foundry must return the complete real file or omit the unchanged file."
+        )
+
+    # A locked Boolean request is stricter: exactly one selected literal may
+    # change. Keep this path isolated from the broader deletion heuristics.
+    if _selected_feature_flag_match_from_active_context(path):
+        _validate_selected_boolean_is_only_file_change(existing, generated, path)
+        return
+
+    import difflib as _difflib
+
+    active = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
+    effective_prompt = str(active.get("effective_prompt") or "").lower()
+    explicit_delete = bool(re.search(
+        r"\b(?:delete|remove|drop|destroy|decommission|tear\s+down)\b",
+        effective_prompt,
+    ))
+
+    existing_lines = existing.splitlines()
+    generated_lines = generated.splitlines()
+    existing_nonblank = [line for line in existing_lines if line.strip()]
+    generated_nonblank = [line for line in generated_lines if line.strip()]
+    if len(existing_nonblank) < 20:
+        return
+
+    matcher = _difflib.SequenceMatcher(a=existing_lines, b=generated_lines, autojunk=False)
+    deleted_nonblank = 0
+    changed_existing_nonblank = 0
+    changed_regions = 0
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        changed_regions += 1
+        old_segment = existing_lines[i1:i2]
+        new_segment = generated_lines[j1:j2]
+        old_nonblank = sum(1 for line in old_segment if line.strip())
+        new_nonblank = sum(1 for line in new_segment if line.strip())
+        changed_existing_nonblank += old_nonblank
+        if tag == "delete":
+            deleted_nonblank += old_nonblank
+        elif tag == "replace" and old_nonblank > new_nonblank:
+            deleted_nonblank += old_nonblank - new_nonblank
+
+    existing_count = max(1, len(existing_nonblank))
+    generated_count = len(generated_nonblank)
+    deleted_fraction = deleted_nonblank / existing_count
+    generated_fraction = generated_count / existing_count
+    similarity = matcher.ratio()
+
+    # The screenshot failure is a large net deletion from an existing tfvars file
+    # (+tiny addition, -large existing object). Block that deterministically.
+    # Legitimate creation/modification additions normally have near-zero deletion.
+    if not explicit_delete and (
+        deleted_nonblank > max(18, int(existing_count * 0.18))
+        or generated_fraction < 0.80
+        or (similarity < 0.62 and changed_existing_nonblank > max(30, int(existing_count * 0.30)))
+    ):
+        raise UnsafeGeneratedChangeError(
+            f"Generated output for {path} removes or rewrites too much existing repository content "
+            f"(deleted_nonblank={deleted_nonblank}, live_nonblank={existing_count}, "
+            f"generated_nonblank={generated_count}, similarity={similarity:.3f}, "
+            f"changed_regions={changed_regions}). Foundry must start from the exact live file, "
+            "preserve every unrelated line/block, and return only files that actually need changes."
         )
 
 
