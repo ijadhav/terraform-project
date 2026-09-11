@@ -797,6 +797,108 @@ def _validate_selected_boolean_is_only_file_change_stage1(
 _validate_selected_boolean_is_only_file_change = _validate_selected_boolean_is_only_file_change_stage1
 
 
+
+def _terrabot_hcl_strip_strings_for_depth(line: str) -> str:
+    """Remove quoted string bodies before counting HCL braces/brackets."""
+    result = []
+    in_string = False
+    escape = False
+    for char in str(line or ""):
+        if in_string:
+            if escape:
+                escape = False
+                result.append(" ")
+                continue
+            if char == "\\":
+                escape = True
+                result.append(" ")
+                continue
+            if char == '"':
+                in_string = False
+                result.append('"')
+            else:
+                result.append(" ")
+            continue
+        if char == '"':
+            in_string = True
+            result.append('"')
+        else:
+            result.append(char)
+    return "".join(result)
+
+
+def _terrabot_hcl_top_level_structure_inventory(path: str, content: str) -> set[str]:
+    """Return top-level HCL/tfvars structures that must survive rewrites.
+
+    This is intentionally structural only: no Terraform resource semantics,
+    no ordering checks, no nested-attribute checks, and no formatting checks.
+    """
+    normalized_path = str(path or "").strip().lower()
+    text = str(content or "").replace("\r\n", "\n")
+    structures: set[str] = set()
+    depth = 0
+    for raw_line in text.splitlines():
+        line = str(raw_line or "")
+        stripped = line.strip()
+        if not stripped or stripped.startswith(("#", "//")):
+            cleaned = _terrabot_hcl_strip_strings_for_depth(line)
+            depth = max(0, depth + cleaned.count("{") + cleaned.count("[") - cleaned.count("}") - cleaned.count("]"))
+            continue
+
+        if depth == 0:
+            if normalized_path.endswith((".tfvars", ".tfvars.json")):
+                assign = re.match(r'^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=', line)
+                if assign:
+                    structures.add(f"tfvars assignment `{assign.group(1)}`")
+            elif normalized_path.endswith(".tf"):
+                block = re.match(
+                    r'^\s*(module|resource|data|variable|output)\s+"([^"]+)"(?:\s+"([^"]+)")?\s*\{',
+                    line,
+                )
+                if block:
+                    kind = block.group(1)
+                    first = block.group(2)
+                    second = block.group(3)
+                    label = f'{kind} "{first}"' + (f' "{second}"' if second else "")
+                    structures.add(label)
+                elif re.match(r'^\s*locals\s*\{', line):
+                    structures.add("locals")
+
+        cleaned = _terrabot_hcl_strip_strings_for_depth(line)
+        depth = max(0, depth + cleaned.count("{") + cleaned.count("[") - cleaned.count("}") - cleaned.count("]"))
+    return structures
+
+
+def _terrabot_validate_hcl_structure_preserved(existing_content: str, generated_content: str, path: str) -> None:
+    """Reject generated files that drop top-level Terraform/HCL structures."""
+    normalized_path = str(path or "").strip().lower()
+    if not normalized_path.endswith((".tf", ".tfvars", ".tfvars.json")):
+        return
+    existing_structures = _terrabot_hcl_top_level_structure_inventory(path, existing_content)
+    if not existing_structures:
+        return
+    generated_structures = _terrabot_hcl_top_level_structure_inventory(path, generated_content)
+    removed = sorted(existing_structures - generated_structures)
+    if not removed:
+        return
+
+    active = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
+    effective_prompt = str(active.get("effective_prompt") or "").lower()
+    explicit_delete = bool(re.search(
+        r"\b(?:delete|remove|drop|destroy|decommission|tear\s+down)\b",
+        effective_prompt,
+    ))
+    if explicit_delete:
+        return
+
+    preview = "; ".join(removed[:18])
+    raise UnsafeGeneratedChangeError(
+        f"Existing repository structures removed from {path}: {preview}. "
+        "The user did not request deleting these structures. Foundry must regenerate from the exact live file, "
+        "preserve every existing top-level map/block/assignment, apply only the requested infrastructure change, "
+        "and return only files that actually need changes."
+    )
+
 def _teams_minimal_existing_file_write_safety(
     existing_content: str | None,
     generated_content: str,
@@ -844,8 +946,7 @@ def _teams_minimal_existing_file_write_safety(
     generated_lines = generated.splitlines()
     existing_nonblank = [line for line in existing_lines if line.strip()]
     generated_nonblank = [line for line in generated_lines if line.strip()]
-    if len(existing_nonblank) < 20:
-        return
+    skip_size_guard = len(existing_nonblank) < 20
 
     matcher = _difflib.SequenceMatcher(a=existing_lines, b=generated_lines, autojunk=False)
     deleted_nonblank = 0
@@ -874,7 +975,7 @@ def _teams_minimal_existing_file_write_safety(
     # The screenshot failure is a large net deletion from an existing tfvars file
     # (+tiny addition, -large existing object). Block that deterministically.
     # Legitimate creation/modification additions normally have near-zero deletion.
-    if not explicit_delete and (
+    if not skip_size_guard and not explicit_delete and (
         deleted_nonblank > max(18, int(existing_count * 0.18))
         or generated_fraction < 0.80
         or (similarity < 0.62 and changed_existing_nonblank > max(30, int(existing_count * 0.30)))
@@ -886,6 +987,11 @@ def _teams_minimal_existing_file_write_safety(
             f"changed_regions={changed_regions}). Foundry must start from the exact live file, "
             "preserve every unrelated line/block, and return only files that actually need changes."
         )
+
+    # Final preservation stage: structure-aware guard. This catches a small diff
+    # that deletes an entire top-level tfvars object or Terraform block while
+    # keeping enough lines/similarity to pass the quantitative guard above.
+    _terrabot_validate_hcl_structure_preserved(existing, generated, path)
 
 
 def github_put_file_if_changed(
