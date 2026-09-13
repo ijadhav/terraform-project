@@ -2341,6 +2341,18 @@ def _handle_teams_chat_request_safe(data: dict):
         "repo_target": str(request_data.get("repo_target") or state.get("repo_target") or "").strip().lower(),
         "repo_name": str(request_data.get("repo_name") or state.get("repo") or "").strip(),
         "workflow": str(request_data.get("workflow") or state.get("workflow") or "").strip(),
+        # Request-local operation state. This is advisory routing state only; it
+        # does not change target resolution, Terraform generation, validation,
+        # branch creation, or repair behavior. It lets downstream gates know when
+        # a repository-complete creation must not be downgraded to clarification.
+        "operation_state": (
+            "boolean"
+            if isinstance(request_data.get("p1_resolved_target_contract") or request_data.get("resolved_repository_target_contract"), dict)
+            and (request_data.get("p1_resolved_target_contract") or request_data.get("resolved_repository_target_contract"))
+            else "create"
+            if re.search(r"\b(create|add|provision|deploy|build|make|one more|another|additional|new)\b", prompt or "", re.IGNORECASE)
+            else "modify"
+        ),
         "requester": str(request_data.get("teams_requester") or "").strip(),
         # Test-only observability. These fields do not alter routing/generation;
         # they let the isolated E2E harness prove that retrieved context was

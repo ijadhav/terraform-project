@@ -1528,6 +1528,12 @@ def _phase_request(case: TestCase, prompt: str, conversation_id: str, *, phase: 
         "automated_test_phase": phase,
         "automated_test_case_id": case.case_id,
         "automated_test_case_type": case.case_type,
+        # Test-only diagnostics. The production backend must never use these
+        # fields for routing/generation; they exist only to log router-vs-expected
+        # mismatches after the fact.
+        "test_expected_target": case.path,
+        "test_expected_flag": case.flag,
+        "test_expected_workflow": _automated_test_workflow(case),
         "fresh_infra_generation": True,
         "cloud": case.cloud,
         "requested_cloud": case.cloud,

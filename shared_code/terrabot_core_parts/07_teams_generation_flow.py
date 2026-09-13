@@ -3692,39 +3692,111 @@ def handle_chat_request(data: dict):
                     and not _get_confirmed_aws_module_selection(retrieved_value_context)
                     and (aws_module_discovery.get("matches") or [])
                 ):
-                    store_pending_aws_module_discovery(
-                        thread_id=conversation_id,
-                        ticket_number=ticket_number,
-                        original_prompt=effective_prompt,
-                        discovery={**aws_module_discovery, "decision_state": "aws_module_selection"},
-                        environment_path=aws_env_path or current_env_path or "terraform/dev_aws/minidev",
-                        proposed_module_path="",
-                        ticket_link=ticket_link,
-                        ticket_title=ticket_title,
-                    )
-                    return {
-                        "ok": False,
-                        "mode": "clarification",
-                        "reply": build_aws_existing_module_selection_reply(
-                            aws_module_discovery,
-                            environment_path=aws_env_path or current_env_path or "terraform/dev_aws/minidev",
-                        ),
-                        "thread_id": conversation_id,
-                        "conversation_label": conversation_label,
-                        "jira_ticket": ticket_number,
-                        "ticket_number": ticket_number,
-                        "ticket_link": ticket_link,
-                        "ticket_title": ticket_title,
-                        "router": {
-                            "request_type": "infra",
-                            "cloud": "aws",
-                            "workflow": "aws_module_selection",
-                            "reason": "Verified tf-devops AWS module option(s) found; user must select before generation.",
-                        },
-                        "decision_state": "aws_module_selection",
-                        "aws_module_discovery": aws_module_discovery,
-                        "environment_path": aws_env_path or current_env_path or "terraform/dev_aws/minidev",
-                    }, 400
+                    active_teams_flow = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
+                    matches = [item for item in (aws_module_discovery.get("matches") or []) if isinstance(item, dict)]
+                    resolved_env_path = aws_env_path or current_env_path or "terraform/dev_aws/minidev"
+                    creation_words = bool(re.search(
+                        r"\b(create|add|provision|deploy|build|make|one more|another|additional|new)\b",
+                        effective_prompt or "",
+                        re.IGNORECASE,
+                    ))
+                    repository_complete = False
+                    repository_complete_reason = ""
+                    if active_teams_flow.get("active") and creation_words and len(matches) == 1 and resolved_env_path:
+                        try:
+                            target_consumer_path = f"{str(resolved_env_path).strip().strip('/')}/main.tf"
+                            target_consumer_content = github_get_file_content(
+                                "aws",
+                                target_consumer_path,
+                                github_base_branch_for_cloud("aws", repo_target="tf-devops", workflow="aws_module_consumer"),
+                                repo_target="tf-devops",
+                                workflow="aws_module_consumer",
+                            )
+                            repository_complete = bool(target_consumer_content is not None)
+                            repository_complete_reason = "module_exists_and_environment_consumer_main_tf_exists" if repository_complete else "missing_consumer"
+                        except Exception as repository_complete_error:
+                            repository_complete_reason = f"missing_consumer:{repository_complete_error}"
+                            repository_complete = False
+
+                    if repository_complete:
+                        # Repository evidence is sufficient: a single verified module exists,
+                        # the target environment is resolved, and the destination consumer file
+                        # exists. Do not ask the user which module/path to use; generation must
+                        # proceed through the normal Foundry aws_module_consumer path.
+                        selected_match = dict(matches[0])
+                        verified_selected, selected_generation_context = _aws_selected_module_context_with_contents(
+                            selected_match,
+                            {**aws_module_discovery, "decision_state": "aws_module_selected", "selection_forced_by_repository_evidence": True},
+                            resolved_env_path,
+                        )
+                        retrieved_module_context = [verified_selected]
+                        retrieved_value_context = list(retrieved_value_context or [])
+                        retrieved_value_context = _remove_backend_existing_infra_contexts(retrieved_value_context)
+                        retrieved_value_context.append(
+                            _aws_selected_module_value_context(verified_selected, aws_module_discovery, resolved_env_path)
+                        )
+                        retrieved_value_context.append(selected_generation_context)
+                        effective_workflow = "aws_module_consumer"
+                        target_cloud = "aws"
+                        active_teams_flow["operation_state"] = "create"
+                        active_teams_flow["expected_workflow"] = effective_workflow
+                        active_teams_flow["expected_cloud"] = "aws"
+                        active_teams_flow["expected_repo_target"] = "tf-devops"
+                        active_teams_flow["retrieved_module_context"] = list(retrieved_module_context or [])
+                        active_teams_flow["retrieved_value_context"] = list(retrieved_value_context or [])
+                        _teams_diag_log(
+                            "aws_creation_repository_evidence_sufficient_forced_generation",
+                            thread=conversation_id,
+                            environment_path=resolved_env_path,
+                            selected_module=str(verified_selected.get("module_path") or verified_selected.get("module_source") or ""),
+                            target_file=str(selected_generation_context.get("target_file") or selected_generation_context.get("path") or ""),
+                            reason=repository_complete_reason,
+                        )
+                    else:
+                        clarification_reason = "semantic_ambiguity" if len(matches) > 1 else repository_complete_reason or "missing_module"
+                        _teams_diag_log(
+                            "aws_creation_clarification_reason",
+                            level="warning",
+                            thread=conversation_id,
+                            clarification_reason=clarification_reason,
+                            match_count=len(matches),
+                            environment_path=resolved_env_path,
+                        )
+                        store_pending_aws_module_discovery(
+                            thread_id=conversation_id,
+                            ticket_number=ticket_number,
+                            original_prompt=effective_prompt,
+                            discovery={**aws_module_discovery, "decision_state": "aws_module_selection"},
+                            environment_path=resolved_env_path,
+                            proposed_module_path="",
+                            ticket_link=ticket_link,
+                            ticket_title=ticket_title,
+                        )
+                        return {
+                            "ok": False,
+                            "mode": "clarification",
+                            "reply": build_aws_existing_module_selection_reply(
+                                aws_module_discovery,
+                                environment_path=resolved_env_path,
+                            ),
+                            "thread_id": conversation_id,
+                            "conversation_label": conversation_label,
+                            "jira_ticket": ticket_number,
+                            "ticket_number": ticket_number,
+                            "ticket_link": ticket_link,
+                            "ticket_title": ticket_title,
+                            "clarification_reason": clarification_reason,
+                            "repository_complete": False,
+                            "router": {
+                                "request_type": "infra",
+                                "cloud": "aws",
+                                "workflow": "aws_module_selection",
+                                "reason": "Verified tf-devops AWS module option(s) found, but repository evidence was not uniquely complete for automatic generation.",
+                            },
+                            "decision_state": "aws_module_selection",
+                            "aws_module_discovery": aws_module_discovery,
+                            "environment_path": resolved_env_path,
+                        }, 400
 
                 if (
                     aws_module_discovery.get("status") == "not_found"
@@ -4310,6 +4382,33 @@ def handle_chat_request(data: dict):
                         no_question_corrective = _teams_flagless_creation_corrective(
                             effective_prompt, retrieved_value_context
                         )
+                    if not no_question_corrective and target_cloud == "aws" and effective_workflow == "aws_module_consumer":
+                        selected_generation_context = next((
+                            item for item in (retrieved_value_context or [])
+                            if isinstance(item, dict)
+                            and item.get("source") == "backend_aws_selected_module_generation_context"
+                        ), {})
+                        if selected_generation_context:
+                            no_question_corrective = json.dumps({
+                                "task": "Repository evidence is already sufficient; clarification is prohibited. Generate the Terraform now and return infra_preview files.",
+                                "original_user_request": effective_prompt,
+                                "cloud": target_cloud,
+                                "workflow": effective_workflow,
+                                "repo_target": "tf-devops",
+                                "resolved_repository_evidence": {
+                                    "environment_path": selected_generation_context.get("environment_path") or "",
+                                    "target_file": selected_generation_context.get("target_file") or selected_generation_context.get("path") or "",
+                                    "module_source": selected_generation_context.get("module_source") or "",
+                                    "has_existing_consumer_content": bool(selected_generation_context.get("content")),
+                                },
+                                "rules": [
+                                    "Do not ask a module, file, path, placement, or confirmation question.",
+                                    "The backend has already resolved environment, module, and consumer location from live GitHub evidence.",
+                                    "Return exactly one changed consumer file containing the complete existing target file plus one new sibling module block.",
+                                    "Use the exact selected module_source and repository style from the supplied evidence.",
+                                    "Return JSON only with files[]; questions must be empty.",
+                                ],
+                            }, ensure_ascii=False)
                     if no_question_corrective:
                         _teams_diag_log(
                             "agent_creation_clarification_forced_to_generation",
@@ -4332,6 +4431,32 @@ def handle_chat_request(data: dict):
                         )
                         agent_clarification = _teams_intercept_agent_questions(agent_reply)
             if agent_clarification is not None:
+                clarification_text = str(agent_clarification or "").lower()
+                clarification_reason = (
+                    "missing_environment" if "environment" in clarification_text else
+                    "missing_module" if "module" in clarification_text else
+                    "missing_consumer" if "consumer" in clarification_text or "target file" in clarification_text or "file path" in clarification_text else
+                    "external_input_required" if "value" in clarification_text or "secret" in clarification_text or "credential" in clarification_text else
+                    "semantic_ambiguity"
+                )
+                repository_complete = bool(
+                    _get_confirmed_aws_module_selection(retrieved_value_context or [])
+                    or any(
+                        isinstance(item, dict)
+                        and item.get("source") == "backend_aws_selected_module_generation_context"
+                        for item in (retrieved_value_context or [])
+                    )
+                )
+                _teams_diag_log(
+                    "agent_clarification_returned",
+                    level="warning",
+                    thread=conversation_id,
+                    cloud=target_cloud,
+                    workflow=effective_workflow,
+                    clarification_reason=clarification_reason,
+                    repository_complete=repository_complete,
+                    clarification=str(agent_clarification)[:240],
+                )
                 return {
                     "ok": False,
                     "mode": "clarification",
@@ -4342,11 +4467,14 @@ def handle_chat_request(data: dict):
                     "ticket_number": ticket_number,
                     "ticket_link": ticket_link,
                     "ticket_title": ticket_title,
+                    "clarification_reason": clarification_reason,
+                    "repository_complete": repository_complete,
+                    "backend_defect": bool(repository_complete and clarification_reason not in {"external_input_required", "semantic_ambiguity"}),
                     "router": {
                         "request_type": "infra",
                         "cloud": target_cloud,
                         "workflow": effective_workflow,
-                        "reason": "Agent returned a blocking question (e.g. already-exists check) instead of files.",
+                        "reason": "Agent returned a blocking question instead of executable Terraform files.",
                     },
                     "decision_state": "agent_clarification",
                 }, 400
