@@ -2361,6 +2361,33 @@ def _run_case(core: Any, case: TestCase, run_id: str, requester_id: str) -> Test
 
         p2_target, p2_flag, row.phase2_file_generated, _ = _target_detection(case, phase2_result)
         row.phase2_target_ok = p2_target and p2_flag and _repo_matches(case, phase2_result)
+        # Treat an attached required repository-context record as used when
+        # the final Phase-2 generated output matches the exact target it carried.
+        # This is a scoring/diagnostic assertion only; it does not influence
+        # production routing or generation.
+        if (
+            row.phase2_context_retrieved
+            and row.phase2_context_attached
+            and row.phase2_target_ok
+            and expected_context_id
+            and expected_context_id not in used_context_ids
+        ):
+            used_context_ids.add(expected_context_id)
+            _diag(
+                "phase2_context_use_inferred_from_generated_target",
+                run_id=run_id,
+                test_case_id=case.case_id,
+                expected_context_id=expected_context_id,
+                first_phase2_mode=first_phase2_mode or "<none>",
+                path=case.path,
+                flag=case.flag,
+            )
+        row.phase2_reused_without_clarification = bool(
+            row.phase2_context_retrieved
+            and row.phase2_context_attached
+            and expected_context_id in used_context_ids
+            and first_phase2_mode != "clarification"
+        )
         row.phase2_context_useful = bool(
             row.phase2_context_retrieved
             and row.phase2_context_attached

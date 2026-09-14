@@ -4363,6 +4363,55 @@ def handle_chat_request(data: dict):
             # repair_edits response is now a normal full-file generation result.
             agent_clarification = _teams_intercept_agent_questions(agent_reply)
             if agent_clarification is not None:
+                # Phase-2 repository-context reuse guard: once the backend has
+                # promoted an attached repository context into an immutable
+                # Boolean target contract, Foundry must not downgrade that
+                # request into a clarification. This does not affect genuine
+                # ambiguity: it runs only when path+flag+current/new value are
+                # already locked and live-verified in the active flow context.
+                active_flow_context = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
+                locked_boolean_contract = active_flow_context.get("resolved_repository_target_contract")
+                if isinstance(locked_boolean_contract, dict) and locked_boolean_contract.get("path") and locked_boolean_contract.get("flag"):
+                    materializer = globals().get("_teams_materialize_resolved_boolean_contract")
+                    if callable(materializer):
+                        forced_result = {
+                            "mode": "infra",
+                            "cloud": target_cloud,
+                            "workflow": effective_workflow,
+                            "repo_target": normalize_repo_target(target_cloud, workflow=effective_workflow),
+                            "title": "Terraform Boolean change",
+                            "summary": "Apply the live-verified repository-context Boolean target.",
+                            "analysis": (
+                                "Repository context resolved the exact Boolean target; "
+                                "Terrabot materialized that locked one-literal change instead of asking a clarification."
+                            ),
+                            "files": [],
+                            "questions": [],
+                            "validation_commands": ["terraform fmt -check -recursive", "terraform validate"],
+                        }
+                        forced_result = materializer(
+                            forced_result,
+                            target_cloud=target_cloud,
+                            effective_workflow=effective_workflow,
+                            retrieved_value_context=retrieved_value_context,
+                            reason="agent_clarification_suppressed_for_locked_repository_context",
+                        )
+                        if isinstance(forced_result, dict) and forced_result.get("files"):
+                            agent_reply = _teams_apply_agent_identity(
+                                json.dumps(forced_result, ensure_ascii=False),
+                                target_cloud,
+                                effective_workflow,
+                            )
+                            agent_clarification = None
+                            _teams_diag_log(
+                                "phase2_context_clarification_suppressed_with_locked_target",
+                                thread=conversation_id,
+                                cloud=target_cloud,
+                                workflow=effective_workflow,
+                                path=str(locked_boolean_contract.get("path") or ""),
+                                flag=str(locked_boolean_contract.get("flag") or ""),
+                                context_id=str(locked_boolean_contract.get("repository_context_id") or locked_boolean_contract.get("context_id") or ""),
+                            )
                 creation_like_request = bool(
                     re.search(r"\b(create|add|provision|deploy|build|make|one more|another|additional|new)\b", effective_prompt, re.IGNORECASE)
                     or any(

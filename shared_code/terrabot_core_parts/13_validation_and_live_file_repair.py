@@ -3352,6 +3352,7 @@ def _verified_immutable_contract_boolean_resolution(inventory: list[dict]) -> di
             path, flag, current, live.get("current_value"),
         )
         return {}
+    context_id = str(contract.get("repository_context_id") or contract.get("context_id") or "").strip()
     candidate = {
         **live,
         "new_value": target,
@@ -3360,9 +3361,11 @@ def _verified_immutable_contract_boolean_resolution(inventory: list[dict]) -> di
         "description": str(contract.get("resolution_source") or "immutable target contract"),
         "classification_reason": "Active immutable repository target contract revalidated against current live Boolean inventory.",
         "operation": "immutable_contract",
-        "repository_context_id": str(contract.get("repository_context_id") or ""),
+        "repository_context_id": context_id,
         "resolution_source": "resolved_repository_target_contract",
     }
+    if context_id:
+        _mark_repository_context_used([context_id], "immutable_contract_revalidated")
     if int(live.get("line_number") or 0) != line_number:
         candidate["resolution_source"] = "resolved_repository_target_contract_relocated_same_flag"
     LOGGER.info(
@@ -3603,6 +3606,20 @@ def _validated_repository_boolean_strategy(
                     if any(str(item.get("repository_context_id") or "").strip() for item in validated)
                     else "environment_boolean_retry"
                 )
+
+    if not validated and len(context_matches) > 1 and any(item.get("required_continuation_record") for item in context_matches):
+        # Exact-ID repository context reached the backend, but more than one
+        # live Boolean still matches the request. Keep genuine ambiguity as a
+        # resource/control choice instead of silently rediscovering a target.
+        strategy["boolean_applicable"] = True
+        strategy["resolution_source"] = "required_repository_context_ambiguous"
+        strategy["requires_user_choice"] = True
+        bounded = [dict(item) for item in context_matches[:5]]
+        for item in bounded:
+            item.setdefault("new_value", "")
+            item.setdefault("confidence", 0.99)
+            item["resolution_source"] = "required_repository_context_ambiguous"
+        return strategy, bounded
 
     if not validated and len(context_matches) == 1 and context_matches[0].get("required_continuation_record"):
         # Phase-2 exact-ID context already proved the live path/flag identity.
