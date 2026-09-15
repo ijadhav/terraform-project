@@ -3196,7 +3196,13 @@ def _repository_context_unique_boolean_match(
         if not isinstance(record, dict):
             continue
         status = str(record.get("status") or "active").strip().lower()
-        if status not in {"active", "conflicted"}:
+        record_id = str(record.get("id") or "").strip()
+        required_record = bool(record.get("required_continuation_record") or (record_id and record_id in required_ids))
+        if status != "active" and not required_record:
+            continue
+        if bool(record.get("stale")) and not required_record:
+            continue
+        if status == "conflicted" and not required_record:
             continue
         record_text = " ".join([
             str(record.get("subject") or ""),
@@ -3230,10 +3236,10 @@ def _repository_context_unique_boolean_match(
                 "confidence": max(float(record.get("confidence") or 0.0), 0.99),
                 "context": str(record.get("statement") or "").strip(),
                 "description": str(record.get("statement") or "").strip(),
-                "repository_context_id": str(record.get("id") or "").strip(),
+                "repository_context_id": record_id,
                 "operation": str(operation or "unknown").strip().lower(),
                 "resolution_source": "validated_repository_context",
-                "required_continuation_record": bool(record.get("required_continuation_record")),
+                "required_continuation_record": required_record,
             })
     LOGGER.info(
         "[TerrabotDiag] event=repository_context_boolean_resolution_complete repo=%s/%s operation=%s matches=%s context_ids=%s",
@@ -3651,10 +3657,19 @@ def _validated_repository_boolean_strategy(
             ],
         }
         try:
-            raw = call_named_agent(json.dumps(transition_request, ensure_ascii=False), AGENT_NAME)
-            parsed = extract_json_from_text(raw)
-            target = str((parsed or {}).get("new_value") or "").strip().lower() if isinstance(parsed, dict) else ""
             current = str(fixed.get("current_value") or "").strip().lower()
+            prompt_text = re.sub(r"\s+", " ", str(prompt or "").strip().lower())
+            deterministic_target = ""
+            if re.search(r"\b(?:off|disable|deactivate|turn\s+off|switch\s+off)\b", prompt_text):
+                deterministic_target = "false"
+            elif re.search(r"\b(?:on|enable|activate|turn\s+on|switch\s+on)\b", prompt_text):
+                deterministic_target = "true"
+            target = deterministic_target
+            parsed = {}
+            if target not in {"true", "false"} or target == current:
+                raw = call_named_agent(json.dumps(transition_request, ensure_ascii=False), AGENT_NAME)
+                parsed = extract_json_from_text(raw)
+                target = str((parsed or {}).get("new_value") or "").strip().lower() if isinstance(parsed, dict) else ""
             if target in {"true", "false"} and current in {"true", "false"} and target != current:
                 fixed["new_value"] = target
                 fixed["confidence"] = max(float(fixed.get("confidence") or 0.0), 0.99)

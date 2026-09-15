@@ -2646,6 +2646,41 @@ def _teams_required_repository_context_block(search_result: dict, required_ids: 
     )
 
 
+def _teams_filter_attachable_repository_context(search_result: dict, required_ids: list[str]) -> dict:
+    """Keep mandatory exact-ID context and non-conflicted active records only.
+
+    Broad semantic searches can return stale/conflicted historical facts. Those
+    are useful for diagnostics, but attaching them to Foundry as ordinary truth
+    can steer generation toward an unrelated module/resource family. Required
+    IDs are preserved because Phase 2 explicitly asks for that continuation
+    record and the downstream resolver still revalidates its path/flag against
+    current live repository inventory.
+    """
+    required = {str(value).strip() for value in (required_ids or []) if str(value).strip()}
+    filtered: list[dict] = []
+    filtered_out = 0
+    for item in (search_result or {}).get("results") or []:
+        if not isinstance(item, dict):
+            continue
+        context_id = str(item.get("id") or "").strip()
+        status = str(item.get("status") or "active").strip().lower()
+        stale = bool(item.get("stale"))
+        advisory = bool(item.get("_advisory_only"))
+        if context_id in required:
+            record = dict(item)
+            record["required_continuation_record"] = True
+            filtered.append(record)
+            continue
+        if status == "active" and not stale and not advisory:
+            filtered.append(dict(item))
+            continue
+        filtered_out += 1
+    result = dict(search_result or {})
+    result["results"] = filtered
+    result["filtered_context_records"] = filtered_out
+    return result
+
+
 def _teams_attach_repository_context(agent_input: str, active: dict) -> str:
     """Attach shared repository context before Foundry works on a task.
 
@@ -2752,6 +2787,14 @@ def _teams_attach_repository_context(agent_input: str, active: dict) -> str:
                 present_ids.add(context_id)
             search_result = dict(search_result or {})
             search_result["results"] = merged_results
+        pre_filter_count = len(search_result.get("results") or [])
+        search_result = _teams_filter_attachable_repository_context(search_result, required_ids)
+        filtered_count = int(search_result.get("filtered_context_records") or 0)
+        if filtered_count:
+            LOGGER.warning(
+                "[TerrabotDiag] event=repository_context_attach_filter_applied repo=%s/%s before=%s after=%s filtered=%s required_ids=%s",
+                owner, repo, pre_filter_count, len(search_result.get("results") or []), filtered_count, ",".join(required_ids)[:800],
+            )
         context_block = shared_repository_context.format_repository_context_for_agent(search_result)
         all_context_ids_for_attachment = [
             str(item.get("id") or "").strip()

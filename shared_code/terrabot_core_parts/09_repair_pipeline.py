@@ -467,6 +467,99 @@ def _teams_collect_live_repair_files(
     return live_files
 
 
+def _teams_prompt_output_mismatch_error(error: Exception | str) -> bool:
+    text = str(error or "").lower()
+    return (
+        "prompt_output_mismatch" in text
+        or "unrelated to the current request" in text
+        or "generated aws module reference is unrelated" in text
+        or "every generated aws module reference" in text
+    )
+
+
+def _teams_live_file_for_locked_repair_target(
+    *,
+    current_result: dict,
+    flow_context: dict | None,
+    path: str,
+) -> dict:
+    """Return an exact live repair baseline for a locked target path.
+
+    PROMPT_OUTPUT_MISMATCH means the rejected candidate may be for the wrong
+    module/file. Repairing that candidate in-place keeps Foundry anchored to the
+    wrong resource family. When a live-verified target contract exists, repair
+    must be re-anchored to that locked path so the next response can only edit
+    the intended repository control. This is repository retrieval only; it does
+    not generate or merge Terraform.
+    """
+    active = dict(flow_context or (_ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}))
+    cloud = safe_normalize_cloud(str(current_result.get("cloud") or active.get("cloud") or "")) or ""
+    workflow = str(current_result.get("workflow") or active.get("workflow") or active.get("resolved_workflow") or "").strip()
+    repo_target = str(current_result.get("repo_target") or active.get("repo_target") or "").strip()
+    refs: list[str] = []
+    for value in (
+        active.get("context_branch"),
+        active.get("existing_branch"),
+        active.get("source_branch"),
+    ):
+        value = str(value or "").strip().replace("refs/heads/", "")
+        if value and value not in refs:
+            refs.append(value)
+    if cloud:
+        try:
+            ref = str(_teams_remote_context_branch(cloud, repo_target, workflow) or "").strip()
+            if ref and ref not in refs:
+                refs.append(ref)
+        except Exception:
+            pass
+        try:
+            ref = str(github_resolve_base_branch_for_cloud(cloud, repo_target=repo_target or None, workflow=workflow or None) or "").strip()
+            if ref and ref not in refs:
+                refs.append(ref)
+        except Exception:
+            pass
+
+    read_errors: list[str] = []
+    live_content = None
+    resolved_ref = ""
+    for ref in refs:
+        try:
+            candidate = github_get_file_content(
+                cloud,
+                path,
+                ref,
+                repo_target=repo_target or None,
+                workflow=workflow or None,
+            )
+        except Exception as exc:
+            read_errors.append(f"{ref}: {exc}")
+            continue
+        if candidate is not None:
+            live_content = str(candidate)
+            resolved_ref = ref
+            break
+    if live_content is None:
+        raise ValueError(
+            f"PROMPT_OUTPUT_MISMATCH_REPAIR_TARGET_UNREADABLE: cannot read locked repair target {path}. "
+            + (f"GitHub reads failed: {' | '.join(read_errors[:3])}" if read_errors else "No repository ref was available.")
+        )
+    if path.endswith((".tf", ".tfvars")):
+        _validate_hcl_content_complete(path, live_content)
+    return {
+        "path": path,
+        "repository_ref": resolved_ref,
+        "existing_live_content": live_content,
+        "rejected_generated_content": "",
+        "existing_nonblank_line_count": len([line for line in live_content.splitlines() if line.strip()]),
+        "rejected_nonblank_line_count": 0,
+        "existing_sha256": hashlib.sha256(live_content.encode("utf-8")).hexdigest(),
+        "rejected_sha256": "",
+        "must_return_complete_final_file": True,
+        "repair_baseline_source": "github_exact_locked_target",
+        "semantic_repair_locked_target": True,
+    }
+
+
 def _teams_build_backend_repair_payload(
     current_result: dict,
     original_user_request: str,
@@ -485,6 +578,30 @@ def _teams_build_backend_repair_payload(
     live_files = _teams_collect_live_repair_files(
         current_result, flow_context, retrieved_value_context
     )
+    semantic_mismatch = _teams_prompt_output_mismatch_error(backend_error)
+    active_repair_context = dict(flow_context or (_ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}))
+    locked_contract = dict(active_repair_context.get("resolved_repository_target_contract") or {})
+    locked_path = str(locked_contract.get("path") or "").strip().strip("/")
+    if semantic_mismatch and locked_path:
+        locked_live_file = _teams_live_file_for_locked_repair_target(
+            current_result=current_result,
+            flow_context=active_repair_context,
+            path=locked_path,
+        )
+        wrong_paths = [
+            str(item.get("path") or "")
+            for item in live_files
+            if str(item.get("path") or "") and str(item.get("path") or "") != locked_path
+        ]
+        locked_live_file["wrong_candidate_paths_discarded"] = wrong_paths
+        live_files = [locked_live_file]
+        _teams_diag_log(
+            "semantic_mismatch_repair_retargeted",
+            level="warning",
+            locked_path=locked_path,
+            discarded_paths=",".join(wrong_paths)[:500],
+            context_id=str(locked_contract.get("repository_context_id") or ""),
+        )
     existing_targets = [item for item in live_files if str((item or {}).get("existing_live_content") or "")]
     all_existing = bool(live_files) and len(existing_targets) == len(live_files)
     protocol = _modular_repair_protocol(all_existing)
@@ -588,11 +705,13 @@ def _teams_build_backend_repair_payload(
         "semantic_relevance_repair_rules": (
             [
                 "PROMPT_OUTPUT_MISMATCH repair: the previous files referenced Terraform modules/resources unrelated to original_user_request.",
+                "Do not repair the rejected wrong-resource candidate in place. Treat repair_files[] as the only allowed live baseline for this repair response.",
+                "If resolved_repository_target is present, its path/flag/current_value/new_value is immutable. Return a repair_edits[] change for that exact target, or a complete file for that same target only.",
                 "Discard unrelated generated module/resource references and reselect the target from resolved_repository_target, exact_edit_hints, retrieved_value_context, and live repair_files only.",
                 "The repaired output must modify/create only the resource behavior named by original_user_request; do not keep otel_collector, patch management, monitoring, IAM, LB, or any other module unless the current user request explicitly asks for it.",
                 "Before returning, compare every generated module/resource label and source against original_user_request and backend evidence; if unrelated, remove it and regenerate the correct file.",
             ]
-            if "prompt_output_mismatch" in str(backend_error).lower() or "unrelated to the current request" in str(backend_error).lower()
+            if semantic_mismatch
             else []
         ),
         "expected_cloud": current_result.get("cloud"),
