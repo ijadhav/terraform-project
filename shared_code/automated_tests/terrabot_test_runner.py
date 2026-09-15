@@ -1118,6 +1118,60 @@ def _pick_expected_candidate(case: TestCase, result: dict) -> str:
     return best[1] if best[0] > 0 else ""
 
 
+
+
+def _test_creation_resolution_from_case(case: TestCase) -> dict[str, Any]:
+    """Build a test-only creation_target continuation from immutable case truth.
+
+    This is used only when Cursor clarification is disabled/unavailable and the
+    backend returned a free-form creation clarification with no structured
+    candidates. It does not affect production Terrabot routing; it keeps the E2E
+    harness from reporting Cursor/quota unavailability as a backend creation
+    failure.
+    """
+    if case.case_type != "resource_creation":
+        return {}
+    target_path = str(case.path or "").strip().strip("/")
+    evidence = str(case.evidence_line or "").strip()
+    if not target_path or not evidence:
+        return {}
+    module_source = ""
+    sibling_example = ""
+    aws_match = re.search(r"terraform/modules/([^;\s]+)", evidence)
+    if case.cloud == "aws" and aws_match:
+        module_name = aws_match.group(1).strip().strip("/")
+        module_source = f"../../modules/{module_name}"
+        sibling = re.search(r"sibling consumer:\s*([^;\n]+)", evidence, re.IGNORECASE)
+        sibling_example = sibling.group(1).strip().strip("/") if sibling else ""
+    elif case.cloud == "azure":
+        family = ""
+        family_match = re.search(r"root module family:\s*([^;\n]+)", evidence, re.IGNORECASE)
+        if family_match:
+            family = family_match.group(1).strip()
+        module_source = family or str(case.alias or "").strip()
+    if not module_source:
+        return {}
+    answer = (
+        f"Create the {case.alias} consumer in {target_path} using module source {module_source}"
+        + (f", modeled on {sibling_example}." if sibling_example else ".")
+    )
+    return {
+        "attempted": False,
+        "resolved": True,
+        "resolution_type": "creation_target",
+        "answer": answer,
+        "selected_path": target_path,
+        "selected_flag": "",
+        "selected_current_value": None,
+        "selected_new_value": None,
+        "module_source": module_source,
+        "sibling_example_path": sibling_example,
+        "reason": "test-only immutable creation case fallback because Cursor clarification was unavailable and no structured picker was returned",
+        "evidence": [evidence[:500]],
+        "api_call": False,
+        "verification_provenance": "automated_test_creation_case_truth",
+    }
+
 def _pick_automated_candidate_reply(case: TestCase, result: dict) -> str:
     """Return a numeric clarification reply suitable for unattended tests.
 
@@ -1714,6 +1768,23 @@ def _resolve_automated_clarifications(
             if case.case_type == "resource_creation" and candidates:
                 selection = _pick_automated_candidate_reply(case, current)
                 structured_picker = bool(selection)
+            if case.case_type == "resource_creation" and not selection and not candidates:
+                fallback_creation = _test_creation_resolution_from_case(case)
+                if fallback_creation:
+                    cursor_resolution = fallback_creation
+                    resolution_type = "creation_target"
+                    selection = str(fallback_creation.get("answer") or "").strip()
+                    structured_picker = False
+                    _diag(
+                        "automated_creation_target_fallback_used",
+                        level="warning",
+                        run_id=run_id,
+                        test_case_id=case.case_id,
+                        phase=phase,
+                        selected_path=fallback_creation.get("selected_path") or "",
+                        module_source=fallback_creation.get("module_source") or "",
+                        reason="cursor_unavailable_and_no_structured_candidates",
+                    )
             if not selection:
                 _diag(
                     "automated_clarification_delegated_to_foundry_self_resolution",
@@ -1859,7 +1930,7 @@ def _resolve_automated_clarifications(
         resolved_repo_target = str(current.get("repo_target") or phase_request.get("repo_target") or "").strip()
         if resolved_repo_target:
             followup["repo_target"] = resolved_repo_target
-        if cursor_resolution and resolution_type in {"candidate", "repository_control"}:
+        if cursor_resolution and resolution_type in {"candidate", "repository_control", "creation_target"}:
             followup["cursor_repository_resolution"] = {
                 "source": "cursor_read_only_repository_clarification",
                 "resolution_type": resolution_type,
@@ -1869,6 +1940,9 @@ def _resolve_automated_clarifications(
                 "flag": str(cursor_resolution.get("selected_flag") or "").strip(),
                 "current_value": cursor_resolution.get("selected_current_value"),
                 "new_value": cursor_resolution.get("selected_new_value"),
+                "module_source": str(cursor_resolution.get("module_source") or "").strip(),
+                "sibling_example_path": str(cursor_resolution.get("sibling_example_path") or "").strip().strip("/"),
+                "answer": str(cursor_resolution.get("answer") or "").strip(),
                 "reason": str(cursor_resolution.get("reason") or "").strip(),
                 "evidence": list(cursor_resolution.get("evidence") or [])[:4],
                 "verification_provenance": str(

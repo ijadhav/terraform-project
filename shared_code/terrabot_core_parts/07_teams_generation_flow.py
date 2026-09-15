@@ -3796,6 +3796,17 @@ def handle_chat_request(data: dict):
                             "decision_state": "aws_module_selection",
                             "aws_module_discovery": aws_module_discovery,
                             "environment_path": resolved_env_path,
+                            "candidates": [
+                                {
+                                    "index": index,
+                                    "module_path": str((match or {}).get("module_path") or (match or {}).get("path") or ""),
+                                    "module_source": str((match or {}).get("module_source") or (match or {}).get("source") or ""),
+                                    "label": str((match or {}).get("label") or (match or {}).get("module_name") or (match or {}).get("name") or (match or {}).get("module_path") or ""),
+                                    "environment_path": resolved_env_path,
+                                }
+                                for index, match in enumerate(matches, start=1)
+                                if isinstance(match, dict)
+                            ],
                         }, 400
 
                 if (
