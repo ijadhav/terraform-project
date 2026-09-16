@@ -489,7 +489,16 @@ def _format_reply(result: Dict[str, Any]) -> str:
                 # relevance_score, so a file whose content actually matches the
                 # request (e.g. waf.tf for "disable ... waf ...") is visible
                 # instead of being pushed off-screen by an alphabetical top-6.
-                ordered_candidates = [item for item in candidate_items if isinstance(item, dict)]
+                ordered_candidates = [
+                    item for item in candidate_items
+                    if isinstance(item, dict)
+                    and (
+                        str(item.get("path") or item.get("filename") or "").strip()
+                        or str(item.get("flag") or item.get("identifier") or "").strip()
+                        or any(str(value).strip() for value in (item.get("matched_blocks") or []))
+                        or str(item.get("content_summary") or "").strip()
+                    )
+                ]
                 if any("relevance_score" in item for item in ordered_candidates):
                     ordered_candidates = sorted(
                         ordered_candidates,
@@ -498,12 +507,14 @@ def _format_reply(result: Dict[str, Any]) -> str:
                 display_limit = 15
                 for fallback_index, item in enumerate(ordered_candidates[:display_limit], start=1):
                     index = item.get("index") or fallback_index
-                    path = str(item.get("path") or "").strip()
+                    path = str(item.get("path") or item.get("filename") or "").strip()
                     blocks = [str(value).strip() for value in (item.get("matched_blocks") or []) if str(value).strip()]
-                    label = blocks[0] if blocks else path.rsplit("/", 1)[-1] if path else "Terraform target"
+                    identifier = str(item.get("flag") or item.get("identifier") or "").strip()
+                    label = blocks[0] if blocks else path.rsplit("/", 1)[-1] if path else identifier or "Terraform target"
                     content_summary = str(item.get("content_summary") or "").strip()
                     suffix = f" — {content_summary}" if content_summary else ""
-                    lines.append(f"{index}. **{label}** — `{path}`{suffix}")
+                    target_text = f" — `{path}`" if path else ""
+                    lines.append(f"{index}. **{label}**{target_text}{suffix}")
                 remaining = len(ordered_candidates) - display_limit
                 if remaining > 0:
                     lines.append(f"...and {remaining} more file(s) in this environment. Reply with a path or resource name if you don't see it above.")

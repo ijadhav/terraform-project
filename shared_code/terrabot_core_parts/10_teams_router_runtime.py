@@ -4159,6 +4159,40 @@ def _handle_teams_chat_request_multicloud(data: dict):
     }
     explicit_infra = str(request_data.get("mode") or "").strip().lower() == "infra"
 
+    # Normal Teams free-form requests intentionally arrive without mode=infra;
+    # the Teams transport leaves semantic intent to the backend/Foundry router.
+    # The branch decision, however, must happen BEFORE repository target/module
+    # discovery. Classify this current turn here, and when it is infrastructure,
+    # pin mode=infra before any older handler can enter target selection.
+    #
+    # Do not classify deterministic protocol continuations (branch yes/no,
+    # target-picker replies, Jira/PR actions) as fresh infrastructure requests.
+    pre_branch_protocol_reply = bool(
+        action
+        or _teams_truthy(request_data.get("pending_target_selection_reply"))
+        or _teams_truthy(request_data.get("pending_branch_choice_reply"))
+        or _teams_truthy(request_data.get("pending_branch_choice_resolved"))
+        or _teams_truthy(request_data.get("pending_target_selection_resolved"))
+        or (
+            stage == "awaiting_branch_reuse_decision"
+            and bool(_teams_branch_choice_from_reply(prompt))
+        )
+    )
+    if (
+        not explicit_infra
+        and prompt
+        and not pre_branch_protocol_reply
+        and not _teams_prompt_requests_pr(prompt)
+    ):
+        explicit_infra = _teams_is_explicit_infra_request(prompt)
+        if explicit_infra:
+            request_data["mode"] = "infra"
+            LOGGER.info(
+                "[TerrabotFlow] step=pre_generation_branch_gate actor=foundry-intent "
+                "result=infra mode_pinned=true stage=%s",
+                stage or "idle",
+            )
+
     # Automated E2E runs must never reuse a production/user branch or open PR.
     # Keep their historical always-new-branch transport semantics even when a
     # durable Teams conversation happens to contain reusable production state.
