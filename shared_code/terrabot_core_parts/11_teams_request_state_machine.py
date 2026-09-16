@@ -4041,7 +4041,30 @@ def _prompt_guard_agent_self_validate(agent_result: dict, prompt: str) -> None:
 
 
 def _teams_find_reusable_aws_branch_for_request(state: dict, request_data: dict) -> str:
-    """Resolve the current AWS Terrabot branch even when UI state is stale."""
+    """Resolve the current AWS Terrabot branch even when UI state is stale.
+
+    Prefer the cloud-scoped session/state first because PR completion preserves
+    AWS and Azure work independently there. Fall back to the legacy top-level
+    branch and THREAD_PR_STATE lookup for compatibility with older sessions.
+    """
+    try:
+        cloud_state = _teams_best_cloud_state(state or {}, "aws")
+    except Exception:
+        cloud_state = {}
+    cloud_branch = str((cloud_state or {}).get("branch") or "").strip()
+    if cloud_branch:
+        try:
+            cloud_workflow = str((cloud_state or {}).get("workflow") or "aws_module_consumer").strip()
+            if github_branch_exists(
+                "aws",
+                cloud_branch,
+                repo_target=str((cloud_state or {}).get("repo_target") or "tf-devops").strip() or "tf-devops",
+                workflow=cloud_workflow or "aws_module_consumer",
+            ):
+                return cloud_branch
+        except Exception:
+            pass
+
     explicit = str(state.get("branch") or request_data.get("existing_branch") or "").strip()
     state_cloud = safe_normalize_cloud(
         state.get("resolved_branch_cloud") or state.get("cloud") or request_data.get("cloud") or request_data.get("requested_cloud")
@@ -4104,7 +4127,6 @@ def _handle_teams_chat_request_with_aws_branch_preflight(data: dict):
             "aws_module_selection",
             "infra_modification_target_selection",
             "awaiting_jira",
-            "awaiting_pr_decision",
         }
         and not _teams_message_is_protocol_control(request_data, state, prompt)
         and infer_cloud_from_prompt(prompt) == "aws"

@@ -1497,6 +1497,73 @@ def _teams_semantic_operation_classification(prompt: str, target_cloud: str) -> 
         return {"operation_shape": "unclear", "reason": str(exc)}
 
 
+def _teams_resolve_aws_module_match_semantically(prompt: str, matches: list[dict]) -> dict:
+    """Let Foundry resolve multiple verified AWS module candidates before asking the user.
+
+    Returns one of:
+      {"decision": "select", "index": <0-based>}
+      {"decision": "create_new"}
+      {"decision": "ambiguous"}
+
+    The backend still verifies and materializes the selected live module. This
+    helper only resolves semantic intent among already-discovered candidates.
+    """
+    candidates = []
+    for index, item in enumerate(matches or []):
+        if not isinstance(item, dict):
+            continue
+        candidates.append({
+            "index": index + 1,
+            "module_path": str(item.get("module_path") or item.get("verified_module_path") or item.get("path") or ""),
+            "module_source": str(item.get("module_source") or item.get("source") or ""),
+            "match_score": int(item.get("match_score") or 0),
+            "match_reasons": list(item.get("match_reasons") or []),
+            "teams_match_confidence": list(item.get("teams_match_confidence") or []),
+        })
+    if len(candidates) <= 1:
+        return {"decision": "select", "index": 0} if candidates else {"decision": "create_new"}
+
+    # Fast deterministic path: a strict score leader is already the strongest
+    # live-repository semantic match. No user picker is needed.
+    ranked = sorted(candidates, key=lambda item: (-int(item.get("match_score") or 0), item.get("module_path") or ""))
+    if len(ranked) > 1 and int(ranked[0].get("match_score") or 0) > int(ranked[1].get("match_score") or 0):
+        return {"decision": "select", "index": int(ranked[0]["index"]) - 1, "reason": "unique highest repository match score"}
+
+    request = {
+        "task": "Resolve an AWS Terraform module candidate ambiguity for a creation request. Return JSON only.",
+        "user_request": str(prompt or "").strip(),
+        "candidates": candidates,
+        "required_output": {
+            "decision": "select|create_new|ambiguous",
+            "selected_index": "1-based candidate index when decision=select, otherwise 0",
+            "reason": "one short repository-semantic explanation",
+        },
+        "rules": [
+            "Choose select only when one existing candidate clearly represents the requested resource family/pattern.",
+            "Choose create_new when the listed candidates are only related examples and none is the requested reusable module.",
+            "Choose ambiguous only when two or more candidates are genuinely equally plausible after semantic analysis.",
+            "Do not ask the user a question and do not generate Terraform.",
+        ],
+    }
+    try:
+        _thread, raw = call_agent(None, json.dumps(request, ensure_ascii=False))
+        parsed = extract_json_from_text(raw)
+        if isinstance(parsed, dict):
+            decision = str(parsed.get("decision") or "").strip().lower()
+            if decision == "select":
+                try:
+                    selected = int(parsed.get("selected_index") or 0) - 1
+                except (TypeError, ValueError):
+                    selected = -1
+                if 0 <= selected < len(matches):
+                    return {"decision": "select", "index": selected, "reason": str(parsed.get("reason") or "")}
+            if decision in {"create_new", "ambiguous"}:
+                return {"decision": decision, "reason": str(parsed.get("reason") or "")}
+    except Exception as exc:
+        LOGGER.warning("AWS module semantic ambiguity resolver failed: %s", exc)
+    return {"decision": "ambiguous", "reason": "semantic resolver unavailable or inconclusive"}
+
+
 def _teams_existing_modification_workflow_for_cloud(target_cloud: str) -> str:
     """Return the one already-defined modification workflow for the cloud."""
     cloud = str(target_cloud or "").strip().lower()
@@ -3727,7 +3794,30 @@ def handle_chat_request(data: dict):
                     ))
                     repository_complete = False
                     repository_complete_reason = ""
-                    if active_teams_flow.get("active") and creation_words and len(matches) == 1 and resolved_env_path:
+                    selected_repository_match = None
+                    semantic_resolution = {"decision": "ambiguous"}
+                    if active_teams_flow.get("active") and creation_words and matches:
+                        semantic_resolution = _teams_resolve_aws_module_match_semantically(
+                            effective_prompt, matches
+                        )
+                        if semantic_resolution.get("decision") == "select":
+                            selected_index = int(semantic_resolution.get("index") or 0)
+                            if 0 <= selected_index < len(matches):
+                                selected_repository_match = dict(matches[selected_index])
+                        elif semantic_resolution.get("decision") == "create_new":
+                            # Multiple related modules are pattern evidence, not a
+                            # reason to ask the user which existing module they meant.
+                            # Reuse the existing verified-missing-module generation path.
+                            aws_module_discovery = {
+                                **aws_module_discovery,
+                                "status": "not_found",
+                                "decision_state": "aws_module_not_found",
+                                "semantic_resolution": semantic_resolution,
+                                "related_pattern_matches": matches,
+                                "matches": [],
+                            }
+
+                    if selected_repository_match is not None and resolved_env_path:
                         try:
                             target_consumer_path = f"{str(resolved_env_path).strip().strip('/')}/main.tf"
                             target_consumer_content = github_get_file_content(
@@ -3748,7 +3838,7 @@ def handle_chat_request(data: dict):
                         # the target environment is resolved, and the destination consumer file
                         # exists. Do not ask the user which module/path to use; generation must
                         # proceed through the normal Foundry aws_module_consumer path.
-                        selected_match = dict(matches[0])
+                        selected_match = dict(selected_repository_match or matches[0])
                         verified_selected, selected_generation_context = _aws_selected_module_context_with_contents(
                             selected_match,
                             {**aws_module_discovery, "decision_state": "aws_module_selected", "selection_forced_by_repository_evidence": True},
@@ -3777,7 +3867,7 @@ def handle_chat_request(data: dict):
                             target_file=str(selected_generation_context.get("target_file") or selected_generation_context.get("path") or ""),
                             reason=repository_complete_reason,
                         )
-                    else:
+                    elif semantic_resolution.get("decision") != "create_new":
                         clarification_reason = "semantic_ambiguity" if len(matches) > 1 else repository_complete_reason or "missing_module"
                         _teams_diag_log(
                             "aws_creation_clarification_reason",
