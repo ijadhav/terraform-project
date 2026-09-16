@@ -2847,11 +2847,20 @@ def handle_chat_request(data: dict):
                         str(operation_class.get("reason") or "")[:300],
                     )
                     effective_workflow = modification_workflow
-            elif (
-                operation_class.get("operation_shape") == "creation_or_consumer"
-                and _teams_truthy(data.get("test_mode"))
-            ):
-                creation_workflow = "aws_module_creation" if target_cloud == "aws" else "azure_consumer_generation" if target_cloud == "azure" else ""
+            elif operation_class.get("operation_shape") == "creation_or_consumer":
+                # Honor semantic creation/consumer classification in normal Teams
+                # traffic as well as tests. For AWS, stay on the consumer
+                # discovery path first: live module discovery will either select
+                # an existing module and generate its consumer, or a verified miss
+                # will fall through to the existing automatic new-module flow.
+                # Azure continues through the existing consumer-generation path.
+                creation_workflow = (
+                    "aws_module_consumer"
+                    if target_cloud == "aws"
+                    else "azure_consumer_generation"
+                    if target_cloud == "azure"
+                    else ""
+                )
                 if creation_workflow:
                     LOGGER.info(
                         "[TerrabotFlow] step=workflow_classification actor=foundry->backend result=creation_or_consumer previous=%s resolved=%s reason=%s",
