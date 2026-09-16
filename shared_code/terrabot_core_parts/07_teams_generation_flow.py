@@ -1867,6 +1867,18 @@ def handle_chat_request(data: dict):
         conversation_id=conversation_id,
     )
 
+    # A complete new Teams instruction can supersede an abandoned picker or
+    # clarification. Clear only transient request-local discovery state before
+    # routing the new instruction; branch/PR continuity remains untouched.
+    if (data.get("source") or "").strip().lower() == "teams" and conversation_id and data.get("supersede_pending_request"):
+        clear_pending_infra_modification_selection(conversation_id, ticket_number)
+        clear_pending_aws_module_discovery(conversation_id, ticket_number)
+        clear_pending_azure_module_discovery(conversation_id, ticket_number)
+        clear_pending_azure_consumer_value_selection(conversation_id, ticket_number)
+        clear_pending_azure_new_consumer_file_confirmation(conversation_id, ticket_number)
+        clear_pending_cloud_clarification(conversation_id, ticket_number)
+        clear_pending_module_variable_value_selection(conversation_id, ticket_number)
+
     if action not in {"commit_pending", "commit_branch", "create_pr_from_branch", "discard_pending", "refresh_pr_status", "submit_module_variable_values"} and not prompt:
         return {"ok": False, "reply": "Please enter a prompt."}, 400
 
@@ -2832,7 +2844,6 @@ def handle_chat_request(data: dict):
             request_source == "teams"
             and target_cloud
             and not requested_workflow
-            and str(effective_workflow or "").strip() not in INFRA_MODIFICATION_WORKFLOWS
         ):
             operation_class = _teams_semantic_operation_classification(
                 effective_prompt, target_cloud
