@@ -666,6 +666,28 @@ def _teams_branch_slug(value: str) -> str:
 
 
 def _teams_suggested_branch_name(agent_result: dict, prompt: str, thread_id: str) -> str:
+    context = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
+
+    # Production Teams branches are user-owned and provider-scoped so the same
+    # Teams user can keep independent AWS and Azure work in flight. Automated
+    # tests deliberately retain the existing isolated branch naming/uniquifying
+    # behavior and are always forced onto a fresh branch elsewhere in the flow.
+    if context.get("active") and not _teams_truthy(context.get("test_mode")):
+        requester = _teams_branch_slug(
+            context.get("requester")
+            or _ACTIVE_TEAMS_REQUESTER_DISPLAY.get()
+            or "teams-user"
+        ).replace("/", "-")
+        cloud = _teams_branch_slug(
+            agent_result.get("cloud")
+            or context.get("expected_cloud")
+            or context.get("cloud")
+            or "infra"
+        ).replace("/", "-")
+        requester = requester or "teams-user"
+        cloud = cloud or "infra"
+        return f"terrabot/{requester[:56]}-{cloud[:12]}".rstrip("-/")
+
     proposed = _teams_branch_slug(agent_result.get("branch_name") or "")
     if proposed.startswith("terrabot/"):
         proposed = proposed[len("terrabot/"):]

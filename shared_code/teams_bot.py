@@ -1535,38 +1535,67 @@ class TerrabotTeamsBot(ActivityHandler):
 
         await _send(turn_context, _format_reply(result))
 
-        # A successfully raised PR closes the logical request conversation.
-        # Keep its completed memory row intact, clear transient workflow state,
-        # and immediately create a fresh memory row for the next user request.
+        # A successfully raised PR completes the current request, but its remote
+        # branch/PR is still an active workspace for this Teams user. Preserve
+        # cloud_sessions + backend THREAD_PR_STATE so a later AWS/Azure request
+        # can ask same-branch vs new-branch and, on reuse, push the next commit
+        # directly into the already-open PR. Only rotate conversational memory
+        # and clear request-local/pending UI fields here. Explicit "clear chat"
+        # remains the operation that performs a full workflow reset.
         if mode == "pr_created" or result.get("pr_url"):
-            completed_memory_id = str(
-                state.get("memory_conversation_id") or memory_conversation_id
-            ).strip()
-            completed_workflow_thread = str(
-                state.get("workflow_thread_id")
-                or state.get("foundry_conversation_id")
-                or workflow_thread_id
-                or ""
-            ).strip()
-            try:
-                await asyncio.to_thread(
-                    reset_teams_chat_session,
-                    thread_id,
-                    completed_workflow_thread,
-                )
-            except Exception:
-                LOGGER.exception(
-                    "Unable to reset Teams workflow after PR creation: conversation=%s",
-                    thread_id,
-                )
-            TEAMS_THREAD_STATE.pop(thread_id, None)
+            completed_cloud = str(result.get("cloud") or state.get("cloud") or "").strip().lower()
+            cloud_sessions = dict(state.get("cloud_sessions") or {})
+            if completed_cloud:
+                session = dict(cloud_sessions.get(completed_cloud) or {})
+                for key, value in {
+                    "thread_id": state.get("workflow_thread_id") or state.get("foundry_conversation_id") or workflow_thread_id,
+                    "branch": result.get("branch") or state.get("branch"),
+                    "branch_url": result.get("branch_url") or state.get("branch_url"),
+                    "compare_url": result.get("compare_url") or state.get("compare_url"),
+                    "pr_url": result.get("pr_url") or state.get("pr_url"),
+                    "pr_number": result.get("pr_number") or state.get("pr_number"),
+                    "repo_target": result.get("repo_target") or state.get("repo_target"),
+                    "workflow": result.get("workflow") or state.get("workflow"),
+                    "base_branch": result.get("base_branch") or state.get("base_branch"),
+                    "ticket_link": result.get("ticket_link") or state.get("ticket_link"),
+                    "ticket_number": result.get("jira_ticket") or result.get("ticket_number") or state.get("ticket_number"),
+                    "ticket_title": result.get("ticket_title") or state.get("ticket_title"),
+                }.items():
+                    if value not in (None, ""):
+                        session[key] = value
+                session["has_open_pr"] = True
+                cloud_sessions[completed_cloud] = session
+
+            for key in (
+                "pending_change_id",
+                "pending_follow_up_prompt",
+                "pending_follow_up_cloud",
+                "pending_follow_up_branch",
+                "pending_follow_up_has_pr",
+                "pending_follow_up_pr_url",
+                "pending_follow_up_ticket_link",
+                "pending_follow_up_ticket_number",
+                "pending_follow_up_ticket_title",
+                "pending_target_selection_thread_id",
+                "pending_target_selection_original_prompt",
+                "pending_target_selection_cloud",
+                "pending_aws_module_selection_thread_id",
+                "pending_aws_module_selection_original_prompt",
+                "pending_aws_module_selection_cloud",
+                "branch_choice_resolved_for_request",
+                "resolved_branch_choice",
+                "resolved_reuse_branch",
+                "resolved_force_new_branch",
+                "resolved_existing_branch",
+                "resolved_branch_cloud",
+            ):
+                state.pop(key, None)
+            state["stage"] = "complete"
+            state["cloud_sessions"] = cloud_sessions
+
             teams_conversation_memory.clear(thread_id)
-            await _rotate_memory_conversation(
-                thread_id,
-                requester,
-                reason="pull_request_created",
-                previous_conversation_id=completed_memory_id,
-            )
+            state["memory_conversation_id"] = _new_memory_conversation_id(thread_id)
+            await _persist_thread_state(thread_id, state)
             set_teams_short_follow_up(False)
             set_teams_conversation_context("")
 

@@ -4158,6 +4158,17 @@ def _handle_teams_chat_request_multicloud(data: dict):
         "aws_module_selection",
     }
     explicit_infra = str(request_data.get("mode") or "").strip().lower() == "infra"
+
+    # Automated E2E runs must never reuse a production/user branch or open PR.
+    # Keep their historical always-new-branch transport semantics even when a
+    # durable Teams conversation happens to contain reusable production state.
+    test_mode = _teams_truthy(request_data.get("test_mode"))
+    if test_mode and explicit_infra and not action:
+        request_data["pending_branch_choice_resolved"] = True
+        request_data["reuse_branch"] = False
+        request_data["force_new_branch"] = True
+        request_data["existing_branch"] = ""
+
     continuation_reply = any(
         _teams_truthy(request_data.get(key))
         for key in (

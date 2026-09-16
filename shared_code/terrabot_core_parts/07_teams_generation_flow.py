@@ -2026,8 +2026,13 @@ def handle_chat_request(data: dict):
                 "compare_url": pr_result.get("compare_url"),
                 "pr_number": pr_result["pr_number"],
                 "pr_url": pr_result["pr_url"],
+                "cloud": pending.get("agent_result", {}).get("cloud") or pr_result.get("cloud"),
+                "workflow": pending.get("agent_result", {}).get("workflow"),
+                "repo_target": pending.get("agent_result", {}).get("repo_target"),
+                "base_branch": pr_result.get("base_branch") or (pending.get("branch_result") or {}).get("base_branch"),
                 "jira_ticket": ticket_number,
                 "ticket_link": ticket_link,
+                "ticket_title": ticket_title,
                 "summary": pending.get("agent_result", {}).get("summary") or "Terraform pull request created.",
                 "analysis": pending.get("agent_result", {}).get("analysis") or "The pull request was created from the current Terrabot branch diff.",
             }, 200
