@@ -1104,14 +1104,32 @@ class TerrabotTeamsBot(ActivityHandler):
                     return
 
                 await _send(turn_context, "Terrabot is processing your request...")
+                pending_branch_prompt = str(
+                    state.get("pending_follow_up_prompt")
+                    or state.get("last_infra_prompt")
+                    or ""
+                ).strip()
+                pending_branch_cloud = str(
+                    state.get("pending_follow_up_cloud")
+                    or state.get("resolved_branch_cloud")
+                    or state.get("cloud")
+                    or ""
+                ).strip()
                 request = {
-                    "prompt": prompt,
+                    # Send the captured infrastructure request, not the literal
+                    # yes/no branch-control reply. This keeps cloud/env/resource
+                    # continuity through the interactive branch decision.
+                    "prompt": pending_branch_prompt or prompt,
+                    "message": pending_branch_prompt or prompt,
+                    "original_prompt": pending_branch_prompt or state.get("last_infra_prompt", ""),
                     "thread_id": workflow_thread_id,
                     "teams_conversation_id": thread_id,
                     "ticket_link": state.get("ticket_link", ticket_link),
                     "jira_ticket": state.get("ticket_number", ticket_number),
                     "source": "teams",
                     "mode": "infra",
+                    "cloud": pending_branch_cloud,
+                    "requested_cloud": pending_branch_cloud,
                     "pending_branch_choice_reply": True,
                     "branch_choice": branch_choice,
                     # Explicitly propagate the branch decision flags so the

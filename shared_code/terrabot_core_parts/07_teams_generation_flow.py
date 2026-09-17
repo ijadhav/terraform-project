@@ -6360,3 +6360,43 @@ _ORIGINAL_CREATE_TEAMS_PULL_REQUEST_FROM_BRANCH = _create_teams_pull_request_fro
 _ORIGINAL_HANDLE_TEAMS_CHAT_REQUEST = _handle_teams_chat_request_base
 
 
+
+# =============================================================================
+# 2026-09-16 Teams analysis-first approval gate
+# =============================================================================
+# Teams should show the generated repository analysis/preview first and push a
+# branch only after the user explicitly approves. This preserves the existing
+# pending-change/commit_branch flow used by the Teams transport and avoids
+# surprise branch writes during exploratory analysis.
+
+_TEAMS_ANALYSIS_FIRST_PREVIOUS_AUTO_COMMIT_PREVIEW = _teams_auto_commit_preview
+
+
+def _teams_auto_commit_preview(data: dict, preview: dict, status_code: int):
+    """Return infra_preview to Teams instead of auto-pushing it.
+
+    Non-Teams callers and explicit commit_branch actions keep the previous
+    implementation. A normal Teams generation request now stops at the analysis
+    preview; the Teams bot's existing `yes` handler calls commit_branch with the
+    pending_change_id, while `no` discards it.
+    """
+    request_data = data or {}
+    if (
+        str(request_data.get("source") or "").strip().lower() == "teams"
+        and str(request_data.get("action") or "").strip().lower() != "commit_branch"
+        and isinstance(preview, dict)
+        and preview.get("mode") == "infra_preview"
+        and preview.get("pending_change_id")
+        and status_code < 400
+        and preview.get("ok", True)
+    ):
+        result = dict(preview)
+        result["approval_required_before_branch_push"] = True
+        result.setdefault(
+            "reply",
+            "Terrabot analyzed the request and prepared a Terraform change. Reply `yes` to push it to a Terrabot branch, or `no` to drop this request.",
+        )
+        result.setdefault("questions", [])
+        result.setdefault("state_patch", {})
+        return result, status_code
+    return _TEAMS_ANALYSIS_FIRST_PREVIOUS_AUTO_COMMIT_PREVIEW(data, preview, status_code)

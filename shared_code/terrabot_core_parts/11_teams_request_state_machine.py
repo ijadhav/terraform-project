@@ -4401,3 +4401,138 @@ handle_teams_chat_request = _handle_teams_chat_request_with_related_pr_awareness
 _AGENT_OWNED_PREVIOUS_BUILD_EXISTING_CONTEXT = build_backend_existing_infra_modification_context
 
 
+
+# =============================================================================
+# 2026-09-16 Branch-choice cloud continuity and clarification diagnostics
+# =============================================================================
+# A bare `yes`/`no` branch-choice reply must execute the captured pending
+# infrastructure request, not the literal control word. These helpers bind the
+# restored prompt to its cloud/repository before lower routers can ask a generic
+# "AWS or Azure" question.
+
+_TEAMS_BRANCH_CLOUD_PREVIOUS_PREPARE_PENDING_BRANCH_CHOICE = _teams_prepare_pending_branch_choice_request
+_TEAMS_BRANCH_CLOUD_PREVIOUS_FLOW_GUARD_BRANCH_REPLY = _teams_flow_guard_prepare_branch_reply
+
+
+def _teams_pending_prompt_cloud(state: dict, request_data: dict | None = None) -> str:
+    """Resolve the provider for a pending branch-choice prompt.
+
+    Source order is explicit pending state, persisted branch decision state,
+    request fields, then the captured prompt itself. This is repository routing
+    only; Terraform resource/flag semantics remain Foundry-owned.
+    """
+    request_data = request_data or {}
+    pending_prompt = str(
+        (state or {}).get("pending_follow_up_prompt")
+        or request_data.get("original_prompt")
+        or request_data.get("prompt")
+        or ""
+    ).strip()
+    candidates = (
+        (state or {}).get("pending_follow_up_cloud"),
+        (state or {}).get("resolved_branch_cloud"),
+        request_data.get("requested_cloud"),
+        request_data.get("cloud"),
+        (state or {}).get("cloud"),
+        _teams_safe_request_cloud(pending_prompt) if pending_prompt else "",
+        infer_cloud_from_prompt(pending_prompt) if pending_prompt else "",
+    )
+    for candidate in candidates:
+        cloud = safe_normalize_cloud(str(candidate or "")) or ""
+        if cloud:
+            return cloud
+    return ""
+
+
+def _teams_branch_resolution_patch(updated: dict, state: dict, request_data: dict | None = None) -> None:
+    pending_prompt = str((state or {}).get("pending_follow_up_prompt") or updated.get("prompt") or "").strip()
+    pending_cloud = _teams_pending_prompt_cloud(state, request_data or updated)
+    if pending_prompt:
+        updated.setdefault("original_prompt", pending_prompt)
+        updated["prompt"] = pending_prompt
+        updated["message"] = pending_prompt
+    if pending_cloud:
+        updated["cloud"] = pending_cloud
+        updated["requested_cloud"] = pending_cloud
+        patch = updated.setdefault("state_patch", {})
+        if isinstance(patch, dict):
+            patch["resolved_branch_cloud"] = pending_cloud
+            patch["cloud"] = pending_cloud
+            patch["pending_follow_up_cloud"] = None
+
+
+def _teams_prepare_pending_branch_choice_request(
+    request_data: dict,
+    state: dict,
+    teams_conversation_id: str,
+    prompt: str,
+) -> tuple[dict, bool]:
+    enriched_state = dict(state or {})
+    pending_cloud = _teams_pending_prompt_cloud(enriched_state, request_data)
+    if pending_cloud and not enriched_state.get("pending_follow_up_cloud"):
+        enriched_state["pending_follow_up_cloud"] = pending_cloud
+    updated, handled = _TEAMS_BRANCH_CLOUD_PREVIOUS_PREPARE_PENDING_BRANCH_CHOICE(
+        request_data,
+        enriched_state,
+        teams_conversation_id,
+        prompt,
+    )
+    if handled:
+        _teams_branch_resolution_patch(updated, enriched_state, request_data)
+        if teams_conversation_id and isinstance(updated.get("state_patch"), dict):
+            _teams_save_ui_state(teams_conversation_id, updated["state_patch"])
+    return updated, handled
+
+
+def _teams_flow_guard_prepare_branch_reply(
+    request_data: dict,
+    state: dict,
+    teams_conversation_id: str,
+    prompt: str,
+) -> tuple[dict, bool]:
+    enriched_state = dict(state or {})
+    pending_cloud = _teams_pending_prompt_cloud(enriched_state, request_data)
+    if pending_cloud and not enriched_state.get("pending_follow_up_cloud"):
+        enriched_state["pending_follow_up_cloud"] = pending_cloud
+    updated, handled = _TEAMS_BRANCH_CLOUD_PREVIOUS_FLOW_GUARD_BRANCH_REPLY(
+        request_data,
+        enriched_state,
+        teams_conversation_id,
+        prompt,
+    )
+    if handled:
+        _teams_branch_resolution_patch(updated, enriched_state, request_data)
+        if teams_conversation_id and isinstance(updated.get("state_patch"), dict):
+            _teams_save_ui_state(teams_conversation_id, updated["state_patch"])
+    return updated, handled
+
+
+_TEAMS_STRUCTURED_FAILURE_PREVIOUS = _teams_structured_live_repo_failure
+
+
+def _teams_structured_live_repo_failure(
+    prompt: str,
+    cloud: str,
+    workflow: str,
+    result: dict,
+) -> tuple[dict, int]:
+    """Add explicit resolution diagnostics to repository-target failures."""
+    response, status = _TEAMS_STRUCTURED_FAILURE_PREVIOUS(prompt, cloud, workflow, result)
+    response = dict(response or {})
+    diagnostics = {
+        "requested_prompt": str(prompt or ""),
+        "cloud_resolution": cloud or "unresolved",
+        "workflow_resolution": workflow or "unresolved",
+        "backend_environment_resolution": response.get("backend_environment_resolution") or result.get("backend_environment_resolution") or {},
+        "reason": response.get("diagnostic_code") or "TEAMS_LIVE_REPO_TARGET_UNRESOLVED",
+    }
+    response["resolution_diagnostics"] = diagnostics
+    analysis = str(response.get("analysis") or "").strip()
+    diagnostic_lines = [
+        "Resolution diagnostics:",
+        f"- Cloud: `{diagnostics['cloud_resolution']}`.",
+        f"- Workflow: `{diagnostics['workflow_resolution']}`.",
+        "- Repository search exhausted the resolved live GitHub scope before asking the user.",
+    ]
+    response["analysis"] = "\n".join(part for part in (analysis, "\n".join(diagnostic_lines)) if part)
+    return response, status
