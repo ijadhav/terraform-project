@@ -4553,15 +4553,64 @@ _TEAMS_BRANCH_CLOUD_PREVIOUS_PREPARE_PENDING_BRANCH_CHOICE = _teams_prepare_pend
 _TEAMS_BRANCH_CLOUD_PREVIOUS_FLOW_GUARD_BRANCH_REPLY = _teams_flow_guard_prepare_branch_reply
 
 
+def _teams_branch_prompt_candidate_is_usable(text: str) -> bool:
+    """Return true when text can be replayed as an infrastructure request.
+
+    A branch-choice prompt may be created immediately after a cloud-only
+    clarification answer such as ``azure``.  That bare cloud word is protocol
+    context, not the original infrastructure request; replaying it after the
+    user answers ``yes``/``no`` sends the router back to the generic
+    AWS/Azure clarification loop.
+    """
+    value = str(text or "").strip()
+    if not value:
+        return False
+    lowered = value.lower()
+    if lowered in {"aws", "azure"}:
+        return False
+    if normalize_yes_no_reply(value) in (AFFIRMATIVE_REPLIES | NEGATIVE_REPLIES):
+        return False
+    if re.fullmatch(r"#?\d+", value):
+        return False
+    if is_valid_jira_ticket_link(value):
+        return False
+    return True
+
+
+def _teams_resolve_pending_branch_infra_prompt(state: dict, request_data: dict | None = None) -> str:
+    """Recover the real infra prompt behind an awaiting-branch decision."""
+    request_data = request_data or {}
+    for candidate in (
+        (state or {}).get("pending_follow_up_prompt"),
+        request_data.get("original_prompt"),
+        request_data.get("prompt"),
+        (state or {}).get("pending_target_selection_original_prompt"),
+        (state or {}).get("pending_aws_module_selection_original_prompt"),
+        (state or {}).get("last_infra_prompt"),
+        (state or {}).get("original_prompt"),
+    ):
+        text = str(candidate or "").strip()
+        if _teams_branch_prompt_candidate_is_usable(text):
+            return text
+
+    for candidate in reversed(list((state or {}).get("recent_user_turns") or [])):
+        text = str(candidate or "").strip()
+        if _teams_branch_prompt_candidate_is_usable(text):
+            return text
+    return ""
+
+
 def _teams_pending_prompt_cloud(state: dict, request_data: dict | None = None) -> str:
     """Resolve the provider for a pending branch-choice prompt.
 
     Source order is explicit pending state, persisted branch decision state,
-    request fields, then the captured prompt itself. This is repository routing
-    only; Terraform resource/flag semantics remain Foundry-owned.
+    request fields, then the recovered captured infra prompt. This is
+    repository routing only; Terraform resource/flag semantics remain
+    Foundry-owned.
     """
     request_data = request_data or {}
-    pending_prompt = str(
+    pending_prompt = _teams_resolve_pending_branch_infra_prompt(state, request_data)
+    raw_pending_prompt = str(
         (state or {}).get("pending_follow_up_prompt")
         or request_data.get("original_prompt")
         or request_data.get("prompt")
@@ -4575,6 +4624,8 @@ def _teams_pending_prompt_cloud(state: dict, request_data: dict | None = None) -
         (state or {}).get("cloud"),
         _teams_safe_request_cloud(pending_prompt) if pending_prompt else "",
         infer_cloud_from_prompt(pending_prompt) if pending_prompt else "",
+        _teams_safe_request_cloud(raw_pending_prompt) if raw_pending_prompt else "",
+        infer_cloud_from_prompt(raw_pending_prompt) if raw_pending_prompt else "",
     )
     for candidate in candidates:
         cloud = safe_normalize_cloud(str(candidate or "")) or ""
@@ -4584,10 +4635,12 @@ def _teams_pending_prompt_cloud(state: dict, request_data: dict | None = None) -
 
 
 def _teams_branch_resolution_patch(updated: dict, state: dict, request_data: dict | None = None) -> None:
-    pending_prompt = str((state or {}).get("pending_follow_up_prompt") or updated.get("prompt") or "").strip()
+    pending_prompt = _teams_resolve_pending_branch_infra_prompt(state, request_data or updated)
+    if not pending_prompt:
+        pending_prompt = str((state or {}).get("pending_follow_up_prompt") or updated.get("prompt") or "").strip()
     pending_cloud = _teams_pending_prompt_cloud(state, request_data or updated)
     if pending_prompt:
-        updated.setdefault("original_prompt", pending_prompt)
+        updated["original_prompt"] = pending_prompt
         updated["prompt"] = pending_prompt
         updated["message"] = pending_prompt
     if pending_cloud:
