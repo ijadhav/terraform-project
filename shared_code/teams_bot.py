@@ -1160,12 +1160,37 @@ class TerrabotTeamsBot(ActivityHandler):
                     or _infer_cloud_from_text_for_teams(state.get("last_infra_prompt"))
                     or ""
                 ).strip().lower()
-                # A branch-choice reply is transport control. The next
-                # generation must run from the captured infrastructure prompt in
-                # a fresh Foundry conversation. Reusing the previous Foundry
-                # thread after a `no` branch decision can preserve stale cloud
-                # or file memory and re-open the generic AWS/Azure question.
+                # A branch-choice reply is transport control. Resolve it
+                # here and persist the transition BEFORE calling the backend.
+                # Otherwise older backend wrapper layers can reload durable
+                # state that still says awaiting_branch_reuse_decision, consume
+                # the restored infra prompt as another branch decision, and
+                # eventually surface the stale branch-selection reset message.
                 branch_generation_thread_id = ""
+                branch_decision_patch = {
+                    "stage": "processing_new_infrastructure_request",
+                    "pending_follow_up_prompt": None,
+                    "pending_follow_up_cloud": None,
+                    "pending_follow_up_has_pr": None,
+                    "pending_follow_up_branch": None,
+                    "pending_follow_up_pr_url": None,
+                    "pending_follow_up_ticket_link": None,
+                    "pending_follow_up_ticket_number": None,
+                    "pending_follow_up_ticket_title": None,
+                    "branch_choice_resolved_for_request": True,
+                    "resolved_branch_choice": branch_choice,
+                    "resolved_reuse_branch": branch_choice == "reuse",
+                    "resolved_force_new_branch": branch_choice == "new",
+                    "resolved_existing_branch": state.get("branch", "") if branch_choice == "reuse" else "",
+                    "resolved_branch_cloud": pending_branch_cloud,
+                    "workflow_thread_id": None,
+                    "foundry_conversation_id": None,
+                }
+                state.update({key: value for key, value in branch_decision_patch.items() if value is not None})
+                for key, value in branch_decision_patch.items():
+                    if value is None:
+                        state.pop(key, None)
+                await _persist_thread_state(thread_id, state)
                 request = {
                     # Send the captured infrastructure request, not the literal
                     # yes/no branch-control reply. This keeps cloud/env/resource
@@ -1194,6 +1219,7 @@ class TerrabotTeamsBot(ActivityHandler):
                     "fresh_infra_generation": True,
                     "stateless_live_github_resolution": True,
                     "supersede_pending_request": True,
+                    "state_patch": branch_decision_patch,
                 }
         elif workflow_stage == "aws_module_selection":
             # AWS module-choice replies are protocol control, not new chat and
