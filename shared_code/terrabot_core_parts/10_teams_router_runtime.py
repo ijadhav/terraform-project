@@ -3857,6 +3857,26 @@ def _handle_teams_chat_request_multicloud(data: dict):
     branch_choice_already_resolved = _teams_truthy(
         request_data.get("pending_branch_choice_resolved")
     )
+
+    # The user already answered the branch question for this exact request. If
+    # the request then needed a clarification, the answer is replayed instead of
+    # asking the same question again, which is what produced a yes/no loop.
+    if not branch_choice_already_resolved and _teams_truthy(state.get("branch_choice_resolved_for_request")):
+        decided_prompt = str(state.get("resolved_branch_choice_prompt") or "").strip().lower()
+        if decided_prompt and decided_prompt == prompt.strip().lower():
+            branch_choice_already_resolved = True
+            request_data["pending_branch_choice_resolved"] = True
+            reuse_branch = _teams_truthy(state.get("resolved_reuse_branch"))
+            force_new_branch = _teams_truthy(state.get("resolved_force_new_branch"))
+            request_data["reuse_branch"] = reuse_branch
+            request_data["force_new_branch"] = force_new_branch
+            request_data["branch_choice"] = str(state.get("resolved_branch_choice") or "").strip()
+            request_data["existing_branch"] = str(
+                request_data.get("existing_branch")
+                or state.get("resolved_existing_branch")
+                or ""
+            ).strip()
+
     branch_choice_reply = (
         stage == "awaiting_branch_reuse_decision"
         and not action

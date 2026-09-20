@@ -2102,8 +2102,17 @@ def _teams_flow_guard_prepare_branch_reply(
     if not choice:
         return request_data, False
 
-    pending_prompt = str((state or {}).get("pending_follow_up_prompt") or "").strip()
-    if not pending_prompt:
+    # The captured follow-up prompt is the authoritative request text, but a
+    # worker restart (or an older bot build that did not persist it) must not
+    # turn the reply into a bare "yes"/"no" infrastructure request.
+    pending_prompt = str(
+        (state or {}).get("pending_follow_up_prompt")
+        or (request_data or {}).get("original_prompt")
+        or (state or {}).get("pending_target_selection_original_prompt")
+        or (state or {}).get("last_infra_prompt")
+        or ""
+    ).strip()
+    if not pending_prompt or _teams_branch_choice_from_reply(pending_prompt):
         return request_data, False
 
     updated = dict(request_data or {})
@@ -2141,6 +2150,21 @@ def _teams_flow_guard_prepare_branch_reply(
     )
     updated["fresh_infra_generation"] = True
 
+    # The cloud was already resolved when the branch question was asked. Pin it
+    # onto the restored request so no later layer has to re-infer a provider
+    # from the literal "yes"/"no" reply.
+    restored_cloud = safe_normalize_cloud(str(
+        (state or {}).get("pending_follow_up_cloud")
+        or updated.get("cloud")
+        or updated.get("requested_cloud")
+        or (state or {}).get("resolved_branch_cloud")
+        or (state or {}).get("cloud")
+        or ""
+    )) or ""
+    if restored_cloud:
+        updated["cloud"] = restored_cloud
+        updated["requested_cloud"] = restored_cloud
+
     if is_target_selection:
         updated["thread_id"] = selection_thread
         updated["pending_target_selection_reply"] = True
@@ -2171,7 +2195,11 @@ def _teams_flow_guard_prepare_branch_reply(
         "resolved_reuse_branch": choice == "reuse",
         "resolved_force_new_branch": choice == "new",
         "resolved_existing_branch": updated.get("existing_branch") or "",
-        "resolved_branch_cloud": str((state or {}).get("pending_follow_up_cloud") or (state or {}).get("cloud") or updated.get("cloud") or "").strip(),
+        "resolved_branch_cloud": restored_cloud or str((state or {}).get("cloud") or "").strip(),
+        # Bind the decision to the exact request text it answered. If that
+        # request still needs a clarification, the same prompt continues with
+        # this decision instead of reopening the branch question.
+        "resolved_branch_choice_prompt": pending_prompt,
     })
     if teams_conversation_id:
         _teams_save_ui_state(teams_conversation_id, updated["state_patch"])
@@ -2679,6 +2707,7 @@ def _handle_teams_chat_request_state_machine(data: dict):
                 "resolved_force_new_branch": None,
                 "resolved_existing_branch": None,
                 "resolved_branch_cloud": None,
+                "resolved_branch_choice_prompt": None,
             })
         else:
             patch.update({
@@ -2697,6 +2726,27 @@ def _handle_teams_chat_request_state_machine(data: dict):
                 "resolved_existing_branch": request_data.get("existing_branch") or state.get("resolved_existing_branch") or "",
                 "resolved_branch_cloud": request_data.get("cloud") or state.get("resolved_branch_cloud") or "",
             })
+
+    branch_reply_reached_terminal_result = bool(
+        branch_reply_handled
+        and status_code < 400
+        and result.get("ok", True)
+        and str(result.get("mode") or "").strip().lower()
+        not in {"clarification", "branch_choice_required"}
+        and str(result.get("decision_state") or "").strip().lower()
+        not in {"infra_modification_target_selection", "aws_module_selection", "awaiting_branch_reuse_decision"}
+    )
+    if branch_reply_reached_terminal_result:
+        # The answered request reached a terminal result, so the stored branch
+        # decision must not leak into the next infrastructure request.
+        patch.update({
+            "branch_choice_resolved_for_request": None,
+            "resolved_branch_choice": None,
+            "resolved_reuse_branch": None,
+            "resolved_force_new_branch": None,
+            "resolved_existing_branch": None,
+            "resolved_branch_choice_prompt": None,
+        })
 
     if target_selection_reply or branch_reply_handled:
         patch.update({

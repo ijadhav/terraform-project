@@ -1070,8 +1070,26 @@ class TerrabotTeamsBot(ActivityHandler):
                     return
 
                 await _send(turn_context, "Terrabot is processing your request...")
+                # A bare `yes`/`no` carries no provider or request semantics of
+                # its own. Send the captured request text and the cloud that was
+                # already resolved when the question was asked so the backend
+                # never has to re-classify the reply itself.
+                pending_branch_prompt = str(
+                    state.get("pending_follow_up_prompt")
+                    or state.get("last_infra_prompt")
+                    or ""
+                ).strip()
+                pending_branch_cloud = str(
+                    state.get("pending_follow_up_cloud")
+                    or state.get("resolved_branch_cloud")
+                    or state.get("cloud")
+                    or ""
+                ).strip()
                 request = {
                     "prompt": prompt,
+                    "original_prompt": pending_branch_prompt,
+                    "cloud": pending_branch_cloud,
+                    "requested_cloud": pending_branch_cloud,
                     "thread_id": workflow_thread_id,
                     "teams_conversation_id": thread_id,
                     "ticket_link": state.get("ticket_link", ticket_link),
