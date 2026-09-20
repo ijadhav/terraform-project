@@ -776,6 +776,48 @@ def _remember_user_turn(state: Dict[str, Any], prompt: str) -> None:
     state["recent_user_turns"] = turns[-12:]
 
 
+def _infer_cloud_from_text_for_teams(text: str) -> str:
+    """Small transport-only cloud inference for protocol continuations.
+
+    This is not Terraform/resource routing. It only prevents a yes/no branch
+    control reply from erasing a cloud that was already present in the captured
+    user request. Foundry/backend still own workflow and target selection.
+    """
+    value = str(text or "").strip().lower()
+    if not value:
+        return ""
+    has_azure = bool(re.search(r"(?<![a-z0-9])(?:azure|tf-azure-hub|npr|sbx|prd)(?![a-z0-9])", value))
+    has_aws = bool(re.search(r"(?<![a-z0-9])(?:aws|tf-devops|minidev|dev_aws|prod_aws)(?![a-z0-9])", value))
+    if has_azure and not has_aws:
+        return "azure"
+    if has_aws and not has_azure:
+        return "aws"
+    return ""
+
+
+def _conversation_context_from_durable_state(state: Dict[str, Any], current_prompt: str) -> str:
+    """Fallback Teams memory block reconstructed from durable thread state.
+
+    The process-local transcript can be empty after an Azure Functions worker
+    recycle. recent_user_turns is persisted with the Teams thread state, so it
+    keeps short follow-ups and branch/clarification replies grounded in the
+    same conversation even when the process memory store is cold.
+    """
+    turns = [str(value or "").strip() for value in (state.get("recent_user_turns") or [])]
+    turns = [value for value in turns if value]
+    current = str(current_prompt or "").strip()
+    if turns and current and turns[-1] == current:
+        turns = turns[:-1]
+    if not turns:
+        return ""
+    lines = [
+        "TEAMS CONVERSATION CONTEXT (durable fallback): previous user turns in this Terrabot Teams thread, oldest first. Use this only to resolve follow-ups, prior branch/target choices, pronouns, and previously supplied values. Live GitHub repository evidence remains the sole authority for files, resources, values, and branches."
+    ]
+    for value in turns[-12:]:
+        lines.append(f"user: {value[:700]}")
+    return "\n".join(lines)
+
+
 def _is_short_contextual_follow_up(prompt: str, state: Dict[str, Any]) -> bool:
     text = str(prompt or "").strip()
     if not text or len(text) > 80:
@@ -938,9 +980,10 @@ class TerrabotTeamsBot(ActivityHandler):
         )
         _remember_user_turn(state, prompt)
         teams_conversation_memory.record_user_message(thread_id, prompt)
-        set_teams_conversation_context(
-            teams_conversation_memory.get_context_block(thread_id)
-        )
+        context_block = teams_conversation_memory.get_context_block(thread_id)
+        if not context_block:
+            context_block = _conversation_context_from_durable_state(state, prompt)
+        set_teams_conversation_context(context_block)
         set_teams_short_follow_up(_is_short_contextual_follow_up(prompt, state))
         effective_prompt = _contextual_prompt(prompt, state)
         normalized = prompt.strip().lower()
@@ -1113,8 +1156,10 @@ class TerrabotTeamsBot(ActivityHandler):
                     state.get("pending_follow_up_cloud")
                     or state.get("resolved_branch_cloud")
                     or state.get("cloud")
+                    or _infer_cloud_from_text_for_teams(pending_branch_prompt)
+                    or _infer_cloud_from_text_for_teams(state.get("last_infra_prompt"))
                     or ""
-                ).strip()
+                ).strip().lower()
                 request = {
                     # Send the captured infrastructure request, not the literal
                     # yes/no branch-control reply. This keeps cloud/env/resource
@@ -1138,6 +1183,9 @@ class TerrabotTeamsBot(ActivityHandler):
                     "reuse_branch": branch_choice == "reuse",
                     "force_new_branch": branch_choice == "new",
                     "existing_branch": state.get("branch", "") if branch_choice == "reuse" else "",
+                    "pending_branch_choice_resolved": True,
+                    "fresh_infra_generation": True,
+                    "stateless_live_github_resolution": True,
                 }
         elif workflow_stage == "aws_module_selection":
             # AWS module-choice replies are protocol control, not new chat and
@@ -1507,6 +1555,30 @@ class TerrabotTeamsBot(ActivityHandler):
             state["base_branch"] = result.get("base_branch")
         elif mode == "branch_choice_required":
             state["stage"] = "awaiting_branch_reuse_decision"
+            pending_prompt_for_branch = str(
+                (result.get("request_prompt") or "")
+                or (result.get("state_patch") or {}).get("pending_follow_up_prompt")
+                or request.get("original_prompt")
+                or request.get("prompt")
+                or state.get("last_infra_prompt")
+                or ""
+            ).strip()
+            if pending_prompt_for_branch:
+                state["pending_follow_up_prompt"] = pending_prompt_for_branch
+                state["last_infra_prompt"] = pending_prompt_for_branch
+            pending_cloud_for_branch = str(
+                (result.get("state_patch") or {}).get("pending_follow_up_cloud")
+                or result.get("cloud")
+                or request.get("requested_cloud")
+                or request.get("cloud")
+                or _infer_cloud_from_text_for_teams(pending_prompt_for_branch)
+                or state.get("cloud")
+                or ""
+            ).strip().lower()
+            if pending_cloud_for_branch:
+                state["pending_follow_up_cloud"] = pending_cloud_for_branch
+                state["resolved_branch_cloud"] = pending_cloud_for_branch
+                state["cloud"] = pending_cloud_for_branch
         elif mode == "jira_required":
             state["stage"] = "awaiting_jira"
         elif mode == "pr_created" or result.get("pr_url"):

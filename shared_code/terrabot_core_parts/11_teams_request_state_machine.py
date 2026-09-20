@@ -2534,6 +2534,80 @@ def _handle_teams_chat_request_state_machine(data: dict):
         result, status_code = _TEAMS_FLOW_GUARD_PREVIOUS_HANDLE_CHAT(retry)
         result = dict(result or {})
 
+    # A branch yes/no reply is protocol control. If a lower router still asks
+    # "which cloud" after the branch choice, retry once using the cloud bound
+    # to the captured pending prompt instead of showing the loop to the user.
+    if branch_reply_handled:
+        _branch_reply_text = str(result.get("reply") or result.get("summary") or "").lower()
+        _branch_cloud_loop = bool(
+            str(result.get("mode") or "").lower() == "clarification"
+            and (
+                "please specify which cloud" in _branch_reply_text
+                or "which cloud" in _branch_reply_text
+                or str((result.get("router") or {}).get("workflow") or "").lower() == "clarification_required"
+            )
+        )
+        if _branch_cloud_loop:
+            restored_prompt = str(
+                request_data.get("prompt")
+                or request_data.get("original_prompt")
+                or state.get("pending_follow_up_prompt")
+                or state.get("last_infra_prompt")
+                or ""
+            ).strip()
+            restored_cloud = safe_normalize_cloud(str(
+                request_data.get("requested_cloud")
+                or request_data.get("cloud")
+                or _teams_pending_prompt_cloud(state, request_data)
+                or infer_cloud_from_prompt(restored_prompt)
+                or ""
+            ))
+            if restored_prompt and restored_cloud:
+                retry = dict(request_data)
+                retry.update({
+                    "prompt": restored_prompt,
+                    "message": restored_prompt,
+                    "original_prompt": restored_prompt,
+                    "mode": "infra",
+                    "foundry_intent": "infra",
+                    "cloud": restored_cloud,
+                    "requested_cloud": restored_cloud,
+                    "workflow": retry.get("workflow") or infer_generation_workflow(restored_prompt, restored_cloud),
+                    "fresh_infra_generation": True,
+                    "pending_branch_choice_resolved": True,
+                    "pending_branch_choice_reply": True,
+                    "reuse_branch": _teams_truthy(request_data.get("reuse_branch")),
+                    "force_new_branch": _teams_truthy(request_data.get("force_new_branch")),
+                    "existing_branch": str(request_data.get("existing_branch") or ""),
+                    "branch_choice": str(request_data.get("branch_choice") or ""),
+                })
+                _teams_flow_guard_clear_branch_prompt(
+                    teams_conversation_id,
+                    "processing_new_infrastructure_request",
+                )
+                result, status_code = _TEAMS_FLOW_GUARD_PREVIOUS_HANDLE_CHAT(retry)
+                result = dict(result or {})
+                request_data = retry
+
+    if branch_reply_handled:
+        _branch_reply_text = str(result.get("reply") or result.get("summary") or "").lower()
+        if (
+            str(result.get("mode") or "").lower() == "clarification"
+            and ("please specify which cloud" in _branch_reply_text or "which cloud" in _branch_reply_text)
+        ):
+            patch = _teams_flow_guard_clear_branch_prompt(teams_conversation_id, "idle")
+            return {
+                "ok": False,
+                "mode": "clarification",
+                "reply": (
+                    "Terrabot blocked a stale branch-decision loop. The branch yes/no reply was already applied, "
+                    "but a lower router still asked for cloud. Resend the infrastructure request; existing GitHub branches were kept."
+                ),
+                "thread_id": str(result.get("thread_id") or request_data.get("thread_id") or ""),
+                "state_patch": patch,
+                "diagnostic_code": "TEAMS_BRANCH_DECISION_CLOUD_LOOP_BLOCKED",
+            }, 409
+
     # One guarded retry is allowed only when a lower legacy wrapper attempted
     # to re-open branch choice before consuming an existing target selection.
     if target_selection_reply and str(result.get("mode") or "").lower() == "branch_choice_required":
