@@ -3431,8 +3431,22 @@ def handle_refresh_pr_status_request(
         "events": events,
     }, 200
 
+ROUTER_INTERNAL_CLARIFICATION_REASONS = {
+    "cloud is unclear",
+    "missing required deployment context",
+    "unable to classify safely",
+}
+
+
 def build_router_response_message(router_decision):
     if router_decision.workflow == "clarification_required":
+        # Environment/provider routing produces a specific, user-facing reason
+        # (for example a conflict between a named environment and a named
+        # cloud). Replacing it with the generic cloud question hides the real
+        # blocker and makes Terrabot ask for a cloud the user already gave.
+        reason = str(getattr(router_decision, "reason", "") or "").strip()
+        if reason and reason.lower() not in ROUTER_INTERNAL_CLARIFICATION_REASONS:
+            return reason
         if not router_decision.cloud:
             return "Please specify which cloud to use: AWS or Azure."
         return "Please provide the target environment or enough deployment context to continue."

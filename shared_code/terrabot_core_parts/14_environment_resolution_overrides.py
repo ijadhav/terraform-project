@@ -31,8 +31,17 @@ def _terrabot_env_name_pattern(name: str) -> str:
 
 
 def _terrabot_prompt_has_name(text: str, name: str) -> bool:
+    """True only when the prompt names this environment as a standalone token.
+
+    Hyphens and underscores join identifiers rather than separate them, so a
+    subscription/resource name such as ``npr-infra-devops`` or a repository
+    folder such as ``dev_aws`` must not be read as the AWS ``devops``/``dev``
+    environment. Environment names that legitimately contain hyphens (for
+    example ``npr-stg``) still match because the boundary is applied around the
+    whole name, not around each segment.
+    """
     pattern = _terrabot_env_name_pattern(name)
-    return bool(pattern and re.search(rf"(?<![a-z0-9]){pattern}(?![a-z0-9])", text))
+    return bool(pattern and re.search(rf"(?<![a-z0-9_-]){pattern}(?![a-z0-9_-])", text))
 
 
 def _terrabot_explicit_provider_from_prompt(prompt: str) -> str:
@@ -86,7 +95,7 @@ def _terrabot_environment_matches(prompt: str) -> list[dict]:
     # Azure non-production.  The exact token rule above already resolves it;
     # this explicit guard documents the routing contract and protects against
     # model-side interpretation drift.
-    if re.search(r"(?<![a-z0-9])dev(?:\s+environment|\s+env)?(?![a-z0-9])", text):
+    if re.search(r"(?<![a-z0-9_-])dev(?:\s+environment|\s+env)?(?![a-z0-9_-])", text):
         add("aws", "nonprod", "dev", TERRABOT_ENVIRONMENT_CATALOG["aws"]["nonprod"]["dev"], alias="dev")
 
     return matches
@@ -291,7 +300,10 @@ def normalize_router_decision(prompt, requested_mode, requested_cloud, recovered
         if (requested_mode or "").strip().lower() == "infra":
             return NormalizedRouterDecision(
                 request_type="infra",
-                cloud=None,
+                # Keep an already-resolved request cloud so the clarification
+                # does not discard the provider the user (or an earlier
+                # protocol turn) already pinned to this request.
+                cloud=safe_normalize_cloud(requested_cloud) or None,
                 workflow="clarification_required",
                 reason=str(resolution["error"]),
             )
