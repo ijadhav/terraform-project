@@ -795,6 +795,61 @@ def _infer_cloud_from_text_for_teams(text: str) -> str:
     return ""
 
 
+def _is_cloud_only_protocol_reply(text: str) -> bool:
+    """Return true for a bare cloud clarification answer, not an infra request."""
+    return str(text or "").strip().lower() in {"aws", "azure"}
+
+
+def _branch_prompt_candidate_is_usable(text: str) -> bool:
+    """Return true when text can be replayed as the captured infra request."""
+    value = str(text or "").strip()
+    if not value:
+        return False
+    lowered = value.lower()
+    if _is_cloud_only_protocol_reply(value):
+        return False
+    if AFFIRMATIVE_RE.match(lowered) or NEGATIVE_RE.match(lowered):
+        return False
+    if RESET_CHAT_RE.match(value) or JIRA_RE.fullmatch(value):
+        return False
+    if re.fullmatch(r"#?\d+", value):
+        return False
+    return True
+
+
+def _resolve_pending_branch_infra_prompt(state: Dict[str, Any], fallback: str = "") -> str:
+    """Recover the original infra request behind a branch-choice prompt.
+
+    The branch prompt can be shown after a cloud-only clarification such as
+    ``azure``. Older state snapshots sometimes stored that bare cloud reply as
+    ``pending_follow_up_prompt``. Replaying it after the user answers ``no``
+    sends the backend back to the generic "AWS or Azure" question. Resolve the
+    pending branch prompt back to the last real infrastructure instruction from
+    durable state/recent turns before the branch yes/no is forwarded.
+    """
+    direct = str((state or {}).get("pending_follow_up_prompt") or "").strip()
+    if _branch_prompt_candidate_is_usable(direct):
+        return direct
+
+    for key in (
+        "pending_target_selection_original_prompt",
+        "pending_aws_module_selection_original_prompt",
+        "last_infra_prompt",
+        "original_prompt",
+    ):
+        candidate = str((state or {}).get(key) or "").strip()
+        if _branch_prompt_candidate_is_usable(candidate):
+            return candidate
+
+    turns = list((state or {}).get("recent_user_turns") or [])
+    for candidate in reversed(turns):
+        text = str(candidate or "").strip()
+        if _branch_prompt_candidate_is_usable(text):
+            return text
+
+    return str(fallback or direct or "").strip()
+
+
 def _conversation_context_from_durable_state(state: Dict[str, Any], current_prompt: str) -> str:
     """Fallback Teams memory block reconstructed from durable thread state.
 
@@ -1147,11 +1202,10 @@ class TerrabotTeamsBot(ActivityHandler):
                     return
 
                 await _send(turn_context, "Terrabot is processing your request...")
-                pending_branch_prompt = str(
-                    state.get("pending_follow_up_prompt")
-                    or state.get("last_infra_prompt")
-                    or ""
-                ).strip()
+                pending_branch_prompt = _resolve_pending_branch_infra_prompt(
+                    state,
+                    fallback=prompt,
+                )
                 pending_branch_cloud = str(
                     state.get("pending_follow_up_cloud")
                     or state.get("resolved_branch_cloud")
@@ -1589,7 +1643,7 @@ class TerrabotTeamsBot(ActivityHandler):
             state["base_branch"] = result.get("base_branch")
         elif mode == "branch_choice_required":
             state["stage"] = "awaiting_branch_reuse_decision"
-            pending_prompt_for_branch = str(
+            raw_pending_prompt_for_branch = str(
                 (result.get("request_prompt") or "")
                 or (result.get("state_patch") or {}).get("pending_follow_up_prompt")
                 or request.get("original_prompt")
@@ -1597,6 +1651,12 @@ class TerrabotTeamsBot(ActivityHandler):
                 or state.get("last_infra_prompt")
                 or ""
             ).strip()
+            pending_prompt_for_branch = raw_pending_prompt_for_branch
+            if not _branch_prompt_candidate_is_usable(pending_prompt_for_branch):
+                pending_prompt_for_branch = _resolve_pending_branch_infra_prompt(
+                    {**local_state_before_backend, **state},
+                    fallback=raw_pending_prompt_for_branch,
+                )
             if pending_prompt_for_branch:
                 state["pending_follow_up_prompt"] = pending_prompt_for_branch
                 state["last_infra_prompt"] = pending_prompt_for_branch
