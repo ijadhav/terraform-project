@@ -4747,3 +4747,359 @@ def _teams_structured_live_repo_failure(
     ]
     response["analysis"] = "\n".join(part for part in (analysis, "\n".join(diagnostic_lines)) if part)
     return response, status
+
+# =============================================================================
+# Final Teams branch-decision/request-cloud binding and Azure subscription guard
+# =============================================================================
+# Appended as a final override. It preserves all existing generation, validation,
+# branch, PR and repair paths while fixing two transport/state issues:
+#   1. yes/no branch-control replies can never be replayed as infrastructure
+#      prompts and are bound to the exact captured request text + cloud.
+#   2. Azure subscription names such as npr-infra-devops do not create a false
+#      AWS/devops environment signal when the request explicitly says Azure.
+
+_TEAMS_FINAL_BRANCH_PREVIOUS_SAFE_REQUEST_CLOUD = _teams_safe_request_cloud
+_TEAMS_FINAL_BRANCH_PREVIOUS_PREPARE_PENDING_BRANCH_CHOICE = _teams_prepare_pending_branch_choice_request
+_TEAMS_FINAL_BRANCH_PREVIOUS_FLOW_GUARD_BRANCH_REPLY = _teams_flow_guard_prepare_branch_reply
+_TEAMS_FINAL_BRANCH_PREVIOUS_BUILD_AGENT_INPUT_FOR_INFRA = build_agent_input_for_infra
+_TEAMS_FINAL_BRANCH_PREVIOUS_HANDLE_TEAMS_CHAT_REQUEST = handle_teams_chat_request
+_TEAMS_FINAL_BRANCH_PREVIOUS_DETECT_EXPLICIT_AWS_ENVIRONMENT = detect_explicit_aws_environment
+_TEAMS_FINAL_BRANCH_PREVIOUS_RESOLVE_AWS_ENVIRONMENT_PATH = resolve_aws_environment_path
+
+
+def _teams_prompt_sha256(value: str) -> str:
+    import hashlib as _hashlib
+    return _hashlib.sha256(str(value or '').strip().encode('utf-8')).hexdigest()
+
+
+def _teams_word_present(text: str, word: str) -> bool:
+    return bool(re.search(rf'(?<![a-z0-9]){re.escape(word)}(?![a-z0-9])', str(text or '').lower()))
+
+
+def _teams_safe_request_cloud(prompt: str) -> str:
+    """Resolve provider words without treating hyphenated subscription tokens as AWS envs.
+
+    `npr-infra-devops` is an Azure subscription name in real Teams prompts. The
+    old matcher normalized punctuation to spaces, so the trailing `devops` token
+    looked like the AWS production environment. This function requires explicit
+    AWS repository/cloud markers for AWS and lets explicit Azure/subscription
+    wording win when both appear only because of such a subscription string.
+    """
+    raw = str(prompt or '')
+    lowered = raw.lower()
+    if not lowered.strip():
+        return ''
+
+    azure_markers = (
+        'azure', 'tf-azure-hub', 'azurerm', 'hub.tfvars', 'hub tfvars',
+        'npr-infra', 'sbx-infra', 'prd-infra', 'subscription',
+    )
+    aws_markers = (
+        'aws', 'amazon web services', 'tf-devops', 'dev_aws', 'prod_aws',
+        'dev services aws', 'dev-services-aws', 'minidev',
+    )
+    has_azure = any(marker in lowered for marker in azure_markers)
+    has_aws = any(marker in lowered for marker in aws_markers)
+
+    # Do not count the bare token "devops" as AWS when it appears only inside a
+    # hyphenated Azure subscription/resource identifier such as npr-infra-devops.
+    explicit_tf_devops = bool(re.search(r'(?<![a-z0-9])tf[-_ ]devops(?![a-z0-9])', lowered))
+    explicit_aws_word = any(_teams_word_present(lowered, token) for token in ('aws', 'amazon'))
+    explicit_aws_env = bool(re.search(r'(?<![a-z0-9])(?:dev_aws|prod_aws|dev-services-aws|minidev)(?![a-z0-9])', lowered))
+    has_aws = bool(explicit_tf_devops or explicit_aws_word or explicit_aws_env)
+
+    if has_azure and not has_aws:
+        return 'azure'
+    if has_aws and not has_azure:
+        return 'aws'
+    if has_azure and has_aws:
+        # A prompt like "... subscription ... azure" is not provider-ambiguous
+        # just because the subscription contains a devops segment.
+        if 'azure' in lowered or 'subscription' in lowered:
+            return 'azure'
+    try:
+        inferred = safe_normalize_cloud(infer_cloud_from_prompt(raw))
+    except Exception:
+        inferred = ''
+    return inferred or ''
+
+
+def _teams_prompt_has_explicit_azure(prompt: str) -> bool:
+    return _teams_safe_request_cloud(prompt) == 'azure'
+
+
+def detect_explicit_aws_environment(prompt: str):
+    """Block false AWS env detection inside explicit Azure requests."""
+    if _teams_prompt_has_explicit_azure(prompt):
+        return '', ''
+    return _TEAMS_FINAL_BRANCH_PREVIOUS_DETECT_EXPLICIT_AWS_ENVIRONMENT(prompt)
+
+
+def resolve_aws_environment_path(prompt: str, *args, **kwargs):
+    """Do not resolve AWS environment from an explicit Azure request."""
+    if _teams_prompt_has_explicit_azure(prompt):
+        return '', ''
+    return _TEAMS_FINAL_BRANCH_PREVIOUS_RESOLVE_AWS_ENVIRONMENT_PATH(prompt, *args, **kwargs)
+
+
+def _teams_enrich_branch_state_with_restored_prompt(state: dict, request_data: dict | None = None) -> dict:
+    enriched = dict(state or {})
+    request_data = request_data or {}
+    restored_prompt = _teams_resolve_pending_branch_infra_prompt(enriched, request_data)
+    if restored_prompt:
+        enriched['pending_follow_up_prompt'] = restored_prompt
+        enriched['last_infra_prompt'] = restored_prompt
+    restored_cloud = _teams_pending_prompt_cloud(enriched, request_data)
+    if restored_cloud:
+        enriched['pending_follow_up_cloud'] = restored_cloud
+        enriched['resolved_branch_cloud'] = restored_cloud
+        enriched['cloud'] = restored_cloud
+    return enriched
+
+
+def _teams_branch_protocol_patch(updated: dict, state: dict, request_data: dict | None = None) -> None:
+    """Bind a branch yes/no answer to one captured prompt and one cloud."""
+    request_data = request_data or updated
+    restored_prompt = _teams_resolve_pending_branch_infra_prompt(state, request_data)
+    restored_cloud = _teams_pending_prompt_cloud(state, request_data)
+    if restored_prompt:
+        updated['prompt'] = restored_prompt
+        updated['message'] = restored_prompt
+        updated['original_prompt'] = restored_prompt
+    if restored_cloud:
+        updated['cloud'] = restored_cloud
+        updated['requested_cloud'] = restored_cloud
+        if restored_prompt and not str(updated.get('workflow') or '').strip():
+            try:
+                workflow = infer_generation_workflow(restored_prompt, restored_cloud)
+            except Exception:
+                workflow = ''
+            if workflow:
+                updated['workflow'] = workflow
+    choice = str(updated.get('branch_choice') or '').strip().lower()
+    if choice not in {'reuse', 'new'}:
+        choice = _teams_branch_choice_from_reply(str(request_data.get('prompt') or ''))
+    prompt_hash = _teams_prompt_sha256(restored_prompt) if restored_prompt else ''
+    updated.update({
+        'mode': 'infra',
+        'foundry_intent': 'infra',
+        'fresh_infra_generation': True,
+        'stateless_live_github_resolution': True,
+        'pending_branch_choice_resolved': True,
+        'pending_branch_choice_reply': True,
+    })
+    if choice:
+        updated['branch_choice'] = choice
+        updated['reuse_branch'] = choice == 'reuse'
+        updated['force_new_branch'] = choice == 'new'
+        if choice == 'new':
+            updated['existing_branch'] = ''
+    # A branch control reply must never reuse the Foundry conversation that
+    # produced the branch question. The live Git branch carries code continuity.
+    updated['thread_id'] = ''
+
+    patch = updated.setdefault('state_patch', {})
+    if isinstance(patch, dict):
+        patch.update({
+            'stage': 'processing_new_infrastructure_request',
+            'pending_follow_up_prompt': None,
+            'pending_follow_up_cloud': None,
+            'pending_follow_up_has_pr': None,
+            'pending_follow_up_branch': None,
+            'pending_follow_up_pr_url': None,
+            'pending_follow_up_ticket_link': None,
+            'pending_follow_up_ticket_number': None,
+            'pending_follow_up_ticket_title': None,
+            'branch_choice_resolved_for_request': True,
+            'branch_choice_answered_prompt_sha256': prompt_hash,
+            'branch_choice_answered_prompt': restored_prompt[:1200] if restored_prompt else '',
+            'resolved_branch_choice': choice,
+            'resolved_reuse_branch': choice == 'reuse',
+            'resolved_force_new_branch': choice == 'new',
+            'resolved_existing_branch': str(updated.get('existing_branch') or '') if choice == 'reuse' else '',
+            'resolved_branch_cloud': restored_cloud,
+            'cloud': restored_cloud,
+        })
+
+
+def _teams_prepare_pending_branch_choice_request(
+    request_data: dict,
+    state: dict,
+    teams_conversation_id: str,
+    prompt: str,
+) -> tuple[dict, bool]:
+    enriched_state = _teams_enrich_branch_state_with_restored_prompt(state, request_data)
+    updated, handled = _TEAMS_FINAL_BRANCH_PREVIOUS_PREPARE_PENDING_BRANCH_CHOICE(
+        request_data,
+        enriched_state,
+        teams_conversation_id,
+        prompt,
+    )
+    if handled:
+        _teams_branch_protocol_patch(updated, enriched_state, request_data)
+        if teams_conversation_id and isinstance(updated.get('state_patch'), dict):
+            _teams_save_ui_state(teams_conversation_id, updated['state_patch'])
+    return updated, handled
+
+
+def _teams_flow_guard_prepare_branch_reply(
+    request_data: dict,
+    state: dict,
+    teams_conversation_id: str,
+    prompt: str,
+) -> tuple[dict, bool]:
+    enriched_state = _teams_enrich_branch_state_with_restored_prompt(state, request_data)
+    updated, handled = _TEAMS_FINAL_BRANCH_PREVIOUS_FLOW_GUARD_BRANCH_REPLY(
+        request_data,
+        enriched_state,
+        teams_conversation_id,
+        prompt,
+    )
+    if handled:
+        _teams_branch_protocol_patch(updated, enriched_state, request_data)
+        if teams_conversation_id and isinstance(updated.get('state_patch'), dict):
+            _teams_save_ui_state(teams_conversation_id, updated['state_patch'])
+    return updated, handled
+
+
+def _teams_replay_resolved_branch_choice_for_same_prompt(request_data: dict, state: dict) -> dict:
+    """Replay a stored branch choice only for the exact prompt it answered."""
+    updated = dict(request_data or {})
+    prompt = str(updated.get('prompt') or updated.get('message') or '').strip()
+    if not prompt or not _teams_branch_prompt_candidate_is_usable(prompt):
+        return updated
+    stored_hash = str((state or {}).get('branch_choice_answered_prompt_sha256') or '').strip()
+    if not stored_hash or stored_hash != _teams_prompt_sha256(prompt):
+        return updated
+    choice = str((state or {}).get('resolved_branch_choice') or '').strip().lower()
+    if choice not in {'reuse', 'new'}:
+        return updated
+    cloud = safe_normalize_cloud(str((state or {}).get('resolved_branch_cloud') or updated.get('cloud') or updated.get('requested_cloud') or '')) or ''
+    updated.update({
+        'mode': 'infra',
+        'foundry_intent': 'infra',
+        'pending_branch_choice_resolved': True,
+        'fresh_infra_generation': True,
+        'branch_choice': choice,
+        'reuse_branch': choice == 'reuse',
+        'force_new_branch': choice == 'new',
+        'existing_branch': str((state or {}).get('resolved_existing_branch') or '') if choice == 'reuse' else '',
+    })
+    if cloud:
+        updated['cloud'] = cloud
+        updated['requested_cloud'] = cloud
+    return updated
+
+
+def build_agent_input_for_infra(
+    prompt: str,
+    thread_id: str,
+    selected_cloud: Optional[str] = None,
+    workflow: Optional[str] = None,
+    retrieved_module_context: Optional[list] = None,
+    retrieved_value_context: Optional[list] = None,
+) -> str:
+    raw = _TEAMS_FINAL_BRANCH_PREVIOUS_BUILD_AGENT_INPUT_FOR_INFRA(
+        prompt,
+        thread_id,
+        selected_cloud=selected_cloud,
+        workflow=workflow,
+        retrieved_module_context=retrieved_module_context,
+        retrieved_value_context=retrieved_value_context,
+    )
+    active = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
+    if not active.get('active'):
+        return raw
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        return raw
+    instructions = list(payload.get('instructions') or [])
+    instructions.extend([
+        'TEAMS BRANCH CONTROL REPLIES (HARD): bare yes/no/reuse/new/fresh/current/existing are protocol answers to branch or PR prompts, never infrastructure prompts. Do not infer cloud, environment, file, resource, or Terraform intent from a bare yes/no value.',
+        'When the backend supplies pending_branch_choice_resolved or teams_branch_context, continue the captured infrastructure request exactly as supplied by backend prompt/original_prompt; do not reinterpret the branch-control reply as the user request.',
+        'AZURE SUBSCRIPTION GUARD (HARD): hyphenated Azure subscription names such as npr-infra-devops are opaque subscription identifiers. Do not split them into environment/provider tokens and do not treat the devops segment as an AWS/tf-devops environment when the request explicitly says Azure or subscription.',
+        'NO-ENV/HUB/FILE SELF-RESOLUTION (HARD): when the request has a cloud, resource family/name, subscription, or environment clue but does not name an exact hub, environment folder, tfvars file, or Terraform path, first use backend-supplied live GitHub matched Terraform/tfvars files, repository scan evidence, sibling resource patterns, folder names, comments, variable/object roots, and module labels to select the target.',
+        'Ask the user only when multiple live repository targets remain genuinely equivalent after comparing the current request with all backend-supplied evidence. Never ask which cloud/file/path just because the prompt omitted an exact hub/env/file while evidence can decide it.',
+        'For Azure storage-account requests, prefer live tf-azure-hub evidence from matched Terraform/tfvars files in the resolved subscription/environment scope. Derive the resource-family file, variables/object root, and target tfvars from nearest sibling storage-account patterns before asking.',
+    ])
+    payload['instructions'] = instructions
+    return json.dumps(payload, separators=(',', ':'), ensure_ascii=False)
+
+
+def handle_teams_chat_request(data: dict):
+    request_data = dict(data or {})
+    teams_conversation_id = str(
+        request_data.get('teams_conversation_id')
+        or request_data.get('conversation_id')
+        or ''
+    ).strip()
+    state = load_teams_conversation_state(teams_conversation_id) if teams_conversation_id else {}
+
+    # If the user already answered branch yes/no for this exact request and a
+    # later repository clarification continues the same prompt, replay the same
+    # branch decision instead of reopening branch selection.
+    if not str(request_data.get('action') or '').strip():
+        request_data = _teams_replay_resolved_branch_choice_for_same_prompt(request_data, state)
+        prompt = str(request_data.get('prompt') or request_data.get('message') or '').strip()
+        resolved_cloud = _teams_safe_request_cloud(prompt)
+        if resolved_cloud:
+            request_data['cloud'] = resolved_cloud
+            request_data['requested_cloud'] = resolved_cloud
+
+    result, status_code = _TEAMS_FINAL_BRANCH_PREVIOUS_HANDLE_TEAMS_CHAT_REQUEST(request_data)
+    result = dict(result or {})
+
+    # Persist prompt-bound branch choice metadata when a branch question is
+    # created. This makes the eventual yes/no answer auditable and replayable
+    # only for that exact prompt.
+    if str(result.get('mode') or '').lower() == 'branch_choice_required':
+        prompt = str(
+            result.get('request_prompt')
+            or (result.get('state_patch') or {}).get('pending_follow_up_prompt')
+            or request_data.get('original_prompt')
+            or request_data.get('prompt')
+            or ''
+        ).strip()
+        cloud = safe_normalize_cloud(str(
+            (result.get('state_patch') or {}).get('pending_follow_up_cloud')
+            or result.get('cloud')
+            or request_data.get('requested_cloud')
+            or request_data.get('cloud')
+            or _teams_safe_request_cloud(prompt)
+            or ''
+        )) or ''
+        patch = dict(result.get('state_patch') or {})
+        if prompt:
+            patch['pending_follow_up_prompt'] = prompt
+            patch['pending_follow_up_prompt_sha256'] = _teams_prompt_sha256(prompt)
+        if cloud:
+            patch['pending_follow_up_cloud'] = cloud
+            patch['resolved_branch_cloud'] = cloud
+            patch['cloud'] = cloud
+        result['state_patch'] = patch
+        if teams_conversation_id:
+            _teams_save_ui_state(teams_conversation_id, patch)
+
+    # Clear branch-decision replay metadata once the request has reached a
+    # terminal write/PR/discard result. Preserve remote GitHub artifacts.
+    terminal_mode = str(result.get('mode') or '').lower()
+    if terminal_mode in {'branch_created', 'pr_created'} or result.get('pr_url') or request_data.get('action') == 'discard_pending':
+        patch = dict(result.get('state_patch') or {})
+        patch.update({
+            'branch_choice_resolved_for_request': None,
+            'branch_choice_answered_prompt_sha256': None,
+            'branch_choice_answered_prompt': None,
+            'resolved_branch_choice': None,
+            'resolved_reuse_branch': None,
+            'resolved_force_new_branch': None,
+            'resolved_existing_branch': None,
+            'resolved_branch_cloud': None,
+            'pending_follow_up_prompt_sha256': None,
+        })
+        result['state_patch'] = patch
+        if teams_conversation_id:
+            _teams_save_ui_state(teams_conversation_id, patch)
+
+    return result, status_code
+
