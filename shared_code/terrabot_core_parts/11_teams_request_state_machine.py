@@ -2595,18 +2595,83 @@ def _handle_teams_chat_request_state_machine(data: dict):
             str(result.get("mode") or "").lower() == "clarification"
             and ("please specify which cloud" in _branch_reply_text or "which cloud" in _branch_reply_text)
         ):
-            patch = _teams_flow_guard_clear_branch_prompt(teams_conversation_id, "idle")
-            return {
-                "ok": False,
-                "mode": "clarification",
-                "reply": (
-                    "Terrabot blocked a stale branch-decision loop. The branch yes/no reply was already applied, "
-                    "but a lower router still asked for cloud. Resend the infrastructure request; existing GitHub branches were kept."
-                ),
-                "thread_id": str(result.get("thread_id") or request_data.get("thread_id") or ""),
-                "state_patch": patch,
-                "diagnostic_code": "TEAMS_BRANCH_DECISION_CLOUD_LOOP_BLOCKED",
-            }, 409
+            # Do not surface an internal stale-state diagnostic in Teams. A
+            # branch decision has already been captured, so make one final
+            # generation attempt using only the restored prompt/cloud and a
+            # fresh Foundry thread. This bypasses old conversation memory that
+            # can cause the lower router to ask AWS/Azure again.
+            restored_prompt = str(
+                request_data.get("prompt")
+                or request_data.get("original_prompt")
+                or state.get("pending_follow_up_prompt")
+                or state.get("last_infra_prompt")
+                or ""
+            ).strip()
+            restored_cloud = safe_normalize_cloud(str(
+                request_data.get("requested_cloud")
+                or request_data.get("cloud")
+                or _teams_pending_prompt_cloud(state, request_data)
+                or infer_cloud_from_prompt(restored_prompt)
+                or ""
+            ))
+            if restored_prompt and restored_cloud:
+                retry = dict(request_data)
+                retry.update({
+                    "prompt": restored_prompt,
+                    "message": restored_prompt,
+                    "original_prompt": restored_prompt,
+                    "thread_id": "",
+                    "mode": "infra",
+                    "foundry_intent": "infra",
+                    "cloud": restored_cloud,
+                    "requested_cloud": restored_cloud,
+                    "workflow": retry.get("workflow") or infer_generation_workflow(restored_prompt, restored_cloud),
+                    "fresh_infra_generation": True,
+                    "stateless_live_github_resolution": True,
+                    "pending_branch_choice_resolved": True,
+                    "pending_branch_choice_reply": True,
+                    "reuse_branch": _teams_truthy(request_data.get("reuse_branch")),
+                    "force_new_branch": _teams_truthy(request_data.get("force_new_branch")),
+                    "existing_branch": str(request_data.get("existing_branch") or ""),
+                    "branch_choice": str(request_data.get("branch_choice") or ""),
+                    "supersede_pending_request": True,
+                })
+                _teams_flow_guard_clear_branch_prompt(
+                    teams_conversation_id,
+                    "processing_new_infrastructure_request",
+                )
+                result, status_code = _TEAMS_FLOW_GUARD_PREVIOUS_HANDLE_CHAT(retry)
+                result = dict(result or {})
+                request_data = retry
+
+            # If a legacy path still returns the same cloud question after the
+            # final fresh-thread retry, clear the stale branch prompt and return
+            # a neutral status message instead of a user-visible error/409. The
+            # next user message starts a clean generation flow; existing remote
+            # branches and PRs remain untouched.
+            _final_text = str(result.get("reply") or result.get("summary") or "").lower()
+            if (
+                str(result.get("mode") or "").lower() == "clarification"
+                and ("please specify which cloud" in _final_text or "which cloud" in _final_text)
+            ):
+                patch = _teams_flow_guard_clear_branch_prompt(teams_conversation_id, "idle")
+                patch.update({
+                    "workflow_thread_id": None,
+                    "foundry_conversation_id": None,
+                    "pending_branch_choice_reply": None,
+                    "pending_branch_choice_resolved": None,
+                })
+                return {
+                    "ok": True,
+                    "mode": "chat",
+                    "reply": (
+                        "Terrabot reset stale branch-selection state. Send the infrastructure request again; "
+                        "existing GitHub branches and pull requests were kept unchanged."
+                    ),
+                    "thread_id": "",
+                    "state_patch": patch,
+                    "diagnostic_code": "TEAMS_BRANCH_DECISION_CLOUD_LOOP_RESET",
+                }, 200
 
     # One guarded retry is allowed only when a lower legacy wrapper attempted
     # to re-open branch choice before consuming an existing target selection.
@@ -4528,11 +4593,30 @@ def _teams_branch_resolution_patch(updated: dict, state: dict, request_data: dic
     if pending_cloud:
         updated["cloud"] = pending_cloud
         updated["requested_cloud"] = pending_cloud
+        if pending_prompt and not str(updated.get("workflow") or "").strip():
+            try:
+                workflow = infer_generation_workflow(pending_prompt, pending_cloud)
+            except Exception:
+                workflow = ""
+            if workflow:
+                updated["workflow"] = workflow
+        # Branch yes/no is already resolved at this point. Pin infra mode and
+        # use a fresh Foundry thread so the lower router cannot classify the
+        # control reply or an older Foundry conversation as the active request.
+        updated["mode"] = "infra"
+        updated["foundry_intent"] = "infra"
+        updated["fresh_infra_generation"] = True
+        updated["stateless_live_github_resolution"] = True
+        updated["pending_branch_choice_resolved"] = True
+        updated["pending_branch_choice_reply"] = True
+        if _teams_truthy(updated.get("force_new_branch")) or _teams_truthy(updated.get("reuse_branch")):
+            updated["thread_id"] = ""
         patch = updated.setdefault("state_patch", {})
         if isinstance(patch, dict):
             patch["resolved_branch_cloud"] = pending_cloud
             patch["cloud"] = pending_cloud
             patch["pending_follow_up_cloud"] = None
+            patch["stage"] = "processing_new_infrastructure_request"
 
 
 def _teams_prepare_pending_branch_choice_request(

@@ -1160,6 +1160,12 @@ class TerrabotTeamsBot(ActivityHandler):
                     or _infer_cloud_from_text_for_teams(state.get("last_infra_prompt"))
                     or ""
                 ).strip().lower()
+                # A branch-choice reply is transport control. The next
+                # generation must run from the captured infrastructure prompt in
+                # a fresh Foundry conversation. Reusing the previous Foundry
+                # thread after a `no` branch decision can preserve stale cloud
+                # or file memory and re-open the generic AWS/Azure question.
+                branch_generation_thread_id = ""
                 request = {
                     # Send the captured infrastructure request, not the literal
                     # yes/no branch-control reply. This keeps cloud/env/resource
@@ -1167,12 +1173,13 @@ class TerrabotTeamsBot(ActivityHandler):
                     "prompt": pending_branch_prompt or prompt,
                     "message": pending_branch_prompt or prompt,
                     "original_prompt": pending_branch_prompt or state.get("last_infra_prompt", ""),
-                    "thread_id": workflow_thread_id,
+                    "thread_id": branch_generation_thread_id,
                     "teams_conversation_id": thread_id,
                     "ticket_link": state.get("ticket_link", ticket_link),
                     "jira_ticket": state.get("ticket_number", ticket_number),
                     "source": "teams",
                     "mode": "infra",
+                    "foundry_intent": "infra",
                     "cloud": pending_branch_cloud,
                     "requested_cloud": pending_branch_cloud,
                     "pending_branch_choice_reply": True,
@@ -1186,6 +1193,7 @@ class TerrabotTeamsBot(ActivityHandler):
                     "pending_branch_choice_resolved": True,
                     "fresh_infra_generation": True,
                     "stateless_live_github_resolution": True,
+                    "supersede_pending_request": True,
                 }
         elif workflow_stage == "aws_module_selection":
             # AWS module-choice replies are protocol control, not new chat and
