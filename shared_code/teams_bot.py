@@ -493,8 +493,8 @@ def _format_reply(result: Dict[str, Any]) -> str:
                     item for item in candidate_items
                     if isinstance(item, dict)
                     and (
-                        str(item.get("path") or item.get("filename") or "").strip()
-                        or str(item.get("flag") or item.get("identifier") or "").strip()
+                        str(item.get("path") or item.get("filename") or item.get("module_path") or "").strip()
+                        or str(item.get("flag") or item.get("identifier") or item.get("label") or item.get("module_source") or "").strip()
                         or any(str(value).strip() for value in (item.get("matched_blocks") or []))
                         or str(item.get("content_summary") or "").strip()
                     )
@@ -507,12 +507,22 @@ def _format_reply(result: Dict[str, Any]) -> str:
                 display_limit = 15
                 for fallback_index, item in enumerate(ordered_candidates[:display_limit], start=1):
                     index = item.get("index") or fallback_index
-                    path = str(item.get("path") or item.get("filename") or "").strip()
+                    path = str(item.get("path") or item.get("filename") or item.get("module_path") or "").strip()
                     blocks = [str(value).strip() for value in (item.get("matched_blocks") or []) if str(value).strip()]
                     identifier = str(item.get("flag") or item.get("identifier") or "").strip()
-                    label = blocks[0] if blocks else path.rsplit("/", 1)[-1] if path else identifier or "Terraform target"
+                    explicit_label = str(item.get("label") or "").strip()
+                    module_source = str(item.get("module_source") or "").strip()
+                    environment_path = str(item.get("environment_path") or "").strip()
+                    label = explicit_label or (blocks[0] if blocks else path.rsplit("/", 1)[-1] if path else identifier or module_source or "Terraform target")
                     content_summary = str(item.get("content_summary") or "").strip()
-                    suffix = f" — {content_summary}" if content_summary else ""
+                    detail_parts = []
+                    if module_source:
+                        detail_parts.append(f"source `{module_source}`")
+                    if environment_path:
+                        detail_parts.append(f"target `{environment_path}`")
+                    if content_summary:
+                        detail_parts.append(content_summary)
+                    suffix = f" — {'; '.join(detail_parts)}" if detail_parts else ""
                     target_text = f" — `{path}`" if path else ""
                     lines.append(f"{index}. **{label}**{target_text}{suffix}")
                 remaining = len(ordered_candidates) - display_limit
@@ -522,7 +532,7 @@ def _format_reply(result: Dict[str, Any]) -> str:
                     "",
                     "Reply with the number, resource/module name, or path. Terrabot will continue the original request after your selection.",
                 ])
-                if related_pr_lines:
+                if related_pr_lines and ordered_candidates:
                     lines.extend(["", *related_pr_lines])
                 return "\n".join(lines)
 

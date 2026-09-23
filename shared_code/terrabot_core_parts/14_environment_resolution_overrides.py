@@ -47,7 +47,14 @@ def _terrabot_explicit_provider_from_prompt(prompt: str) -> str:
 
 
 def _terrabot_environment_matches(prompt: str) -> list[dict]:
-    """Return every explicit environment named by the user, without collapsing tiers."""
+    """Return every explicit environment named by the user, without collapsing tiers.
+
+    Matching is longest/specific-token first. This is important for repository
+    folders whose names extend another valid environment name (for example
+    ``us1_dr`` vs ``us1`` or ``dev_devops`` vs ``dev``). A shorter match that
+    is wholly contained inside a longer environment token is ignored, while
+    distinct explicit environments elsewhere in the same prompt are preserved.
+    """
     text = _terrabot_env_text(prompt)
     matches: list[dict] = []
     seen: set[tuple[str, str, str]] = set()
@@ -66,31 +73,80 @@ def _terrabot_environment_matches(prompt: str) -> list[dict]:
             "repo_target": TERRABOT_ENVIRONMENT_CATALOG[cloud]["repo_target"],
         })
 
-    # Azure aliases are unambiguous and intentionally checked before canonical
-    # names so a short production alias such as `ca4` resolves to `prd-ca4`.
+    # Build one catalog of every repository-backed environment spelling, then
+    # select non-overlapping longest spans. This avoids special-casing DR names
+    # and automatically covers any future environment whose name extends a
+    # shorter valid environment token.
+    definitions: list[dict] = []
     for alias, canonical in TERRABOT_AZURE_ENVIRONMENT_ALIASES.items():
-        if not _terrabot_prompt_has_name(text, alias):
-            continue
         for tier in ("nonprod", "prod"):
             path = TERRABOT_ENVIRONMENT_CATALOG["azure"][tier].get(canonical)
             if path:
-                add("azure", tier, canonical, path, alias=alias)
+                definitions.append({
+                    "cloud": "azure",
+                    "tier": tier,
+                    "canonical": canonical,
+                    "path": path,
+                    "name": alias,
+                    "alias": alias,
+                })
 
     for cloud in ("aws", "azure"):
         for tier in ("nonprod", "prod"):
             for canonical, path in TERRABOT_ENVIRONMENT_CATALOG[cloud][tier].items():
-                if _terrabot_prompt_has_name(text, canonical):
-                    add(cloud, tier, canonical, path)
+                definitions.append({
+                    "cloud": cloud,
+                    "tier": tier,
+                    "canonical": canonical,
+                    "path": path,
+                    "name": canonical,
+                    "alias": canonical,
+                })
+
+    raw_hits: list[dict] = []
+    for definition in definitions:
+        pattern = _terrabot_env_name_pattern(str(definition.get("name") or ""))
+        if not pattern:
+            continue
+        for match in re.finditer(rf"(?<![a-z0-9]){pattern}(?![a-z0-9])", text):
+            raw_hits.append({**definition, "start": match.start(), "end": match.end()})
+
+    # Consider longest spans first so us1-dr consumes the overlapping us1 hit.
+    # Equal spans are retained: names such as AWS global intentionally exist in
+    # both tiers and must still trigger the existing tier-ambiguity handling.
+    accepted_hits: list[dict] = []
+    for hit in sorted(raw_hits, key=lambda item: (-(item["end"] - item["start"]), item["start"], item["end"])):
+        strictly_contained = any(
+            hit["cloud"] == accepted["cloud"]
+            and hit["start"] >= accepted["start"]
+            and hit["end"] <= accepted["end"]
+            and (hit["start"], hit["end"]) != (accepted["start"], accepted["end"])
+            for accepted in accepted_hits
+        )
+        if strictly_contained:
+            continue
+        accepted_hits.append(hit)
+
+    for hit in sorted(accepted_hits, key=lambda item: (item["start"], item["end"], item["cloud"], item["tier"])):
+        add(
+            str(hit["cloud"]),
+            str(hit["tier"]),
+            str(hit["canonical"]),
+            str(hit["path"]),
+            alias=str(hit.get("alias") or hit["canonical"]),
+        )
 
     # `dev environment` is a tf-devops environment, not a generic synonym for
-    # Azure non-production.  The exact token rule above already resolves it;
-    # this explicit guard documents the routing contract and protects against
-    # model-side interpretation drift.
-    if re.search(r"(?<![a-z0-9])dev(?:\s+environment|\s+env)?(?![a-z0-9])", text):
+    # Azure non-production. The catalog scan normally captures it directly.
+    # Keep this compatibility guard only when no more-specific AWS environment
+    # token was found, so `dev_devops` can never be degraded to `dev`.
+    if (
+        re.search(r"(?<![a-z0-9])dev(?:\s+environment|\s+env)?(?![a-z0-9])", text)
+        and not any(item.get("cloud") == "aws" for item in matches)
+    ):
         add("aws", "nonprod", "dev", TERRABOT_ENVIRONMENT_CATALOG["aws"]["nonprod"]["dev"], alias="dev")
 
     return matches
-
 
 def _terrabot_group_request(prompt: str) -> tuple[str, str]:
     text = _terrabot_env_text(prompt)

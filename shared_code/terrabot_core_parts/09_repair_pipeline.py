@@ -477,6 +477,25 @@ def _teams_prompt_output_mismatch_error(error: Exception | str) -> bool:
     )
 
 
+def _teams_environment_target_mismatch_error(error: Exception | str) -> bool:
+    """Detect validator failures where generation used a sibling environment."""
+    text = str(error or "").lower()
+    return any(marker in text for marker in (
+        "environment mismatch",
+        "target environment mismatch",
+        "wrong environment/path",
+        "target placement wrong",
+        "requested environment",
+    )) and any(marker in text for marker in (
+        "generated",
+        "generated file",
+        "consumer",
+        "target",
+        "written to",
+        "modifies",
+    ))
+
+
 def _teams_live_file_for_locked_repair_target(
     *,
     current_result: dict,
@@ -579,10 +598,25 @@ def _teams_build_backend_repair_payload(
         current_result, flow_context, retrieved_value_context
     )
     semantic_mismatch = _teams_prompt_output_mismatch_error(backend_error)
+    environment_mismatch = _teams_environment_target_mismatch_error(backend_error)
     active_repair_context = dict(flow_context or (_ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}))
     locked_contract = dict(active_repair_context.get("resolved_repository_target_contract") or {})
     locked_path = str(locked_contract.get("path") or "").strip().strip("/")
-    if semantic_mismatch and locked_path:
+    if environment_mismatch and not locked_path:
+        selected_generation = next((
+            item for item in (retrieved_value_context or active_repair_context.get("retrieved_value_context") or [])
+            if isinstance(item, dict)
+            and item.get("source") == "backend_aws_selected_module_generation_context"
+            and str(item.get("target_file") or item.get("path") or "").strip()
+        ), {})
+        locked_path = str(selected_generation.get("target_file") or selected_generation.get("path") or "").strip().strip("/")
+        if locked_path:
+            locked_contract = {
+                **locked_contract,
+                "path": locked_path,
+                "source": "backend_aws_selected_module_generation_context",
+            }
+    if (semantic_mismatch or environment_mismatch) and locked_path:
         locked_live_file = _teams_live_file_for_locked_repair_target(
             current_result=current_result,
             flow_context=active_repair_context,
@@ -596,11 +630,12 @@ def _teams_build_backend_repair_payload(
         locked_live_file["wrong_candidate_paths_discarded"] = wrong_paths
         live_files = [locked_live_file]
         _teams_diag_log(
-            "semantic_mismatch_repair_retargeted",
+            "semantic_mismatch_repair_retargeted" if semantic_mismatch else "environment_mismatch_repair_retargeted",
             level="warning",
             locked_path=locked_path,
             discarded_paths=",".join(wrong_paths)[:500],
             context_id=str(locked_contract.get("repository_context_id") or ""),
+            target_source=str(locked_contract.get("source") or "resolved_repository_target_contract"),
         )
     existing_targets = [item for item in live_files if str((item or {}).get("existing_live_content") or "")]
     all_existing = bool(live_files) and len(existing_targets) == len(live_files)

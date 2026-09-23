@@ -2089,6 +2089,8 @@ def _teams_flow_guard_clear_branch_prompt(teams_conversation_id: str, stage: str
         "reset_confirmation_pending": None,
         "pending_follow_up_prompt": None,
         "pending_follow_up_cloud": None,
+        "pending_follow_up_workflow": None,
+        "pending_follow_up_operation_shape": None,
         "pending_follow_up_has_pr": None,
         "pending_follow_up_branch": None,
         "pending_follow_up_pr_url": None,
@@ -4283,6 +4285,8 @@ def _handle_teams_chat_request_with_aws_branch_preflight(data: dict):
                 "pending_follow_up_prompt": prompt,
                 "pending_follow_up_branch": reusable_branch,
                 "pending_follow_up_cloud": "aws",
+                "pending_follow_up_workflow": infer_generation_workflow(prompt, "aws"),
+                "pending_follow_up_operation_shape": _teams_operation_shape_for_workflow(infer_generation_workflow(prompt, "aws")),
                 "pending_follow_up_ticket_link": request_data.get("ticket_link") or state.get("ticket_link") or "",
                 "pending_follow_up_ticket_number": request_data.get("jira_ticket") or state.get("ticket_number") or "",
                 "pending_follow_up_ticket_title": request_data.get("ticket_title") or state.get("ticket_title") or "",
@@ -4639,10 +4643,13 @@ def _teams_branch_resolution_patch(updated: dict, state: dict, request_data: dic
     if not pending_prompt:
         pending_prompt = str((state or {}).get("pending_follow_up_prompt") or updated.get("prompt") or "").strip()
     pending_cloud = _teams_pending_prompt_cloud(state, request_data or updated)
+    pending_workflow = _teams_branch_workflow_from_state(state, request_data or updated)
     if pending_prompt:
         updated["original_prompt"] = pending_prompt
         updated["prompt"] = pending_prompt
         updated["message"] = pending_prompt
+    if pending_workflow:
+        updated["workflow"] = pending_workflow
     if pending_cloud:
         updated["cloud"] = pending_cloud
         updated["requested_cloud"] = pending_cloud
@@ -4857,15 +4864,70 @@ def _teams_enrich_branch_state_with_restored_prompt(state: dict, request_data: d
     return enriched
 
 
+def _teams_branch_workflow_from_state(state: dict, request_data: dict | None = None) -> str:
+    """Return the workflow captured when the branch question was created.
+
+    The branch yes/no reply is protocol state, not a new semantic-routing turn.
+    Prefer the captured workflow and only fall back to an already-pinned request
+    workflow; do not reclassify the literal control reply.
+    """
+    request_data = request_data or {}
+    for candidate in (
+        (state or {}).get("pending_follow_up_workflow"),
+        (state or {}).get("resolved_branch_workflow"),
+        request_data.get("workflow"),
+    ):
+        workflow = str(candidate or "").strip()
+        if workflow:
+            return workflow
+    return ""
+
+
+def _teams_operation_shape_for_workflow(workflow: str) -> str:
+    workflow = str(workflow or "").strip()
+    if workflow in INFRA_MODIFICATION_WORKFLOWS:
+        return "existing_modification"
+    if workflow:
+        return "creation_or_consumer"
+    return ""
+
+
+def _teams_branch_workflow_from_result(result: dict, request_data: dict, prompt: str, cloud: str) -> str:
+    """Capture the already-resolved workflow at branch-question time."""
+    router = (result or {}).get("router") or {}
+    patch = (result or {}).get("state_patch") or {}
+    for candidate in (
+        patch.get("pending_follow_up_workflow") if isinstance(patch, dict) else "",
+        (result or {}).get("workflow"),
+        router.get("workflow") if isinstance(router, dict) else "",
+        (request_data or {}).get("workflow"),
+    ):
+        workflow = str(candidate or "").strip()
+        if workflow and workflow not in {"clarification_required", "aws_module_selection"}:
+            return workflow
+    # Last-resort inference happens when the branch question is created, while
+    # the full infrastructure prompt is present. It is never performed from the
+    # later yes/no control reply.
+    if prompt and cloud:
+        try:
+            return str(infer_generation_workflow(prompt, cloud) or "").strip()
+        except Exception:
+            return ""
+    return ""
+
+
 def _teams_branch_protocol_patch(updated: dict, state: dict, request_data: dict | None = None) -> None:
     """Bind a branch yes/no answer to one captured prompt and one cloud."""
     request_data = request_data or updated
     restored_prompt = _teams_resolve_pending_branch_infra_prompt(state, request_data)
     restored_cloud = _teams_pending_prompt_cloud(state, request_data)
+    restored_workflow = _teams_branch_workflow_from_state(state, request_data)
     if restored_prompt:
         updated['prompt'] = restored_prompt
         updated['message'] = restored_prompt
         updated['original_prompt'] = restored_prompt
+    if restored_workflow:
+        updated['workflow'] = restored_workflow
     if restored_cloud:
         updated['cloud'] = restored_cloud
         updated['requested_cloud'] = restored_cloud
@@ -4876,6 +4938,7 @@ def _teams_branch_protocol_patch(updated: dict, state: dict, request_data: dict 
                 workflow = ''
             if workflow:
                 updated['workflow'] = workflow
+                restored_workflow = workflow
     choice = str(updated.get('branch_choice') or '').strip().lower()
     if choice not in {'reuse', 'new'}:
         choice = _teams_branch_choice_from_reply(str(request_data.get('prompt') or ''))
@@ -4904,6 +4967,8 @@ def _teams_branch_protocol_patch(updated: dict, state: dict, request_data: dict 
             'stage': 'processing_new_infrastructure_request',
             'pending_follow_up_prompt': None,
             'pending_follow_up_cloud': None,
+            'pending_follow_up_workflow': None,
+            'pending_follow_up_operation_shape': None,
             'pending_follow_up_has_pr': None,
             'pending_follow_up_branch': None,
             'pending_follow_up_pr_url': None,
@@ -4918,6 +4983,8 @@ def _teams_branch_protocol_patch(updated: dict, state: dict, request_data: dict 
             'resolved_force_new_branch': choice == 'new',
             'resolved_existing_branch': str(updated.get('existing_branch') or '') if choice == 'reuse' else '',
             'resolved_branch_cloud': restored_cloud,
+            'resolved_branch_workflow': restored_workflow or str(updated.get('workflow') or '').strip(),
+            'resolved_branch_operation_shape': str((state or {}).get('pending_follow_up_operation_shape') or _teams_operation_shape_for_workflow(restored_workflow or updated.get('workflow')) or '').strip(),
             'cloud': restored_cloud,
         })
 
@@ -4985,6 +5052,9 @@ def _teams_replay_resolved_branch_choice_for_same_prompt(request_data: dict, sta
         'force_new_branch': choice == 'new',
         'existing_branch': str((state or {}).get('resolved_existing_branch') or '') if choice == 'reuse' else '',
     })
+    workflow = str((state or {}).get('resolved_branch_workflow') or '').strip()
+    if workflow:
+        updated['workflow'] = workflow
     if cloud:
         updated['cloud'] = cloud
         updated['requested_cloud'] = cloud
@@ -5036,6 +5106,23 @@ def handle_teams_chat_request(data: dict):
     ).strip()
     state = load_teams_conversation_state(teams_conversation_id) if teams_conversation_id else {}
 
+    branch_reply_choice = _teams_branch_choice_from_reply(str(request_data.get('prompt') or request_data.get('message') or ''))
+    branch_reply_workflow = ''
+    branch_reply_prompt = ''
+    if str(state.get('stage') or '').strip() == 'awaiting_branch_reuse_decision' and branch_reply_choice:
+        branch_reply_workflow = _teams_branch_workflow_from_state(state, request_data)
+        branch_reply_prompt = _teams_resolve_pending_branch_infra_prompt(state, request_data)
+        if branch_reply_workflow:
+            # Hard pin before lower routing runs. requested_workflow bypasses the
+            # semantic creation/modification classifier, so a branch control
+            # reply cannot turn an existing modification into module selection.
+            request_data['workflow'] = branch_reply_workflow
+            request_data['pending_follow_up_workflow'] = branch_reply_workflow
+        pending_cloud = _teams_pending_prompt_cloud(state, request_data)
+        if pending_cloud:
+            request_data['cloud'] = pending_cloud
+            request_data['requested_cloud'] = pending_cloud
+
     # If the user already answered branch yes/no for this exact request and a
     # later repository clarification continues the same prompt, replay the same
     # branch decision instead of reopening branch selection.
@@ -5049,6 +5136,44 @@ def handle_teams_chat_request(data: dict):
 
     result, status_code = _TEAMS_FINAL_BRANCH_PREVIOUS_HANDLE_TEAMS_CHAT_REQUEST(request_data)
     result = dict(result or {})
+
+    # Safety invariant: a branch reply for an already-resolved existing
+    # modification may not escape into AWS module selection. If an older lower
+    # wrapper still does so, rerun once from the captured full prompt with the
+    # immutable workflow pin instead of exposing the wrong module picker.
+    if (
+        branch_reply_choice
+        and branch_reply_workflow in INFRA_MODIFICATION_WORKFLOWS
+        and branch_reply_workflow == 'aws_infra_modification'
+        and str(result.get('decision_state') or '').strip() == 'aws_module_selection'
+        and branch_reply_prompt
+    ):
+        _teams_diag_log(
+            'branch_workflow_escape_blocked',
+            level='warning',
+            workflow=branch_reply_workflow,
+            escaped_decision_state='aws_module_selection',
+        )
+        retry = dict(request_data)
+        retry.update({
+            'prompt': branch_reply_prompt,
+            'message': branch_reply_prompt,
+            'original_prompt': branch_reply_prompt,
+            'mode': 'infra',
+            'foundry_intent': 'infra',
+            'workflow': branch_reply_workflow,
+            'fresh_infra_generation': True,
+            'stateless_live_github_resolution': True,
+            'pending_branch_choice_resolved': True,
+            'pending_branch_choice_reply': True,
+            'branch_choice': branch_reply_choice,
+            'reuse_branch': branch_reply_choice == 'reuse',
+            'force_new_branch': branch_reply_choice == 'new',
+            'existing_branch': str(state.get('pending_follow_up_branch') or '') if branch_reply_choice == 'reuse' else '',
+            'thread_id': '',
+        })
+        result, status_code = _TEAMS_FINAL_BRANCH_PREVIOUS_HANDLE_TEAMS_CHAT_REQUEST(retry)
+        result = dict(result or {})
 
     # Persist prompt-bound branch choice metadata when a branch question is
     # created. This makes the eventual yes/no answer auditable and replayable
@@ -5077,6 +5202,11 @@ def handle_teams_chat_request(data: dict):
             patch['pending_follow_up_cloud'] = cloud
             patch['resolved_branch_cloud'] = cloud
             patch['cloud'] = cloud
+        workflow = _teams_branch_workflow_from_result(result, request_data, prompt, cloud)
+        if workflow:
+            patch['pending_follow_up_workflow'] = workflow
+            patch['pending_follow_up_operation_shape'] = _teams_operation_shape_for_workflow(workflow)
+            result.setdefault('workflow', workflow)
         result['state_patch'] = patch
         if teams_conversation_id:
             _teams_save_ui_state(teams_conversation_id, patch)
@@ -5095,6 +5225,10 @@ def handle_teams_chat_request(data: dict):
             'resolved_force_new_branch': None,
             'resolved_existing_branch': None,
             'resolved_branch_cloud': None,
+            'resolved_branch_workflow': None,
+            'resolved_branch_operation_shape': None,
+            'pending_follow_up_workflow': None,
+            'pending_follow_up_operation_shape': None,
             'pending_follow_up_prompt_sha256': None,
         })
         result['state_patch'] = patch

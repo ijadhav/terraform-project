@@ -1082,6 +1082,31 @@ def _build_agent_input_for_infra_teams_v1(
             "When returning repair_edits for this first generation response, files may be omitted; the backend will materialize the exact edit onto current live bytes and run all hard validators before any branch write.",
             "Self-check old_text uniqueness, path equality, old/new polarity, and absence of any other change before returning. This is the primary generation response, not a corrective repair round.",
         ])
+    authoritative_environment_paths = list(dict.fromkeys(
+        str(item.get("environment_path") or "").strip().strip("/")
+        for item in (retrieved_value_context or [])
+        if isinstance(item, dict)
+        and str(item.get("environment_path") or "").strip()
+        and item.get("source") in {"backend_environment_resolution", "backend_aws_selected_module_generation_context"}
+    ))
+    resolved_environment_paths = authoritative_environment_paths or list(dict.fromkeys(
+        str(item.get("environment_path") or "").strip().strip("/")
+        for item in (retrieved_value_context or [])
+        if isinstance(item, dict)
+        and str(item.get("environment_path") or "").strip().startswith("terraform/")
+    ))
+    if expected_cloud == "aws" and len(resolved_environment_paths) == 1:
+        resolved_environment_path = resolved_environment_paths[0]
+        payload["resolved_environment_target"] = {
+            "cloud": "aws",
+            "environment_path": resolved_environment_path,
+            "rule": "Generated environment-consumer changes must use this exact repository folder.",
+        }
+        instructions.extend([
+            f"AWS RESOLVED ENVIRONMENT TARGET (HARD): the backend resolved this request to {resolved_environment_path}. Do not substitute a base/sibling environment whose name is a prefix of this one (for example a non-DR folder for a DR request).",
+            f"For aws_module_consumer and aws_infra_modification, every environment-consumer file you change must be under {resolved_environment_path}/ unless the workflow explicitly creates/updates a reusable module under terraform/modules. Self-validation must fail any sibling-environment path.",
+        ])
+
     selected_generation_context = next((
         item for item in retrieved_value_context or []
         if isinstance(item, dict)
