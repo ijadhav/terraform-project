@@ -1817,43 +1817,57 @@ def _teams_git_resolution_analysis(
     return "\n".join(lines)
 
 
-def _teams_foundry_classify_request(prompt: str) -> str:
-    """Classify one ordinary Teams message using the configured Foundry agent.
+def _teams_foundry_classify_and_resolve_request(prompt: str) -> dict:
+    """Classify one Teams turn and semantically resolve cloud when needed.
 
-    No Python keyword/resource/environment scoring is used. The call is fresh
-    so previous Terraform turns cannot bias classification. Repository-oriented
-    verbs with approximate resource wording (for example "disable patch setup
-    from minidev") must remain infrastructure because the agent can resolve the
-    concrete target later from live GitHub evidence.
+    Foundry owns semantic cloud selection for infrastructure requests that do
+    not name a repository environment/provider explicitly. Deterministic
+    repository/environment routing remains backend-owned and is applied later.
     """
     text = str(prompt or "").strip()
     if not text:
-        return "chat"
+        return {"intent": "chat", "cloud": "", "reason": "empty request"}
     request = {
-        "task": "CLASSIFY CURRENT TEAMS USER INTENT ONLY. Return JSON only.",
+        "task": "CLASSIFY CURRENT TEAMS USER INTENT AND, FOR INFRA ONLY, RESOLVE THE MOST LIKELY CLOUD. Return JSON only.",
         "user_request": text,
         "allowed_intents": ["chat", "repo_qna", "infra"],
-        "required_output": {"intent": "chat|repo_qna|infra", "reason": "one short sentence"},
+        "allowed_clouds": ["aws", "azure", "unresolved"],
+        "required_output": {
+            "intent": "chat|repo_qna|infra",
+            "cloud": "aws|azure|unresolved",
+            "reason": "one short sentence",
+        },
         "rules": [
             "Use the Terrabot system instructions as the authority for intent.",
             "Infrastructure means the user is asking to create, change, enable, disable, remove, fix, or otherwise mutate infrastructure/repository Terraform.",
             "Do not require exact product terminology. Approximate or colloquial resource phrases are still infrastructure when an infrastructure action is clear; repository discovery resolves the exact target later.",
-            "A named environment or repository scope plus an action such as enable/disable/change is strong infrastructure intent even if the resource phrase is vague.",
+            "If intent is infra and the user did not name an environment/provider, infer AWS vs Azure from the requested infrastructure/resource semantics and known Terrabot repository responsibilities.",
+            "Return cloud=unresolved when the request could reasonably apply to either AWS or Azure and there is not enough evidence to choose safely.",
+            "Do not invent an environment. Environment selection/defaulting is backend-owned after cloud is resolved.",
             "Chat and repository Q&A must not be converted to infrastructure merely because prior thread state exists.",
-            "This is classification only: do not generate Terraform, files, questions, or implementation plans.",
+            "This is classification/routing only: do not generate Terraform, files, questions, or implementation plans.",
         ],
     }
     try:
         _thread, reply = call_agent(None, json.dumps(request, separators=(",", ":")))
         parsed = extract_json_safely(reply)
         intent = str(parsed.get("intent") or "").strip().lower()
+        cloud = safe_normalize_cloud(str(parsed.get("cloud") or "")) or ""
+        reason = str(parsed.get("reason") or "").strip()
         if intent in {"chat", "repo_qna", "infra"}:
-            LOGGER.info("Foundry Teams intent: %s", intent)
-            return intent
-        LOGGER.warning("Foundry Teams intent response was not recognized; delegating message without backend intent forcing.")
+            if intent != "infra":
+                cloud = ""
+            LOGGER.info("Foundry Teams intent: %s cloud=%s", intent, cloud or "unresolved")
+            return {"intent": intent, "cloud": cloud, "reason": reason}
+        LOGGER.warning("Foundry Teams routing response was not recognized; delegating message without backend intent forcing.")
     except Exception as exc:
-        LOGGER.warning("Foundry Teams intent classification failed; delegating message without backend intent forcing: %s", exc)
-    return "unknown"
+        LOGGER.warning("Foundry Teams intent/cloud classification failed; delegating message without backend intent forcing: %s", exc)
+    return {"intent": "unknown", "cloud": "", "reason": "Foundry routing unavailable"}
+
+
+def _teams_foundry_classify_request(prompt: str) -> str:
+    """Compatibility wrapper retained for existing callers."""
+    return str(_teams_foundry_classify_and_resolve_request(prompt).get("intent") or "unknown")
 
 
 def _teams_message_is_protocol_control(request_data: dict, state: dict, prompt: str) -> bool:
@@ -4158,8 +4172,61 @@ def _handle_teams_chat_request_multicloud(data: dict):
         "processing_new_infrastructure_request",
         "azure_module_branch_selection",
         "aws_module_selection",
+        "awaiting_cloud_clarification",
     }
+
+    # A cloud clarification is protocol continuation, not a new semantic turn.
+    # Restore the captured infrastructure request before any Foundry intent
+    # classification so a bare `aws`/`azure` reply cannot be downgraded to chat
+    # or lose the pending generation request.
+    cloud_clarification_choice = ""
+    if stage == "awaiting_cloud_clarification" and not action:
+        # Teams may contextualize short replies before they reach the backend;
+        # original_prompt retains the literal user answer (for example `AWS`).
+        reply_text = str(request_data.get("original_prompt") or prompt or "").strip().lower()
+        if re.fullmatch(r"(?:use\s+)?aws(?:\s+please)?", reply_text):
+            cloud_clarification_choice = "aws"
+        elif re.fullmatch(r"(?:use\s+)?azure(?:\s+please)?", reply_text):
+            cloud_clarification_choice = "azure"
+
+        if cloud_clarification_choice:
+            captured_prompt = str(
+                state.get("pending_cloud_original_prompt")
+                or state.get("last_infra_prompt")
+                or request_data.get("original_prompt")
+                or ""
+            ).strip()
+            if captured_prompt:
+                prompt = captured_prompt
+                request_data["prompt"] = captured_prompt
+                request_data["message"] = captured_prompt
+                request_data["original_prompt"] = captured_prompt
+            request_data["mode"] = "infra"
+            request_data["foundry_intent"] = "infra"
+            request_data["cloud"] = cloud_clarification_choice
+            request_data["requested_cloud"] = cloud_clarification_choice
+            request_data["pending_cloud_clarification_reply"] = True
+            request_data["pending_cloud_clarification_resolved"] = True
+            state["stage"] = "processing_new_infrastructure_request"
+            state["cloud"] = cloud_clarification_choice
+            state["last_infra_prompt"] = captured_prompt or str(state.get("last_infra_prompt") or "").strip()
+            for key in (
+                "pending_cloud_original_prompt",
+                "pending_cloud_requested_mode",
+                "pending_cloud_requested_cloud",
+                "pending_cloud_reason",
+            ):
+                state.pop(key, None)
+            if teams_conversation_id:
+                save_teams_conversation_state(teams_conversation_id, state)
+            LOGGER.info(
+                "[TerrabotFlow] step=cloud_clarification_resolved cloud=%s request_restored=%s",
+                cloud_clarification_choice,
+                bool(captured_prompt),
+            )
+
     explicit_infra = str(request_data.get("mode") or "").strip().lower() == "infra"
+    foundry_route = {"intent": "infra" if explicit_infra else "", "cloud": "", "reason": ""}
 
     # Normal Teams free-form requests intentionally arrive without mode=infra;
     # the Teams transport leaves semantic intent to the backend/Foundry router.
@@ -4186,12 +4253,15 @@ def _handle_teams_chat_request_multicloud(data: dict):
         and not pre_branch_protocol_reply
         and not _teams_prompt_requests_pr(prompt)
     ):
-        explicit_infra = _teams_is_explicit_infra_request(prompt)
+        foundry_route = _teams_foundry_classify_and_resolve_request(prompt)
+        explicit_infra = str(foundry_route.get("intent") or "").strip().lower() == "infra"
         if explicit_infra:
             request_data["mode"] = "infra"
+            request_data["foundry_intent"] = "infra"
             LOGGER.info(
                 "[TerrabotFlow] step=pre_generation_branch_gate actor=foundry-intent "
-                "result=infra mode_pinned=true stage=%s",
+                "result=infra cloud=%s mode_pinned=true stage=%s",
+                str(foundry_route.get("cloud") or "unresolved"),
                 stage or "idle",
             )
 
@@ -4245,10 +4315,53 @@ def _handle_teams_chat_request_multicloud(data: dict):
         or request_data.get("requested_cloud")
         or ""
     )) or ""
-    requested_cloud = (
-        pinned_request_cloud
-        or (_teams_safe_request_cloud(prompt) if explicit_infra else "")
-    )
+    deterministic_request_cloud = _teams_safe_request_cloud(prompt) if explicit_infra else ""
+    foundry_request_cloud = safe_normalize_cloud(str(foundry_route.get("cloud") or "")) or ""
+    requested_cloud = pinned_request_cloud or deterministic_request_cloud or foundry_request_cloud
+
+    # If Foundry identifies infrastructure but cannot safely resolve AWS vs
+    # Azure, persist the full request in durable Teams state and ask exactly one
+    # cloud clarification. The follow-up restores this prompt and queues normal
+    # generation with the selected cloud; it is never treated as a new chat turn.
+    if explicit_infra and not requested_cloud and not action and not continuation_reply:
+        pending_prompt = str(request_data.get("original_prompt") or prompt or "").strip()
+        state.update({
+            "stage": "awaiting_cloud_clarification",
+            "pending_cloud_original_prompt": pending_prompt,
+            "pending_cloud_requested_mode": "infra",
+            "pending_cloud_requested_cloud": "",
+            "pending_cloud_reason": str(foundry_route.get("reason") or "").strip(),
+            "last_infra_prompt": pending_prompt,
+        })
+        if teams_conversation_id:
+            save_teams_conversation_state(teams_conversation_id, state)
+        LOGGER.info(
+            "[TerrabotFlow] step=cloud_clarification_required request_captured=%s",
+            bool(pending_prompt),
+        )
+        return {
+            "ok": False,
+            "mode": "clarification",
+            "reply": "I can make this infrastructure change, but the target cloud is not unambiguous. Reply `AWS` or `Azure` and Terrabot will continue the same request.",
+            "thread_id": str(request_data.get("thread_id") or state.get("workflow_thread_id") or "").strip(),
+            "decision_state": "awaiting_cloud_clarification",
+            "request_prompt": pending_prompt,
+            "state_patch": {
+                "stage": "awaiting_cloud_clarification",
+                "pending_cloud_original_prompt": pending_prompt,
+                "pending_cloud_requested_mode": "infra",
+                "pending_cloud_requested_cloud": "",
+                "pending_cloud_reason": str(foundry_route.get("reason") or "").strip(),
+                "last_infra_prompt": pending_prompt,
+            },
+            "router": {
+                "request_type": "infra",
+                "cloud": "",
+                "workflow": "clarification_required",
+                "reason": str(foundry_route.get("reason") or "Foundry could not resolve the target cloud safely."),
+            },
+        }, 400
+
     active_cloud = safe_normalize_cloud(str(state.get("cloud") or "")) or ""
     target_cloud_state = _teams_best_cloud_state(state, requested_cloud) if requested_cloud else {}
 

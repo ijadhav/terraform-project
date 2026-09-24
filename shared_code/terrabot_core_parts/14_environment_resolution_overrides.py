@@ -328,10 +328,20 @@ def infer_cloud_from_prompt(prompt: str):
 
 
 def _teams_safe_request_cloud(prompt: str) -> str:
+    """Resolve only deterministic cloud evidence for Teams routing.
+
+    Explicit repository environments and explicit provider names remain
+    backend-owned. Resource-only/semantic cloud selection is intentionally not
+    guessed here; the terminal Teams router asks Foundry for that decision.
+    """
     resolution = resolve_teams_environment_targets(prompt)
-    if resolution.get("cloud"):
+    if resolution.get("cloud") and (
+        _terrabot_environment_matches(prompt)
+        or _terrabot_explicit_provider_from_prompt(prompt)
+    ):
         return str(resolution["cloud"])
-    return _ENV_RESOLUTION_PREVIOUS_SAFE_REQUEST_CLOUD(prompt)
+    explicit = _terrabot_explicit_provider_from_prompt(prompt)
+    return str(explicit or "")
 
 
 def normalize_router_decision(prompt, requested_mode, requested_cloud, recovered_state, thread_id=None):
