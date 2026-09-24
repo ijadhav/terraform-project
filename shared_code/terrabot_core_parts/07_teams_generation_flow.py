@@ -1497,6 +1497,77 @@ def _teams_semantic_operation_classification(prompt: str, target_cloud: str) -> 
         return {"operation_shape": "unclear", "reason": str(exc)}
 
 
+def _teams_probe_aws_existing_boolean_modification(
+    prompt: str,
+    conversation_id: str,
+    environment_path: str,
+    retrieved_value_context: list | None = None,
+) -> dict:
+    """Return a strong live-repository modification context when one is proven.
+
+    This is a narrow routing safety net for Teams.  It does not use resource
+    names, service aliases, or keyword-to-file mappings.  The normal generic
+    modification resolver is asked to inspect the resolved AWS environment and
+    only wins over module-consumer routing when it proves an exact existing
+    literal Boolean target from live GitHub evidence.
+
+    This prevents an existing on/off request from escaping into
+    ``aws_module_selection`` merely because the high-level semantic classifier
+    was uncertain or returned a creation/consumer shape.
+    """
+    prompt = str(prompt or "").strip()
+    environment_path = str(environment_path or "").strip().strip("/")
+    if not prompt or not environment_path:
+        return {}
+
+    try:
+        probe_context = build_backend_existing_infra_modification_context(
+            prompt=prompt,
+            thread_id=conversation_id,
+            cloud="aws",
+            workflow="aws_infra_modification",
+            retrieved_value_context=list(retrieved_value_context or []),
+        )
+    except Exception as exc:
+        LOGGER.warning(
+            "[TerrabotDiag] event=aws_existing_modification_probe_failed thread=%s environment_path=%s error=%s",
+            conversation_id,
+            environment_path,
+            exc,
+        )
+        return {}
+
+    if not isinstance(probe_context, dict):
+        return {}
+
+    matched_files = [
+        item for item in (probe_context.get("matched_files") or [])
+        if isinstance(item, dict)
+    ]
+    exact_boolean = bool(
+        probe_context.get("feature_flag_selection")
+        and probe_context.get("selection_state") == "selected"
+        and probe_context.get("selected_path")
+        and len(matched_files) == 1
+        and isinstance(matched_files[0].get("feature_flag_match"), dict)
+    )
+    if not exact_boolean:
+        return {}
+
+    selected_path = str(probe_context.get("selected_path") or "").strip().strip("/")
+    env_prefix = environment_path.rstrip("/") + "/"
+    if selected_path != environment_path and not selected_path.startswith(env_prefix):
+        LOGGER.warning(
+            "[TerrabotDiag] event=aws_existing_modification_probe_rejected_environment_mismatch thread=%s environment_path=%s selected_path=%s",
+            conversation_id,
+            environment_path,
+            selected_path,
+        )
+        return {}
+
+    return probe_context
+
+
 def _teams_resolve_aws_module_match_semantically(prompt: str, matches: list[dict]) -> dict:
     """Let Foundry resolve multiple verified AWS module candidates before asking the user.
 
@@ -3733,8 +3804,97 @@ def handle_chat_request(data: dict):
                             retrieved_value_context=retrieved_value_context,
                         )
 
+                # Generic safety boundary: before AWS module selection/discovery can
+                # take ownership of this turn, give the live modification resolver one
+                # chance to prove that the request is actually an existing Boolean
+                # mutation in the resolved environment.  Strong repository proof wins
+                # over an uncertain/mistaken creation classification.
+                live_modification_context = {}
+                if (
+                    request_source == "teams"
+                    and aws_env_path
+                    and effective_workflow != "aws_infra_modification"
+                ):
+                    live_modification_context = _teams_probe_aws_existing_boolean_modification(
+                        effective_prompt,
+                        conversation_id,
+                        aws_env_path,
+                        retrieved_value_context=retrieved_value_context,
+                    )
+                    if live_modification_context:
+                        # A stale/incorrect module picker must not survive the route
+                        # correction.  Discard only AWS module-selection context; keep
+                        # unrelated durable repository context intact.
+                        clear_pending_aws_module_discovery(conversation_id, ticket_number)
+                        pending_aws_discovery = None
+                        pending_aws_discovery_state = ""
+                        pending_aws_module_affirmative_reply = False
+                        pending_aws_module_negative_reply = False
+                        pending_aws_selected_match_from_reply = {}
+                        retrieved_module_context = [
+                            item for item in list(retrieved_module_context or [])
+                            if not (isinstance(item, dict) and str(item.get("cloud") or "").lower() == "aws")
+                        ]
+                        retrieved_value_context = [
+                            item for item in _remove_backend_existing_infra_contexts(retrieved_value_context)
+                            if not (
+                                isinstance(item, dict)
+                                and item.get("source") == "backend_aws_module_selection_confirmed"
+                            )
+                        ]
+                        retrieved_value_context.append(live_modification_context)
+                        effective_workflow = "aws_infra_modification"
+                        target_cloud = "aws"
+                        active_teams_flow = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
+                        if active_teams_flow.get("active"):
+                            active_teams_flow["operation_state"] = "existing_modification"
+                            active_teams_flow["expected_workflow"] = effective_workflow
+                            active_teams_flow["workflow"] = effective_workflow
+                            active_teams_flow["expected_cloud"] = "aws"
+                            active_teams_flow["expected_repo_target"] = "tf-devops"
+                            active_teams_flow["effective_prompt"] = effective_prompt
+                            active_teams_flow["retrieved_module_context"] = list(retrieved_module_context or [])
+                            active_teams_flow["retrieved_value_context"] = list(retrieved_value_context or [])
+                        try:
+                            _teams_bind_repository_context_route(
+                                "aws",
+                                "tf-devops",
+                                effective_workflow,
+                                effective_prompt=effective_prompt,
+                            )
+                        except Exception as route_rebind_error:
+                            LOGGER.warning(
+                                "[TerrabotDiag] event=aws_existing_modification_route_rebind_failed thread=%s error=%s",
+                                conversation_id,
+                                route_rebind_error,
+                            )
+                        selected_flag = (
+                            ((live_modification_context.get("matched_files") or [{}])[0].get("feature_flag_match") or {})
+                        )
+                        _teams_diag_log(
+                            "aws_module_route_overridden_by_live_existing_modification",
+                            thread=conversation_id,
+                            environment_path=aws_env_path,
+                            selected_path=str(live_modification_context.get("selected_path") or ""),
+                            flag=str(selected_flag.get("flag") or ""),
+                            current_value=str(selected_flag.get("current_value") or ""),
+                            desired_value=str(selected_flag.get("new_value") or ""),
+                        )
+
                 confirmed_aws_selection = _get_confirmed_aws_module_selection(retrieved_value_context)
-                if confirmed_aws_selection:
+                if live_modification_context:
+                    # The exact existing Boolean target is already live-verified.
+                    # Do not run AWS module discovery on the same turn; doing so can
+                    # reintroduce an unrelated module candidate after the route was
+                    # corrected from consumer/creation to modification.
+                    aws_module_discovery = {
+                        "status": "skipped",
+                        "decision_state": "aws_existing_modification_live_target_selected",
+                        "selection_consumed": True,
+                        "matches": [],
+                        "repo_full_name": f"{GITHUB_OWNER}/{GITHUB_AWS_REPO}",
+                    }
+                elif confirmed_aws_selection:
                     aws_module_discovery = {
                         "status": "selected",
                         "decision_state": "aws_module_selected",

@@ -2528,6 +2528,7 @@ def _teams_bind_repository_context_route(
     if not active.get("active"):
         return
     previous_key = _repository_context_route_key(active)
+    previous_effective_prompt = str(active.get("effective_prompt") or "").strip()
     active["cloud"] = str(cloud or active.get("cloud") or "").strip().lower()
     active["repo_target"] = str(repo_target or active.get("repo_target") or "").strip().lower()
     active["workflow"] = str(workflow or active.get("workflow") or "").strip()
@@ -2536,7 +2537,18 @@ def _teams_bind_repository_context_route(
     if repo_name:
         active["repo_name"] = str(repo_name).strip()
     new_key = _repository_context_route_key(active)
-    if new_key != previous_key or active.get("repository_context_future") is None:
+    new_effective_prompt = str(active.get("effective_prompt") or "").strip()
+    prompt_changed = bool(new_effective_prompt and new_effective_prompt != previous_effective_prompt)
+    if (
+        new_key != previous_key
+        or prompt_changed
+        or active.get("repository_context_future") is None
+    ):
+        # A clarification reply such as "1", "yes", or "AWS" may use the
+        # same repository route as the original infrastructure request.  Route
+        # equality alone is therefore insufficient: when the restored effective
+        # prompt changes, cancel/restart the prefetch so repository context is
+        # queried with the original infra request rather than the control reply.
         _start_repository_context_prefetch(active, force=True)
     LOGGER.info(
         "[TerrabotDiag] event=repository_context_route_bound cloud=%s repo_target=%s workflow=%s repo_name=%s",
