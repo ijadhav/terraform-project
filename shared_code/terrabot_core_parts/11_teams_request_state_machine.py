@@ -591,13 +591,8 @@ def _handle_teams_chat_request_stateless(data: dict):
             "repo_target",
             normalize_repo_target(inferred_cloud, workflow=inferred_workflow),
         )
-        analysis_note = (
-            "Stateless request resolution: inferred the cloud/environment from the current prompt and read the target repository from live GitHub using GitHub App authentication; no prior chat or local workspace context was required."
-        )
-        result["analysis"] = "\n".join(filter(None, [
-            str(result.get("analysis") or "").strip(),
-            analysis_note,
-        ]))
+        # Preserve the evidence-backed Foundry analysis verbatim. Authentication
+        # and router implementation details are not a Terraform change plan.
 
         visible_text = " ".join(
             str(result.get(key) or "")

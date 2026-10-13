@@ -181,7 +181,15 @@ def match_pull_requests_for_prompt(
         if not isinstance(pull_request, dict):
             continue
         score, strong_overlap, body_overlap = _score_pull_request(prompt_tokens, pull_request)
-        relevant = bool(strong_overlap) or len(body_overlap) >= 2
+        # A single shared generic resource word must never classify a PR as
+        # related. Require two semantic title/branch terms, or a strong exact
+        # compound identifier (e.g. create_sql_db, not merely "sql").
+        prompt_compounds = set(re.findall(r"[a-z][a-z0-9]*(?:_[a-z0-9]+){1,}", str(prompt or "").lower()))
+        pr_text = " ".join(str(v or "") for v in (
+            pull_request.get("title"), (pull_request.get("head") or {}).get("ref"), pull_request.get("body")
+        )).lower()
+        exact_compound = any(re.search(r"(?<![a-z0-9_])" + re.escape(flag) + r"(?![a-z0-9_])", pr_text) for flag in prompt_compounds)
+        relevant = len(strong_overlap) >= 2 or (len(body_overlap) >= 2 and len(strong_overlap) >= 1) or exact_compound
         if relevant and score >= min_score:
             scored.append((score, len(strong_overlap), len(body_overlap), pull_request))
     scored.sort(key=lambda item: (-item[0], -item[1], -item[2]))

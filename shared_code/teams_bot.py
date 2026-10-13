@@ -900,6 +900,28 @@ def _is_short_contextual_follow_up(prompt: str, state: Dict[str, Any]) -> bool:
         or bool(state.get("pending_rule2_prompt"))  # name reply after exists-question
     )
 
+def _is_infrastructure_continuation(text: str, state: Dict[str, Any]) -> bool:
+    """Recognize scoped corrections, never arbitrary new infrastructure tasks.
+
+    Use this only when an earlier infra request exists. A branch name or a
+    repository question must not be silently converted into a code change.
+    """
+    value = str(text or "").strip().lower()
+    if not state.get("last_infra_prompt") and not state.get("pending_follow_up_prompt"):
+        return False
+    if not value or len(value) > 140 or RESET_CHAT_RE.match(value):
+        return False
+    if re.fullmatch(r"(?:in |target cloud is |cloud is )?(?:azure|aws)", value):
+        return True
+    if re.fullmatch(r"(?:for (?:the )?|in (?:the )?)[a-z0-9_-]{2,55}", value):
+        return True
+    if re.fullmatch(r"(?:edit|modify|use) (?:the )?[a-z0-9_./-]+(?: of (?:the )?[a-z0-9_-]+)?", value):
+        return True
+    if re.fullmatch(r"(?:enable|disable|set|turn on|turn off) (?:this |the )?(?:flag )?[a-z][a-z0-9_-]{2,80}", value):
+        return True
+    return False
+
+
 def _teams_extract_resource_name_from_prompt(prompt: str) -> str:
     text = str(prompt or "").lower()
     for pattern in (
@@ -961,9 +983,9 @@ def _contextual_prompt(prompt: str, state: Dict[str, Any]) -> str:
         else:
             new_prompt = prior + f" Use the name {new_name}."
         return new_prompt
-    if not _is_short_contextual_follow_up(prompt, state):
+    if not (_is_short_contextual_follow_up(prompt, state) or _is_infrastructure_continuation(prompt, state)):
         return prompt
-    prior = str(state.get("last_infra_prompt") or "").strip()
+    prior = str(state.get("pending_follow_up_prompt") or state.get("last_infra_prompt") or "").strip()
     return (
         "Continue the current infrastructure request using the same repository "
         "and live GitHub context. Previous request: " + prior +
@@ -1178,7 +1200,23 @@ class TerrabotTeamsBot(ActivityHandler):
         # pending decision so a numeric target selection, branch yes/no, Jira
         # reply, or preview decision cannot be interpreted by another workflow.
         if workflow_stage == "awaiting_branch_reuse_decision":
-            if _is_freeform_user_message(prompt):
+            if _is_infrastructure_continuation(prompt, state):
+                # Clarification of the pending infrastructure operation, not a
+                # fresh request and not a yes/no branch decision.
+                await _send(turn_context, "Terrabot is processing your request...")
+                pending_intent = _resolve_pending_branch_infra_prompt(state, fallback=state.get("last_infra_prompt", ""))
+                request = {
+                    "prompt": "Continue the same infrastructure modification. Original request: " + pending_intent + "\nUser clarification: " + prompt,
+                    "original_prompt": pending_intent,
+                    "teams_conversation_id": thread_id,
+                    "thread_id": "",
+                    "source": "teams",
+                    "mode": "infra",
+                    "cloud": state.get("pending_follow_up_cloud") or state.get("resolved_branch_cloud") or state.get("cloud") or "",
+                    "fresh_infra_generation": True,
+                    "supersede_pending_request": True,
+                }
+            elif _is_freeform_user_message(prompt):
                 # A complete new instruction supersedes the older pending branch
                 # request. Send it through the backend so repository/cloud scope
                 # is recalculated from the current prompt. The backend preserves
@@ -1540,6 +1578,17 @@ class TerrabotTeamsBot(ActivityHandler):
                 result.get("mode"),
                 bool(result.get("thread_id")),
             )
+            if int(status_code or 0) >= 400:
+                # Sanitized request diagnostics: never log prompt, credentials,
+                # Foundry payload contents, or full exception response bodies.
+                LOGGER.error(
+                    "[TerrabotDiag] event=teams_backend_error http_status=%s "
+                    "workflow_stage=%s request_mode=%s prompt_chars=%s "
+                    "foundry_thread_present=%s response_mode=%s",
+                    status_code, workflow_stage, request.get("mode") or "auto",
+                    len(str(request.get("prompt") or "")),
+                    bool(request.get("thread_id")), result.get("mode") or "unknown",
+                )
         except Exception as exc:
             LOGGER.exception("Terrabot backend failed for Teams", exc_info=exc)
             await _persist_thread_state(thread_id, state)
