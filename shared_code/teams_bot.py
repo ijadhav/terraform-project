@@ -419,6 +419,11 @@ def _format_reply(result: Dict[str, Any]) -> str:
     """Render backend payloads as concise Teams messages, never raw JSON."""
     mode = str(result.get("mode") or "chat")
     reply = str(result.get("reply") or result.get("summary") or "Done.").strip()
+    if result.get("diagnostic_code") in {
+        "TEAMS_INCOMPLETE_TARGET_COVERAGE", "TEAMS_EXISTING_MODIFICATION_ROUTING_DEFECT",
+    }:
+        # Do not disguise a backend safety stop as a clarification question.
+        return "**Terraform generation blocked (no changes pushed)**\n" + reply
 
     payload = _extract_json_payload(reply)
     if payload:
@@ -842,6 +847,7 @@ def _resolve_pending_branch_infra_prompt(state: Dict[str, Any], fallback: str = 
         return direct
 
     for key in (
+        "active_infra_intent",
         "pending_target_selection_original_prompt",
         "pending_aws_module_selection_original_prompt",
         "last_infra_prompt",
@@ -907,7 +913,7 @@ def _is_infrastructure_continuation(text: str, state: Dict[str, Any]) -> bool:
     repository question must not be silently converted into a code change.
     """
     value = str(text or "").strip().lower()
-    if not state.get("last_infra_prompt") and not state.get("pending_follow_up_prompt"):
+    if not (state.get("active_infra_intent") or state.get("last_infra_prompt") or state.get("pending_follow_up_prompt")):
         return False
     if not value or len(value) > 140 or RESET_CHAT_RE.match(value):
         return False
@@ -918,6 +924,13 @@ def _is_infrastructure_continuation(text: str, state: Dict[str, Any]) -> bool:
     if re.fullmatch(r"(?:edit|modify|use) (?:the )?[a-z0-9_./-]+(?: of (?:the )?[a-z0-9_-]+)?", value):
         return True
     if re.fullmatch(r"(?:enable|disable|set|turn on|turn off) (?:this |the )?(?:flag )?[a-z][a-z0-9_-]{2,80}", value):
+        return True
+    # A continuation can also refine the file or provide a missing assignment.
+    if re.fullmatch(r"(?:in|for|within) (?:the )?[a-z][a-z0-9_-]{2,70}(?: (?:env|environment|subscription))?", value):
+        return True
+    if re.fullmatch(r"(?:use|edit|change|modify) (?:the )?(?:[a-z0-9_./-]+)\.(?:tf|tfvars)(?:\s+.*)?", value):
+        return True
+    if len(value) <= 140 and re.search(r"\b(?:enable|disable|set|update|modify)\b", value) and re.search(r"\b[a-z][a-z0-9_]+\s*=\s*(?:true|false)\b", value):
         return True
     return False
 
@@ -969,6 +982,48 @@ def _rule2_name_from_reply(prompt: str) -> str:
     text = re.sub(r"^use\s+", "", text).strip()
     return text
 
+def _canonical_infrastructure_follow_up(prior: str, clarification: str) -> str:
+    """Keep the original request and new constraints in a bounded, reusable prompt.
+
+    Clarifications do not erase resource/flag/environment information, and the
+    latest clarification takes precedence when it corrects an earlier target.
+    """
+    original = str(prior or "").strip()
+    answer = str(clarification or "").strip()
+    if not original:
+        return answer
+    if not answer:
+        return original
+    # An environment-only answer CORRECTS a previous target; it must not
+    # accidentally become an instruction to modify both environments. Avoid
+    # touching resource identifiers or repository names while removing older
+    # provider-environment clauses from the current captured request.
+    environment_correction = re.fullmatch(
+        r"(?i)(?:for|in|within)\s+(?:the\s+)?((?:(?:npr|sbx|prd|prod)[_-][a-z0-9_-]+)|"
+        r"(?:minidev|dev|devops|sandbox|staging|production))\s*(?:env|environment)?",
+        answer,
+    )
+    if environment_correction:
+        older_env_clause = re.compile(
+            r"(?i)\b(?:for|in|within)\s+(?:the\s+)?(?:(?:npr|sbx|prd|prod)[_-][a-z0-9_-]+|"
+            r"minidev|dev|devops|sandbox|staging|production)(?:\s+(?:env|environment))?\b"
+        )
+        original = older_env_clause.sub("", original).strip()
+    # Avoid an unbounded chain of nested 'Continue previous request' wrappers.
+    if original.lower().endswith("user clarification: " + answer.lower()):
+        return original
+    result = original + "\nUser clarification (latest overrides conflicting target details): " + answer
+    return result[-6500:] if len(result) > 6500 else result
+
+
+def _infrastructure_intent_source(state: Dict[str, Any]) -> str:
+    for name in ("active_infra_intent", "pending_follow_up_prompt", "last_infra_prompt"):
+        value = str((state or {}).get(name) or "").strip()
+        if _branch_prompt_candidate_is_usable(value):
+            return value
+    return ""
+
+
 def _contextual_prompt(prompt: str, state: Dict[str, Any]) -> str:
     # RULE-2 name reply: reconstruct a full creation prompt so all existing
     # parsing paths (cloud inference, env resolution, invocation context)
@@ -985,12 +1040,8 @@ def _contextual_prompt(prompt: str, state: Dict[str, Any]) -> str:
         return new_prompt
     if not (_is_short_contextual_follow_up(prompt, state) or _is_infrastructure_continuation(prompt, state)):
         return prompt
-    prior = str(state.get("pending_follow_up_prompt") or state.get("last_infra_prompt") or "").strip()
-    return (
-        "Continue the current infrastructure request using the same repository "
-        "and live GitHub context. Previous request: " + prior +
-        "\nUser follow-up: " + str(prompt or "").strip()
-    )
+    prior = _infrastructure_intent_source(state)
+    return _canonical_infrastructure_follow_up(prior, prompt)
 
 
 class TerrabotTeamsBot(ActivityHandler):
@@ -1204,17 +1255,19 @@ class TerrabotTeamsBot(ActivityHandler):
                 # Clarification of the pending infrastructure operation, not a
                 # fresh request and not a yes/no branch decision.
                 await _send(turn_context, "Terrabot is processing your request...")
-                pending_intent = _resolve_pending_branch_infra_prompt(state, fallback=state.get("last_infra_prompt", ""))
+                pending_intent = _infrastructure_intent_source(state) or _resolve_pending_branch_infra_prompt(state, fallback=state.get("last_infra_prompt", ""))
+                merged_intent = _canonical_infrastructure_follow_up(pending_intent, prompt)
                 request = {
-                    "prompt": "Continue the same infrastructure modification. Original request: " + pending_intent + "\nUser clarification: " + prompt,
-                    "original_prompt": pending_intent,
+                    "prompt": merged_intent,
+                    "original_prompt": merged_intent,
                     "teams_conversation_id": thread_id,
                     "thread_id": "",
                     "source": "teams",
                     "mode": "infra",
                     "cloud": state.get("pending_follow_up_cloud") or state.get("resolved_branch_cloud") or state.get("cloud") or "",
                     "fresh_infra_generation": True,
-                    "supersede_pending_request": True,
+                    "supersede_pending_request": False,
+                    "infra_clarification": True,
                 }
             elif _is_freeform_user_message(prompt):
                 # A complete new instruction supersedes the older pending branch
@@ -1590,7 +1643,17 @@ class TerrabotTeamsBot(ActivityHandler):
                     bool(request.get("thread_id")), result.get("mode") or "unknown",
                 )
         except Exception as exc:
-            LOGGER.exception("Terrabot backend failed for Teams", exc_info=exc)
+            # Avoid writing full provider error bodies, prompts, or headers to
+            # Function App logs. Capture the actionable provider request ID.
+            LOGGER.error(
+                "[TerrabotDiag] event=teams_foundry_request_failed exception_type=%s "
+                "provider_http_status=%s provider_request_id=%s stage=%s "
+                "request_mode=%s prompt_chars=%s payload_chars=%s foundry_thread_present=%s",
+                type(exc).__name__, getattr(exc, "status_code", None),
+                str(getattr(exc, "request_id", "") or "")[:80], workflow_stage,
+                request.get("mode") or "auto", len(str(request.get("prompt") or "")),
+                len(json.dumps(request, default=str)), bool(request.get("thread_id")),
+            )
             await _persist_thread_state(thread_id, state)
             await _send(
                 turn_context,
@@ -1617,7 +1680,7 @@ class TerrabotTeamsBot(ActivityHandler):
             backend_state = {}
         if isinstance(backend_state, dict) and backend_state:
             state = dict(backend_state)
-            for local_key in ("recent_user_turns", "last_infra_prompt", "memory_conversation_id"):
+            for local_key in ("recent_user_turns", "last_infra_prompt", "active_infra_intent", "memory_conversation_id"):
                 if local_state_before_backend.get(local_key) not in (None, "", []):
                     state[local_key] = local_state_before_backend[local_key]
 
@@ -1690,8 +1753,23 @@ class TerrabotTeamsBot(ActivityHandler):
             ).strip()
 
         mode = str(result.get("mode") or "").strip().lower()
-        if mode not in {"chat", "clarification"} and request.get("prompt"):
-            state["last_infra_prompt"] = str(request.get("original_prompt") or request.get("prompt") or "").strip()
+        router = result.get("router") if isinstance(result.get("router"), dict) else {}
+        routed_infra = bool(
+            request.get("mode") == "infra"
+            or str(router.get("request_type") or "").lower() == "infra"
+            or mode in {"infra_preview", "branch_choice_required", "branch_created"}
+            or (mode == "clarification" and str(result.get("workflow") or "").endswith("_infra_modification"))
+        )
+        if routed_infra and request.get("prompt"):
+            # Clarification failures must preserve the pending infrastructure
+            # request just as successful previews do. A previous implementation
+            # skipped 'clarification' and lost the user's exact file/flag details.
+            source_prompt = str(request.get("original_prompt") or request.get("prompt") or "").strip()
+            if request.get("infra_clarification"):
+                source_prompt = str(request.get("prompt") or "").strip()
+            if _branch_prompt_candidate_is_usable(source_prompt):
+                state["last_infra_prompt"] = source_prompt
+                state["active_infra_intent"] = source_prompt
         if mode == "infra_preview":
             state["stage"] = "awaiting_branch_commit"
         elif mode == "branch_created":

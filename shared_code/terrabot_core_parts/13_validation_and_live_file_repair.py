@@ -2495,7 +2495,7 @@ def build_backend_existing_infra_modification_context(
     if shared_context_block:
         context["shared_repository_context"] = shared_context_block
         context["shared_repository_context_metadata"] = shared_context_metadata
-    if not evidence:
+    if not evidence and not (_teams_exact_requested_files(prompt) and _teams_explicit_boolean_changes(prompt)):
         return context
 
     # Critical: environment discovery stores bounded snippets (20k chars per
@@ -2510,6 +2510,81 @@ def build_backend_existing_infra_modification_context(
         )
     except Exception as exc:
         LOGGER.debug("Full Teams repository evidence rehydration skipped: %s", exc)
+
+    # Explicit path + literal Boolean values are authoritative user intent.
+    # This fast path is independent of the Foundry semantic candidate picker:
+    # more than one requested flag in the same file is one coherent change, not
+    # a reason to ask the user which flag to edit or to discover new modules.
+    exact_paths = _teams_exact_requested_files(prompt)
+    exact_flags = _teams_explicit_boolean_changes(prompt)
+    if exact_paths and exact_flags and len(exact_paths) <= 8:
+        exact_entries = []
+        all_proven = True
+        exact_cloud = normalize_cloud(cloud) or str(cloud or "")
+        exact_repo = str(context.get("repo_target") or "") or normalize_repo_target(exact_cloud, workflow=workflow)
+        exact_branch = str(context.get("context_ref") or "").strip()
+        if not exact_branch:
+            try:
+                exact_branch = _teams_remote_context_branch(exact_cloud, exact_repo, workflow)
+            except Exception:
+                exact_branch = ""
+        for requested_path in exact_paths:
+            try:
+                live_text = github_get_file_content(
+                    exact_cloud, requested_path, exact_branch,
+                    repo_target=exact_repo, workflow=workflow,
+                )
+            except Exception as exc:
+                LOGGER.warning(
+                    "Explicit requested Boolean target read failed path=%s error_type=%s",
+                    requested_path, type(exc).__name__,
+                )
+                live_text = None
+            if live_text is None:
+                all_proven = False
+                break
+            content = str(live_text)
+            flag_batch = []
+            for flag, desired in exact_flags.items():
+                matches = list(re.finditer(
+                    rf"(?m)^[ \t]*{re.escape(flag)}[ \t]*=[ \t]*(true|false)\b",
+                    content, re.IGNORECASE,
+                ))
+                if len(matches) != 1:
+                    all_proven = False
+                    break
+                found = matches[0]
+                flag_batch.append({
+                    "flag": flag, "path": requested_path,
+                    "line_number": content.count("\n", 0, found.start()) + 1,
+                    "current_value": found.group(1).lower(), "new_value": desired,
+                })
+            if not all_proven:
+                break
+            exact_entries.append({
+                "path": requested_path, "filename": requested_path.rsplit("/", 1)[-1],
+                "content": content, "feature_flag_batch": flag_batch,
+                "reason": "exact user path and existing Boolean assignments verified against live GitHub",
+            })
+        if all_proven and len(exact_entries) == len(exact_paths):
+            context["matched_files"] = exact_entries
+            context["matched_file_paths"] = exact_paths
+            context["selected_path"] = exact_paths[0] if len(exact_paths) == 1 else ""
+            context["selection_state"] = "selected"
+            context["agent_resolves_target"] = True
+            context["feature_flag_selection"] = False
+            context.pop("resolved_repository_target", None)
+            context["exact_boolean_batch"] = True
+            context["instructions"] = list(context.get("instructions") or []) + [
+                "EXACT EXISTING BOOLEAN BATCH (HARD): the user supplied the file path and all desired literal Boolean values. Live GitHub has verified each existing assignment in matched_files.feature_flag_batch.",
+                "Modify every requested Boolean value in its complete original target file; never ask the user to choose one of the requested flags or to create/discover a module.",
+                "Preserve all unrelated lines and formatting exactly. Return one complete final file per explicitly named target path. Do not create new Terraform files for existing literal flag assignments.",
+            ]
+            _teams_diag_log(
+                "exact_existing_boolean_batch_selected", level="info",
+                cloud=normalized_cloud, files=len(exact_entries), flags=len(exact_flags),
+            )
+            return context
 
     # Semantic target ownership remains with Foundry. The backend may build and
     # validate a literal Boolean inventory, but it must not select a resource
@@ -2612,6 +2687,35 @@ def build_backend_existing_infra_modification_context(
         "Return the COMPLETE final selected file with only feature_flag_match.current_value changed to feature_flag_match.new_value on feature_flag_match.line_number.",
         "Preserve every other line exactly. The backend performs exact-diff validation and will block unrelated changes without synthesizing a repair.",
     ]
+    # Several explicitly named environments are destinations, not mutually
+    # exclusive alternatives. Do not ask a user to choose only one environment.
+    try:
+        environment_set = resolve_teams_environment_targets(prompt, cloud_hint=cloud)
+    except Exception:
+        environment_set = {}
+    roots = list(dict.fromkeys(
+        str(item.get("path") or "").strip("/")
+        for item in environment_set.get("targets") or [] if item.get("path")
+    ))
+    if not environment_set.get("error") and len(roots) > 1 and all(
+        any(str(item.get("path") or "").startswith(root + "/") for item in matched)
+        for root in roots
+    ):
+        context["selection_state"] = "selected"
+        context["selected_path"] = ""
+        context["agent_resolves_target"] = True
+        context["feature_flag_selection"] = False
+        context["environment_boolean_batch"] = True
+        context["instructions"] = [
+            "MULTI-ENVIRONMENT BOOLEAN CHANGE (HARD): matched_files contains independent existing Boolean assignments for every environment explicitly requested. They are destinations, not alternatives.",
+            "Modify all requested environments and return complete final files for each. Never ask the user to select one environment.",
+            "Preserve unrelated lines in every target. Backend rejects incomplete target sets before GitHub branch push.",
+        ]
+        _teams_diag_log(
+            "multi_environment_boolean_batch_selected", level="info",
+            cloud=cloud, environments=len(roots), matched_files=len(matched),
+        )
+        return context
     if len(matched) == 1:
         context["selection_state"] = "selected"
         context["selected_path"] = _teams_context_file_identity(matched[0])

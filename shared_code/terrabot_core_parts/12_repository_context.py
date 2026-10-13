@@ -850,6 +850,13 @@ def _run_parallel_precommit_validations(agent_result: dict, prompt: str, thread_
 
 def commit_terraform_files_to_branch_for_teams(agent_result: dict, prompt: str, thread_id: str) -> dict:
     """Validate and transport Foundry output without rewriting Terraform."""
+    # Pre-write target-set invariant. The October Teams overlay installs this
+    # validator in core part 11. Guard both the explicit user file and every
+    # requested environment; no partial multi-environment branch pushes.
+    _teams_validate_target_coverage(
+        agent_result.get("files") or [], prompt,
+        agent_result.get("cloud") or "", require_content=True,
+    )
     _teams_diag_log(
         "precommit_pipeline_start",
         thread=thread_id,

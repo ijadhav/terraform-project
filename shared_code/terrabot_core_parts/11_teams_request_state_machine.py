@@ -378,6 +378,7 @@ _TEAMS_STALE_DECISION_STAGES = {
     "awaiting_jira",
     "infra_modification_target_selection",
     "azure_module_branch_selection",
+    "azure_module_discovery",
     "azure_module_repo_creation_confirmation",
     "azure_module_selection",
     "azure_consumer_value_selection",
@@ -569,6 +570,9 @@ def _handle_teams_chat_request_stateless(data: dict):
             # transient workflow decisions are cleared; conversational memory
             # must remain available for follow-up interpretation.
 
+        pinned_workflow = str(request_data.get("workflow") or "").strip()
+        if pinned_workflow in INFRA_MODIFICATION_WORKFLOWS and _teams_explicit_existing_file_mutation(prompt):
+            inferred_workflow = pinned_workflow
         request_data["mode"] = "infra"
         request_data["cloud"] = inferred_cloud
         request_data["workflow"] = inferred_workflow
@@ -1526,6 +1530,11 @@ def infer_generation_workflow(prompt: str, target_cloud: str, requested_workflow
     if requested:
         return requested
     cloud = safe_normalize_cloud(target_cloud)
+    # This is a request-shape gate, not a resource-name/alias table. A user
+    # requesting existing Boolean assignments or an edit to a specific live
+    # Terraform file is modifying existing infrastructure, not creating a module.
+    if cloud in {"aws", "azure"} and _teams_explicit_existing_file_mutation(prompt):
+        return "aws_infra_modification" if cloud == "aws" else "azure_infra_modification"
 
     # AWS creation must always enter the tf-devops module-discovery workflow
     # first. Routing ordinary AWS create/add prompts to aws_infra_modification
@@ -4506,10 +4515,13 @@ def _handle_teams_chat_request_with_related_pr_awareness(data: dict):
         or ""
     ).strip()
 
+    # PR discovery is useful after a concrete Terraform plan exists. Scanning
+    # every clarification/target-picker turn duplicates GitHub API work and can
+    # surface irrelevant PRs while the target is still unresolved.
     is_infra_flavored = (
-        mode in {"infra_preview", "clarification", "branch_created"}
-        or decision_state in {"infra_modification_target_selection", "aws_module_selection", "azure_module_branch_selection"}
-        or router_request_type == "infra"
+        mode in {"infra_preview", "branch_created"}
+        and not decision_state.endswith("selection")
+        and router_request_type in {"", "infra"}
     )
     if prompt and cloud and is_infra_flavored:
         LOGGER.info(
@@ -5232,3 +5244,326 @@ def handle_teams_chat_request(data: dict):
 
     return result, status_code
 
+
+
+# =============================================================================
+# 2026-10-13: deterministic request-shape, target-set and preview safeguards
+# =============================================================================
+
+_TEAMS_EXPLICIT_TF_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9_])((?:vars|terraform)/[A-Za-z0-9_.\-/]+\.(?:tf|tfvars))(?![A-Za-z0-9_])",
+    re.IGNORECASE,
+)
+_TEAMS_EXPLICIT_BOOL_VALUE_RE = re.compile(
+    r"(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(true|false)\b", re.IGNORECASE
+)
+_TEAMS_MUTATION_VERB_RE = re.compile(
+    r"\b(?:enable|disable|turn\s+on|turn\s+off|set|edit|modify|update|change|flip|toggle|switch)\b",
+    re.IGNORECASE,
+)
+
+
+def _teams_explicit_existing_file_mutation(prompt: str) -> bool:
+    """Identify an explicit edit from its syntax, not from cloud resource aliases."""
+    value = str(prompt or "")
+    if not _TEAMS_MUTATION_VERB_RE.search(value):
+        return False
+    # Never reinterpret a genuine create/provision request as a modification
+    # merely because it also asks to enable logging or another feature. A
+    # request to 'create a PR to enable ...' is still an existing-file change.
+    without_pr_phrase = re.sub(r"\bcreate\s+(?:a\s+)?(?:pr|pull request)\b", "", value, flags=re.IGNORECASE)
+    if re.search(r"\b(?:create|add|provision|deploy|build)\b", without_pr_phrase, re.IGNORECASE):
+        return False
+    if _TEAMS_EXPLICIT_BOOL_VALUE_RE.search(value):
+        return True
+    if _TEAMS_EXPLICIT_TF_PATH_RE.search(value):
+        return True
+    # Generic enable/disable requests represent a change to an existing
+    # repository-defined control. Foundry chooses the actual flag or attribute
+    # from live evidence; a module-creation workflow is not the default.
+    return bool(re.search(r"\b(?:enable|disable|turn\s+on|turn\s+off)\b", value, re.IGNORECASE))
+
+
+def _teams_exact_requested_files(prompt: str) -> list[str]:
+    return list(dict.fromkeys(
+        match.group(1).strip("/ ")
+        for match in _TEAMS_EXPLICIT_TF_PATH_RE.finditer(str(prompt or ""))
+    ))
+
+
+def _teams_explicit_boolean_changes(prompt: str) -> dict[str, str]:
+    requested: dict[str, str] = {}
+    for found in _TEAMS_EXPLICIT_BOOL_VALUE_RE.finditer(str(prompt or "")):
+        requested[found.group(1)] = found.group(2).lower()
+    return requested
+
+
+def _teams_request_target_contract(prompt: str, cloud: str = "") -> dict:
+    """Build an immutable expected environment/file set for validation.
+
+    Repository discovery/Foundry decide implementation; this only ensures an
+    explicit multi-target request is not silently reduced to its first target.
+    """
+    try:
+        resolved = resolve_teams_environment_targets(prompt, cloud_hint=cloud)
+    except (NameError, KeyError, ValueError) as exc:
+        return {"targets": [], "error": str(exc), "files": _teams_exact_requested_files(prompt),
+                "flags": _teams_explicit_boolean_changes(prompt)}
+    return {
+        "cloud": str(resolved.get("cloud") or cloud or ""),
+        "repo_target": str(resolved.get("repo_target") or ""),
+        "targets": list(resolved.get("targets") or []),
+        "files": _teams_exact_requested_files(prompt),
+        "flags": _teams_explicit_boolean_changes(prompt),
+        "error": str(resolved.get("error") or ""),
+        "basis": resolved.get("basis") or "",
+    }
+
+
+def _teams_validate_target_coverage(files: list, prompt: str, cloud: str = "", *, require_content: bool = False) -> dict:
+    """Fail closed if one of several requested environments was skipped.
+
+    Do not claim that shared .tf modifications constitute an environment-specific
+    values change. The existing HCL/preservation validators remain authoritative.
+    """
+    contract = _teams_request_target_contract(prompt, cloud)
+    if contract.get("error"):
+        raise ValueError("ENVIRONMENT_TARGET_CONFLICT: " + contract["error"])
+    items = [item for item in (files or []) if isinstance(item, (dict, str))]
+    by_path: dict[str, str | None] = {}
+    for item in items:
+        path = str((item.get("filename") or item.get("path")) if isinstance(item, dict) else item or "").strip().strip("/")
+        if path:
+            by_path[path] = str(item.get("content") or "") if isinstance(item, dict) else None
+    explicit_files = contract.get("files") or []
+    for required in explicit_files:
+        if required not in by_path:
+            raise ValueError(f"EXPLICIT_TARGET_NOT_GENERATED: requested {required} missing from files[].")
+    # Explicit paths are authoritative. For multi-env requests expressed with a
+    # single illustrative path, each distinct environment must still be covered.
+    target_roots = list(dict.fromkeys(
+        str(item.get("path") or "").strip("/")
+        for item in contract.get("targets") or []
+        if item.get("path")
+    ))
+    if len(target_roots) > 1:
+        missing = [root for root in target_roots if not any(path.startswith(root + "/") for path in by_path)]
+        if missing:
+            raise ValueError("MULTI_ENVIRONMENT_INCOMPLETE: no generated environment-specific file for " + ", ".join(missing))
+    if require_content and contract.get("flags"):
+        # For an explicit file, all specified values belong in that file. For
+        # a multi-environment request without a file, each target must contain
+        # the requested values (on one of its own generated value files).
+        required_groups = [[path] for path in explicit_files] if explicit_files else [
+            [path for path in by_path if path.startswith(root + "/")]
+            for root in target_roots
+        ] if len(target_roots) > 1 else []
+        for group in required_groups:
+            if not group or any(by_path.get(path) is None for path in group):
+                raise ValueError("EXPLICIT_FLAG_CONTENT_MISSING: " + ", ".join(group or target_roots))
+            for flag, desired in contract["flags"].items():
+                assignments = [m.group(1).lower() for path in group for m in re.finditer(
+                    rf'(?m)^\s*{re.escape(flag)}\s*=\s*(true|false)\b', by_path.get(path) or "", re.IGNORECASE)]
+                if not assignments or any(value != desired for value in assignments):
+                    raise ValueError(f"EXPLICIT_FLAG_VALUE_MISMATCH: target {', '.join(group)} requires {flag} = {desired}.")
+    return {"paths": list(by_path), "environment_roots": target_roots,
+            "explicit_files": explicit_files, "flags": contract.get("flags") or {}}
+
+
+def _teams_remove_legacy_analysis(analysis: str) -> str:
+    """Strip obsolete backend transport notes without removing Foundry decisions."""
+    text = str(analysis or "")
+    if "Stateless request resolution:" not in text:
+        return text.strip()
+    # Old output is a single paragraph and sometimes followed by structured
+    # bullet diagnostics. Everything up to the next implementation heading is
+    # transport commentary; do not present it as Terraform analysis.
+    parts = re.split(r"(?i)(?=\b(?:Inspected|Convention|Decision|Values|Preservation|Backend materialization|Terraform change):)", text, maxsplit=1)
+    if len(parts) > 1:
+        return parts[1].strip()
+    return ""
+
+
+_TEAMS_RELIABILITY_PREVIOUS_AGENT_INPUT = build_agent_input_for_infra
+
+
+def build_agent_input_for_infra(
+    prompt: str, thread_id: str, selected_cloud: Optional[str] = None,
+    workflow: Optional[str] = None, retrieved_module_context: Optional[list] = None,
+    retrieved_value_context: Optional[list] = None,
+) -> str:
+    raw = _TEAMS_RELIABILITY_PREVIOUS_AGENT_INPUT(
+        prompt, thread_id, selected_cloud=selected_cloud, workflow=workflow,
+        retrieved_module_context=retrieved_module_context,
+        retrieved_value_context=retrieved_value_context,
+    )
+    if not (_ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}).get("active"):
+        return raw
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        return raw
+    contract = _teams_request_target_contract(prompt, selected_cloud or "")
+    payload["teams_requested_target_contract"] = {
+        key: value for key, value in contract.items() if key in {"cloud", "targets", "files", "flags", "error"}
+    }
+    payload["instructions"] = list(payload.get("instructions") or []) + [
+        "EXPLICIT FILE MUTATION (HARD): if the user supplied an existing .tf/.tfvars path and Boolean assignments, modify that exact file; do not perform module discovery or ask for the feature name/path.",
+        "MULTIPLE TARGETS (HARD): implement every entry in teams_requested_target_contract.targets and return all environment-specific write files together. One matching environment is not successful completion of a multi-environment request.",
+        "If requested flags are explicit, preserve all other live file lines and implement every requested flag value in the specified file(s). For a multi-flag request, never implement just one flag.",
+        "PRE-PUSH ANALYSIS (HARD): report the Terraform paths actually inspected, the repository convention observed, the exact file/flag/resource changes, origins of values, preservation of unrelated code, repository/environment decision and the next branch action. Never report stateless request resolution, GitHub authentication, or backend routing mechanics as the Terraform change analysis.",
+    ]
+    # The live contents, not the model's prior knowledge, are authoritative.
+    # Attach the exact small set explicitly named by the user as evidence; this
+    # fixes the Azure module-discovery loop for an existing tfvars mutation.
+    paths = contract.get("files") or []
+    if paths and len(paths) <= 8 and contract.get("cloud") in {"azure", "aws"}:
+        cloud_name = contract["cloud"]
+        repo_target = contract.get("repo_target") or normalize_repo_target(cloud_name, workflow=workflow)
+        try:
+            ref = _teams_remote_context_branch(cloud_name, repo_target, workflow or ("azure_infra_modification" if cloud_name == "azure" else "aws_infra_modification"))
+        except Exception:
+            ref = ""
+        evidence = []
+        already_attached = set()
+        for item in retrieved_value_context or []:
+            if not isinstance(item, dict):
+                continue
+            for match in item.get("matched_files") or []:
+                if isinstance(match, dict) and match.get("path") and match.get("content") is not None:
+                    already_attached.add(str(match["path"]).strip("/"))
+        for path in paths:
+            if path in already_attached:
+                # Avoid duplicating a full tfvars file in the Foundry payload.
+                # It is already part of the validated backend context pack.
+                evidence.append({"path": path, "source": "already_attached_live_matched_file"})
+                continue
+            try:
+                content = github_get_file_content(cloud_name, path, ref, repo_target=repo_target, workflow=workflow)
+            except Exception as exc:
+                LOGGER.warning("Exact requested Terraform evidence read failed path=%s type=%s", path, type(exc).__name__)
+                content = None
+            if content is not None:
+                evidence.append({"path": path, "content": str(content), "reference": ref})
+        payload["teams_explicit_live_files"] = evidence
+        if len(evidence) != len(paths):
+            payload["instructions"].append("An explicitly requested Terraform file was not readable from live GitHub. Do not invent its content or route to module discovery; report a repository read blocker.")
+    # Multi-environment repository evidence is gathered once per unique target,
+    # not once per flag or per agent repair attempt. Bound the payload so large
+    # environments cannot generate a provider HTTP 400 from excessive context.
+    targets = list(contract.get("targets") or [])
+    if len(targets) > 1 and contract.get("cloud") in {"azure", "aws"}:
+        target_cloud = contract["cloud"]
+        repo_target = contract.get("repo_target") or normalize_repo_target(target_cloud, workflow=workflow)
+        try:
+            ref = _teams_remote_context_branch(target_cloud, repo_target, workflow or "")
+        except Exception:
+            ref = ""
+        kind = "dr" if re.search(r"(?<![a-z0-9])dr(?:\.tfvars)?(?![a-z0-9])", str(prompt).lower()) else "hub"
+        entries = []
+        total_chars = 0
+        for target in targets:
+            root = str(target.get("path") or "").strip("/")
+            if not root:
+                continue
+            candidates = ([f"{root}/{kind}.tfvars", f"{root}/hub.tfvars"] if target_cloud == "azure"
+                          else [f"{root}/main.tf"])
+            for path in dict.fromkeys(candidates):
+                try:
+                    content = github_get_file_content(target_cloud, path, ref, repo_target=repo_target, workflow=workflow)
+                except Exception:
+                    content = None
+                if content is None:
+                    continue
+                raw_content = str(content)
+                if total_chars + len(raw_content) > 180000:
+                    entries.append({"path": path, "omitted_due_to_context_size": True})
+                    continue
+                entries.append({"path": path, "content": raw_content})
+                total_chars += len(raw_content)
+        payload["teams_multi_environment_live_files"] = entries
+        payload["instructions"].append(
+            "For multi-environment requests, use teams_multi_environment_live_files and all backend_environment_resolution.targets. "
+            "Never claim completeness for a target whose necessary full live file was missing or omitted due to context size. "
+            "Preserve every target file's existing content; return one complete modification for each affected environment."
+        )
+    return json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+
+
+_TEAMS_RELIABILITY_PREVIOUS_HANDLE = handle_teams_chat_request
+
+
+def handle_teams_chat_request(data: dict):
+    """Resolve exact mutations before legacy module routing and validate previews."""
+    request_data = dict(data or {})
+    prompt = str(request_data.get("prompt") or request_data.get("message") or "").strip()
+    action = str(request_data.get("action") or "").strip().lower()
+    if not action and _teams_explicit_existing_file_mutation(prompt):
+        cloud = _teams_safe_request_cloud(prompt) or str(request_data.get("cloud") or request_data.get("requested_cloud") or "")
+        cloud = safe_normalize_cloud(cloud) or ""
+        if cloud in {"aws", "azure"}:
+            request_data["mode"] = "infra"
+            request_data["cloud"] = cloud
+            request_data["requested_cloud"] = cloud
+            request_data["workflow"] = "azure_infra_modification" if cloud == "azure" else "aws_infra_modification"
+            request_data["foundry_intent"] = "infra"
+            _teams_diag_log("explicit_existing_file_mutation_routed", level="info", cloud=cloud,
+                            flags=len(_teams_explicit_boolean_changes(prompt)),
+                            files=len(_teams_exact_requested_files(prompt)))
+    try:
+        result, code = _TEAMS_RELIABILITY_PREVIOUS_HANDLE(request_data)
+    except Exception as exc:
+        _teams_diag_log(
+            "teams_generation_provider_exception", level="error",
+            error_type=type(exc).__name__,
+            provider_status=getattr(exc, "status_code", None),
+            provider_request_id=str(getattr(exc, "request_id", "") or "")[:80],
+            thread_present=bool(request_data.get("thread_id")),
+            prompt_chars=len(prompt), workflow=request_data.get("workflow") or "",
+        )
+        raise
+    result = dict(result or {})
+    result["analysis"] = _teams_remove_legacy_analysis(result.get("analysis") or "")
+    if code >= 400 and result.get("mode") not in {"branch_choice_required", "clarification"}:
+        _teams_diag_log(
+            "teams_generation_error_response", level="warning",
+            status=code, diagnostic_code=result.get("diagnostic_code") or "",
+            thread_present=bool(request_data.get("thread_id")),
+            workflow=request_data.get("workflow") or "", prompt_chars=len(prompt),
+        )
+    # If an older workflow returns Azure module discovery for an explicitly
+    # requested Terraform flag edit, never ask the user to create a module.
+    # Report the routing defect with the exact target rather than invalidating
+    # their repository-backed request or entering a clarification loop.
+    route = result.get("router") if isinstance(result.get("router"), dict) else {}
+    module_escape = bool(
+        not action and request_data.get("workflow") == "azure_infra_modification"
+        and (
+            str(route.get("workflow") or "") == "azure_module_discovery"
+            or str(result.get("workflow") or "") == "azure_module_discovery"
+        )
+    )
+    if module_escape:
+        _teams_diag_log("azure_modification_module_discovery_blocked", level="error", prompt_chars=len(prompt))
+        return {
+            "ok": False, "mode": "clarification", "cloud": "azure", "workflow": "azure_infra_modification",
+            "reply": "Terrabot blocked an incorrect module-discovery route for your existing Terraform modification. "
+                     "The original file and requested flags are retained; no changes were pushed. "
+                     "Please retry after verifying the deployed Teams backend includes the modification-routing patch.",
+            "diagnostic_code": "TEAMS_EXISTING_MODIFICATION_ROUTING_DEFECT",
+            "thread_id": result.get("thread_id") or "", "state_patch": result.get("state_patch") or {},
+        }, 409
+    if not action and str(result.get("mode") or "").lower() == "infra_preview":
+        try:
+            _teams_validate_target_coverage(result.get("files") or [], prompt, result.get("cloud") or request_data.get("cloud") or "")
+        except ValueError as exc:
+            _teams_diag_log("teams_preview_target_coverage_blocked", level="warning", code=str(exc).split(":", 1)[0])
+            # Never advertise an incomplete plan as a prepared infrastructure change.
+            return {
+                "ok": False, "mode": "clarification", "cloud": result.get("cloud") or request_data.get("cloud") or "",
+                "workflow": result.get("workflow") or request_data.get("workflow") or "",
+                "reply": "Terrabot did not prepare every requested Terraform target. No changes have been pushed. " + str(exc),
+                "diagnostic_code": "TEAMS_INCOMPLETE_TARGET_COVERAGE", "files": [],
+                "thread_id": result.get("thread_id") or "", "state_patch": result.get("state_patch") or {},
+            }, 422
+    return result, code

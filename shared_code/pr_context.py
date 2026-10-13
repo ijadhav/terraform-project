@@ -42,6 +42,8 @@ _STOPWORDS = {
     # cloud/environment words must never make two otherwise unrelated PRs match
     "aws", "azure", "prod", "production", "dev", "development", "nonprod", "non",
     "environment", "environments", "env", "main", "branch", "draft", "pull", "pr",
+    # Repository layout words and environment labels are not resource evidence.
+    "tfvars", "terraform", "vars", "dr", "hub", "npr", "sbx", "prd", "int", "stg", "tier", "file", "path",
 }
 
 
@@ -184,12 +186,29 @@ def match_pull_requests_for_prompt(
         # A single shared generic resource word must never classify a PR as
         # related. Require two semantic title/branch terms, or a strong exact
         # compound identifier (e.g. create_sql_db, not merely "sql").
+        # An exact user-specified Boolean flag is stronger than incidental token
+        # overlap. When one is supplied, a PR must refer to that flag (or to a
+        # different requested flag in the same batch), rather than just sharing
+        # 'npr-int', 'dr', 'sql', or 'resources' with the request.
+        requested_flags = {
+            flag.lower() for flag, _value in re.findall(
+                r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(true|false)\b", str(prompt or ""), re.IGNORECASE
+            )
+        }
         prompt_compounds = set(re.findall(r"[a-z][a-z0-9]*(?:_[a-z0-9]+){1,}", str(prompt or "").lower()))
         pr_text = " ".join(str(v or "") for v in (
             pull_request.get("title"), (pull_request.get("head") or {}).get("ref"), pull_request.get("body")
         )).lower()
         exact_compound = any(re.search(r"(?<![a-z0-9_])" + re.escape(flag) + r"(?![a-z0-9_])", pr_text) for flag in prompt_compounds)
-        relevant = len(strong_overlap) >= 2 or (len(body_overlap) >= 2 and len(strong_overlap) >= 1) or exact_compound
+        flag_overlap = {
+            flag for flag in requested_flags
+            if re.search(r"(?<![a-z0-9_])" + re.escape(flag) + r"(?![a-z0-9_])", pr_text)
+        }
+        relevant = bool(flag_overlap) if requested_flags else (
+            len(strong_overlap) >= 2
+            or (len(body_overlap) >= 2 and len(strong_overlap) >= 1)
+            or exact_compound
+        )
         if relevant and score >= min_score:
             scored.append((score, len(strong_overlap), len(body_overlap), pull_request))
     scored.sort(key=lambda item: (-item[0], -item[1], -item[2]))
@@ -216,6 +235,49 @@ def _summarize_pull_request(pull_request: dict) -> Dict[str, Any]:
     }
 
 
+def _pull_request_changed_paths(owner: str, repo: str, number: int, token: Optional[str]) -> Optional[set[str]]:
+    """Return modified paths for a shortlisted PR, or None if unavailable."""
+    try:
+        response = requests.get(
+            f"{GITHUB_API}/repos/{owner}/{repo}/pulls/{number}/files",
+            headers=_auth_headers(token), params={"per_page": 100}, timeout=DEFAULT_TIMEOUT,
+        )
+        response.raise_for_status()
+        data = response.json()
+        if not isinstance(data, list):
+            return None
+        return {str(item.get("filename") or "").strip("/") for item in data if isinstance(item, dict)}
+    except Exception as exc:
+        LOGGER.warning("pr_context: changed-file verification unavailable pr=%s error_type=%s", number, type(exc).__name__)
+        return None
+
+
+def _verify_pr_file_overlap(
+    prompt: str, owner: str, repo: str, token: Optional[str], matches: List[dict]
+) -> List[dict]:
+    """If the user specified exact files, reject PRs changing unrelated files.
+
+    Keep semantic matches when GitHub cannot serve changed-file metadata, rather
+    than suppressing genuine duplicate-work warnings on transient API failure.
+    """
+    paths = set(re.findall(
+        r"(?<![A-Za-z0-9_])((?:vars|terraform)/[A-Za-z0-9_.\-/]+\.(?:tf|tfvars))(?![A-Za-z0-9_])",
+        str(prompt or ""), re.IGNORECASE,
+    ))
+    if not paths:
+        return matches
+    verified = []
+    for match in matches:
+        number = match.get("number")
+        if not isinstance(number, int):
+            verified.append(match)
+            continue
+        changed = _pull_request_changed_paths(owner, repo, number, token)
+        if changed is None or (paths & changed):
+            verified.append(match)
+    return verified
+
+
 def build_pr_context_block(
     prompt: str,
     owner: str,
@@ -232,11 +294,12 @@ def build_pr_context_block(
           input, or "" when there is nothing relevant.
     """
     LOGGER.info(
-        "pr_context: duplicate-work check starting repo=%s/%s cloud=%s prompt_preview=%r",
-        owner, repo, cloud or "", str(prompt or "")[:120],
+        "pr_context: duplicate-work check starting repo=%s/%s cloud=%s prompt_chars=%s",
+        owner, repo, cloud or "", len(str(prompt or "")),
     )
     pull_requests = list_open_pull_requests(owner, repo, token=token)
     matches = match_pull_requests_for_prompt(prompt, pull_requests, max_matches=max_matches)
+    matches = _verify_pr_file_overlap(prompt, owner, repo, token, matches)
     summaries = [_summarize_pull_request(pr) for pr in matches]
 
     if not summaries:
