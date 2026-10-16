@@ -638,6 +638,18 @@ def _format_reply(result: Dict[str, Any]) -> str:
         return "\n".join(lines)
 
     if mode == "branch_created":
+        target_statuses = result.get("environment_target_statuses")
+        target_statuses = target_statuses if isinstance(target_statuses, dict) else {}
+        if str(result.get("action") or "").lower() == "noop":
+            lines = [
+                "**Terraform request already satisfied — no commit created**",
+                "Every reported target was verified against live GitHub; Terrabot did not make an unnecessary branch change.",
+            ]
+            for environment, status in target_statuses.items():
+                lines.append(f"- `{environment}`: {status.replace('_', ' ')}")
+            if result.get("branch_url"):
+                lines.extend(["", "**Existing branch**", str(result["branch_url"])])
+            return "\n".join(lines)
         reused = bool(result.get("branch_reused"))
         heading = "**Existing Terrabot branch updated**" if reused else "**Changes pushed to a new Terrabot branch**"
         # The branch has already been generated and pushed. Do not expose the
@@ -654,6 +666,10 @@ def _format_reply(result: Dict[str, Any]) -> str:
             lines.extend(["", *evidence_lines])
         if files:
             lines.extend(["", "**Files changed**", *[f"- `{item}`" for item in files]])
+        if target_statuses:
+            lines.append("")
+            lines.append("**Environment coverage (GitHub branch, not Terraform apply)**")
+            lines.extend(f"- `{environment}`: {str(status).replace('_', ' ')}" for environment, status in target_statuses.items())
         if fillable:
             lines.extend([
                 "",

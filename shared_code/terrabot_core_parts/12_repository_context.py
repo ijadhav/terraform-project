@@ -853,10 +853,25 @@ def commit_terraform_files_to_branch_for_teams(agent_result: dict, prompt: str, 
     # Pre-write target-set invariant. The October Teams overlay installs this
     # validator in core part 11. Guard both the explicit user file and every
     # requested environment; no partial multi-environment branch pushes.
-    _teams_validate_target_coverage(
-        agent_result.get("files") or [], prompt,
-        agent_result.get("cloud") or "", require_content=True,
+    active = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
+    cloud = str(agent_result.get("cloud") or "")
+    workflow = str(agent_result.get("workflow") or "")
+    repo_target = str(agent_result.get("repo_target") or normalize_repo_target(cloud, workflow=workflow))
+    ref = str(_teams_remote_context_branch(cloud, repo_target, workflow) or "").strip()
+    coverage = _teams_validate_target_coverage(
+        agent_result.get("files") or [], prompt, cloud,
+        require_content=True, require_live=True, branch=ref, workflow=workflow,
     )
+    agent_result["environment_target_statuses"] = dict(coverage.get("target_statuses") or {})
+    all_satisfied = bool(coverage.get("target_statuses")) and all(
+        value == "already_satisfied" for value in coverage["target_statuses"].values()
+    )
+    if all_satisfied and not (agent_result.get("files") or []):
+        # No Terraform mutation and no Foundry repair are needed. The branch
+        # writer does not create a new Git ref for this verified no-op.
+        noop_result = _commit_terraform_files_to_branch_for_teams_base(agent_result, prompt, thread_id)
+        noop_result["repository_context_update"] = {"stored": 0, "rejected": 0}
+        return noop_result
     _teams_diag_log(
         "precommit_pipeline_start",
         thread=thread_id,

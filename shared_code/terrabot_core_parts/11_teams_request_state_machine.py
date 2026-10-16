@@ -5292,82 +5292,335 @@ def _teams_exact_requested_files(prompt: str) -> list[str]:
 
 
 def _teams_explicit_boolean_changes(prompt: str) -> dict[str, str]:
+    """Legacy single-value view; conflicting per-environment values stay in assignments."""
     requested: dict[str, str] = {}
     for found in _TEAMS_EXPLICIT_BOOL_VALUE_RE.finditer(str(prompt or "")):
         requested[found.group(1)] = found.group(2).lower()
     return requested
 
 
-def _teams_request_target_contract(prompt: str, cloud: str = "") -> dict:
-    """Build an immutable expected environment/file set for validation.
+def _teams_scoped_boolean_expectations(prompt: str, targets: list[dict]) -> list[dict]:
+    """Bind user-written Boolean values to concrete environment paths.
 
-    Repository discovery/Foundry decide implementation; this only ensures an
-    explicit multi-target request is not silently reduced to its first target.
+    This is syntax-level scoping only, not resource/flag inference. Foundry still
+    resolves non-explicit intentions. The same flag may have different desired
+    values in different target environments without being collapsed into a dict.
     """
+    text = str(prompt or "")
+    assignments = list(_TEAMS_EXPLICIT_BOOL_VALUE_RE.finditer(text))
+    if not assignments:
+        return []
+    normalized = text.lower().replace("_", "-")
+    sightings: list[tuple[int, int, str]] = []
+    for target in targets:
+        root = str(target.get("path") or "").strip("/")
+        if not root:
+            continue
+        names = {str(target.get(key) or "").lower().replace("_", "-") for key in ("alias", "environment")}
+        names.add(root.rsplit("/", 1)[-1].lower().replace("_", "-"))
+        for name in sorted((name for name in names if name), key=len, reverse=True):
+            pattern = re.escape(name).replace(r"\-", r"[- ]")
+            for match in re.finditer(rf"(?<![a-z0-9]){pattern}(?![a-z0-9])", normalized):
+                sightings.append((match.start(), match.end(), root))
+    sightings = list(dict.fromkeys(sightings))
+    destinations: dict[int, set[str]] = {i: set() for i in range(len(assignments))}
+    # Associate each named environment with the closest assignment. Forward
+    # and backward forms ("flag=true in env", "in env flag=true") both work.
+    for start, end, root in sightings:
+        distances = []
+        for i, match in enumerate(assignments):
+            distance = max(match.start() - end, start - match.end(), 0)
+            distances.append((distance, i))
+        if distances:
+            best = min(distances)[1]
+            destinations[best].add(root)
+    target_roots = {str(item.get("path") or "").strip("/") for item in targets}
+    # If a group of flags precedes one shared trailing environment clause,
+    # the unscoped flags belong to that clause as well. Do not broadcast a flag
+    # into unrelated earlier or later scoped clauses.
+    for i in range(len(assignments)):
+        if destinations[i]:
+            continue
+        if not sightings:
+            destinations[i] = set(target_roots)
+            continue
+        following = [j for j in range(i + 1, len(assignments)) if destinations[j]]
+        preceding = [j for j in range(i - 1, -1, -1) if destinations[j]]
+        selected = following[0] if following else (preceding[0] if preceding else None)
+        if selected is not None:
+            destinations[i] = set(destinations[selected])
+
+    result: list[dict] = []
+    seen: dict[tuple[str, str], str] = {}
+    for i, match in enumerate(assignments):
+        flag, desired = match.group(1), match.group(2).lower()
+        for root in sorted(destinations[i]):
+            key = (root, flag.lower())
+            previous = seen.get(key)
+            if previous and previous != desired:
+                raise ValueError(f"BOOLEAN_TARGET_SCOPE_AMBIGUOUS: conflicting values for {flag} in {root}.")
+            if not previous:
+                result.append({"environment_path": root, "flag": flag, "desired_value": desired})
+                seen[key] = desired
+    if targets and any(not destinations[i] for i in range(len(assignments))):
+        raise ValueError("BOOLEAN_TARGET_SCOPE_AMBIGUOUS: one or more Boolean assignments have no resolved environment.")
+    return result
+
+
+def _teams_request_target_contract(prompt: str, cloud: str = "") -> dict:
+    """Resolve the requested target set and keep every scoped assignment."""
     try:
         resolved = resolve_teams_environment_targets(prompt, cloud_hint=cloud)
     except (NameError, KeyError, ValueError) as exc:
         return {"targets": [], "error": str(exc), "files": _teams_exact_requested_files(prompt),
-                "flags": _teams_explicit_boolean_changes(prompt)}
+                "flags": _teams_explicit_boolean_changes(prompt), "assignments": []}
+    targets = list(resolved.get("targets") or [])
+    try:
+        assignments = _teams_scoped_boolean_expectations(prompt, targets)
+    except ValueError as exc:
+        return {"targets": targets, "error": str(exc), "files": _teams_exact_requested_files(prompt),
+                "flags": _teams_explicit_boolean_changes(prompt), "assignments": []}
     return {
         "cloud": str(resolved.get("cloud") or cloud or ""),
         "repo_target": str(resolved.get("repo_target") or ""),
-        "targets": list(resolved.get("targets") or []),
+        "targets": targets,
         "files": _teams_exact_requested_files(prompt),
         "flags": _teams_explicit_boolean_changes(prompt),
+        "assignments": assignments,
         "error": str(resolved.get("error") or ""),
         "basis": resolved.get("basis") or "",
     }
 
 
-def _teams_validate_target_coverage(files: list, prompt: str, cloud: str = "", *, require_content: bool = False) -> dict:
-    """Fail closed if one of several requested environments was skipped.
+def _teams_round1_live_file(cloud: str, path: str, ref: str, repo_target: str, workflow: str) -> str | None:
+    if not ref:
+        raise ValueError("LIVE_TARGET_REF_UNRESOLVED: a repository ref is required to validate target deltas.")
+    try:
+        return github_get_file_content(cloud, path, ref, repo_target=repo_target, workflow=workflow)
+    except Exception as exc:
+        raise ValueError(f"LIVE_TARGET_READ_FAILED: unable to verify {path} ({type(exc).__name__}).") from exc
 
-    Do not claim that shared .tf modifications constitute an environment-specific
-    values change. The existing HCL/preservation validators remain authoritative.
+
+def _teams_round1_boolean_values(content: str, flag: str) -> list[str]:
+    return [match.group(1).lower() for match in re.finditer(
+        rf'(?m)^\s*{re.escape(flag)}\s*=\s*(true|false)\b', str(content or ""), re.IGNORECASE
+    )]
+
+
+def _teams_round1_assignment_only_delta(before: str, after: str, desired: dict[str, str], path: str) -> bool:
+    """Require exact preservation except for selected literal Boolean values."""
+    old_lines, new_lines = before.splitlines(keepends=True), after.splitlines(keepends=True)
+    if len(old_lines) != len(new_lines):
+        raise ValueError(f"EXPLICIT_BOOLEAN_UNRELATED_EDIT: {path} changed its line count.")
+    changed = False
+    for old, new in zip(old_lines, new_lines):
+        if old == new:
+            continue
+        old_match = re.fullmatch(r'(\s*[A-Za-z_][A-Za-z0-9_]*\s*=\s*)(true|false)(\s*(?:[#/].*)?\r?\n?)', old, re.I)
+        new_match = re.fullmatch(r'(\s*[A-Za-z_][A-Za-z0-9_]*\s*=\s*)(true|false)(\s*(?:[#/].*)?\r?\n?)', new, re.I)
+        if not old_match or not new_match or old_match.group(1) != new_match.group(1) or old_match.group(3) != new_match.group(3):
+            raise ValueError(f"EXPLICIT_BOOLEAN_UNRELATED_EDIT: {path} changed content outside a literal Boolean assignment.")
+        name_match = re.search(r'([A-Za-z_][A-Za-z0-9_]*)\s*=\s*$', old_match.group(1))
+        name = name_match.group(1).lower() if name_match else ""
+        if name not in desired or new_match.group(2).lower() != desired[name] or old_match.group(2).lower() == desired[name]:
+            raise ValueError(f"EXPLICIT_BOOLEAN_UNRELATED_EDIT: {path} changed unrelated or incorrect Boolean {name}.")
+        changed = True
+    return changed
+
+
+def _teams_round1_target_live_candidates(root: str, cloud: str, ref: str, repo_target: str, workflow: str, explicit: list[str]) -> list[str]:
+    """Find possible already-satisfied targets from live repository paths only."""
+    candidates = [path for path in explicit if path.startswith(root.rstrip("/") + "/")]
+    try:
+        entries = github_get_directory_listing(cloud, root, ref, repo_target=repo_target, workflow=workflow) or []
+    except Exception:
+        entries = []
+    for entry in entries:
+        if isinstance(entry, dict) and entry.get("type") == "file":
+            path = str(entry.get("path") or "").strip("/")
+            if path.endswith((".tf", ".tfvars")) and path not in candidates:
+                candidates.append(path)
+    return candidates[:40]
+
+
+def _teams_validate_target_coverage(
+    files: list, prompt: str, cloud: str = "", *, require_content: bool = False,
+    branch: str = "", workflow: str = "", require_live: bool = False,
+) -> dict:
+    """Validate all requested environment states, including verified no-ops.
+
+    For explicit Boolean changes, the changed assignment must match its scoped
+    desired value and the rest of the original file must remain byte-identical.
+    For non-explicit changes, every named environment must have a substantive
+    Terraform delta; an arbitrary returned filename cannot satisfy coverage.
     """
     contract = _teams_request_target_contract(prompt, cloud)
     if contract.get("error"):
         raise ValueError("ENVIRONMENT_TARGET_CONFLICT: " + contract["error"])
-    items = [item for item in (files or []) if isinstance(item, (dict, str))]
-    by_path: dict[str, str | None] = {}
-    for item in items:
-        path = str((item.get("filename") or item.get("path")) if isinstance(item, dict) else item or "").strip().strip("/")
-        if path:
-            by_path[path] = str(item.get("content") or "") if isinstance(item, dict) else None
-    explicit_files = contract.get("files") or []
-    for required in explicit_files:
-        if required not in by_path:
-            raise ValueError(f"EXPLICIT_TARGET_NOT_GENERATED: requested {required} missing from files[].")
-    # Explicit paths are authoritative. For multi-env requests expressed with a
-    # single illustrative path, each distinct environment must still be covered.
-    target_roots = list(dict.fromkeys(
-        str(item.get("path") or "").strip("/")
-        for item in contract.get("targets") or []
-        if item.get("path")
-    ))
-    if len(target_roots) > 1:
-        missing = [root for root in target_roots if not any(path.startswith(root + "/") for path in by_path)]
-        if missing:
-            raise ValueError("MULTI_ENVIRONMENT_INCOMPLETE: no generated environment-specific file for " + ", ".join(missing))
-    if require_content and contract.get("flags"):
-        # For an explicit file, all specified values belong in that file. For
-        # a multi-environment request without a file, each target must contain
-        # the requested values (on one of its own generated value files).
-        required_groups = [[path] for path in explicit_files] if explicit_files else [
-            [path for path in by_path if path.startswith(root + "/")]
-            for root in target_roots
-        ] if len(target_roots) > 1 else []
-        for group in required_groups:
-            if not group or any(by_path.get(path) is None for path in group):
-                raise ValueError("EXPLICIT_FLAG_CONTENT_MISSING: " + ", ".join(group or target_roots))
-            for flag, desired in contract["flags"].items():
-                assignments = [m.group(1).lower() for path in group for m in re.finditer(
-                    rf'(?m)^\s*{re.escape(flag)}\s*=\s*(true|false)\b', by_path.get(path) or "", re.IGNORECASE)]
-                if not assignments or any(value != desired for value in assignments):
-                    raise ValueError(f"EXPLICIT_FLAG_VALUE_MISMATCH: target {', '.join(group)} requires {flag} = {desired}.")
-    return {"paths": list(by_path), "environment_roots": target_roots,
-            "explicit_files": explicit_files, "flags": contract.get("flags") or {}}
+    cloud = str(contract.get("cloud") or cloud or "")
+    repo_target = str(contract.get("repo_target") or "")
+    effective_workflow = workflow or ("azure_infra_modification" if cloud == "azure" else "aws_infra_modification")
+    ref = str(branch or "").strip()
+    if require_live and not ref:
+        ref = _teams_remote_context_branch(cloud, repo_target, effective_workflow)
+    paths: dict[str, str | None] = {}
+    for item in files or []:
+        if isinstance(item, dict):
+            path = str(item.get("filename") or item.get("path") or "").strip("/")
+            content = item.get("content")
+            if path in paths:
+                raise ValueError(f"DUPLICATE_GENERATED_TARGET: {path} appears twice in files[].")
+            if path:
+                paths[path] = content if isinstance(content, str) else None
+        elif isinstance(item, str) and item.strip():
+            paths[item.strip("/")] = None
+    explicit = contract.get("files") or []
+    scopes = list(dict.fromkeys(str(t.get("path") or "").strip("/") for t in contract.get("targets") or [] if t.get("path")))
+    expectations = contract.get("assignments") or []
+    exp_by_scope: dict[str, dict[str, str]] = {}
+    for entry in expectations:
+        root = entry["environment_path"]
+        flag = entry["flag"].lower()
+        exp_by_scope.setdefault(root, {})[flag] = entry["desired_value"]
+    # Explicit paths apply to their own environment; any other named target
+    # requires a separate target-specific file or live-proven no-op.
+    for path in explicit:
+        if path not in paths:
+            # An explicit no-op is supported only by checking live exact content.
+            if not (require_live and expectations and any(path.startswith(root + "/") for root in scopes)):
+                raise ValueError(f"EXPLICIT_TARGET_NOT_GENERATED: requested {path} missing from files[].")
+
+    live_cache: dict[str, str | None] = {}
+    def get_live(path: str) -> str | None:
+        if path not in live_cache:
+            live_cache[path] = _teams_round1_live_file(cloud, path, ref, repo_target, effective_workflow)
+        return live_cache[path]
+
+    statuses: dict[str, str] = {}
+    covered_files: dict[str, list[str]] = {}
+    for root in scopes:
+        own_files = [path for path in paths if path.startswith(root + "/")]
+        desired = exp_by_scope.get(root, {})
+        if not own_files and not (require_live and desired):
+            if len(scopes) > 1:
+                raise ValueError(f"MULTI_ENVIRONMENT_INCOMPLETE: no generated environment-specific file for {root}.")
+            continue
+        if not require_content:
+            statuses[root] = "generated" if own_files else "unknown"
+            covered_files[root] = own_files
+            continue
+        if own_files and any(paths[path] is None for path in own_files):
+            raise ValueError("EXPLICIT_FLAG_CONTENT_MISSING: " + ", ".join(own_files))
+        if not require_live:
+            # Preview-only (without a pinned GitHub ref): never mark no-op.
+            if desired:
+                for flag, value in desired.items():
+                    values = [v for path in own_files for v in _teams_round1_boolean_values(paths[path] or "", flag)]
+                    if not values or any(v != value for v in values):
+                        raise ValueError(f"EXPLICIT_FLAG_VALUE_MISMATCH: {root} requires {flag} = {value}.")
+            statuses[root] = "generated" if own_files else "unknown"
+            covered_files[root] = own_files
+            continue
+        # Each returned file must contain an actual diff and preserve existing
+        # content according to the downstream preservation/shape validators.
+        changed_paths: list[str] = []
+        if desired:
+            observed: dict[str, set[str]] = {flag: set() for flag in desired}
+            verified: dict[str, bool] = {flag: False for flag in desired}
+            # Normally the generated file itself is the requested target.
+            # Avoid an environment-wide GitHub scan when every explicit flag
+            # is already present in that file. Scan only when one or more
+            # targets are omitted (the verified no-op / missing-flag case).
+            absent_flags = [
+                flag for flag in desired
+                if not any(_teams_round1_boolean_values(paths[path] or "", flag) for path in own_files)
+            ]
+            additional = (
+                _teams_round1_target_live_candidates(root, cloud, ref, repo_target, effective_workflow, explicit)
+                if absent_flags else []
+            )
+            candidate_paths = list(dict.fromkeys(own_files + additional))
+            for path in candidate_paths:
+                live = get_live(path)
+                generated = paths.get(path)
+                if path in paths and generated is None:
+                    raise ValueError(f"EXPLICIT_FLAG_CONTENT_MISSING: {path}")
+                for flag, value in desired.items():
+                    before_values = _teams_round1_boolean_values(live or "", flag)
+                    after_values = _teams_round1_boolean_values(generated if generated is not None else live or "", flag)
+                    if before_values:
+                        if len(before_values) != 1 or len(after_values) != 1:
+                            raise ValueError(f"EXPLICIT_FLAG_AMBIGUOUS: {flag} occurs multiple times in {path}.")
+                        observed[flag].update(after_values)
+                        if after_values[0] == value:
+                            verified[flag] = True
+                    elif path in paths and after_values:
+                        # Creating an explicit assignment is legitimate for a
+                        # creation request but not an edit to an existing flag.
+                        observed[flag].update(after_values)
+                        if after_values == [value] and not _teams_explicit_existing_file_mutation(prompt):
+                            verified[flag] = True
+                if generated is not None:
+                    if live is None or live != generated:
+                        scoped = {flag: value for flag, value in desired.items()
+                                  if _teams_round1_boolean_values(live or "", flag)}
+                        if _teams_explicit_existing_file_mutation(prompt):
+                            if live is None:
+                                raise ValueError(f"EXPLICIT_FLAG_TARGET_NOT_LIVE: {path} is not an existing file.")
+                            _teams_round1_assignment_only_delta(live, generated, scoped, path)
+                        changed_paths.append(path)
+            for flag, value in desired.items():
+                if not verified[flag] or observed[flag] != {value}:
+                    raise ValueError(f"EXPLICIT_FLAG_VALUE_MISMATCH: {root} requires one verified {flag} = {value}.")
+        else:
+            for path in own_files:
+                live = get_live(path)
+                generated = paths.get(path)
+                if generated is None:
+                    raise ValueError(f"TARGET_CONTENT_MISSING: {path}")
+                if live != generated:
+                    # At least one non-comment/whitespace Terraform line must
+                    # change. Meaningfulness is checked further by semantic
+                    # relevance validators; this guard is not semantic inference.
+                    def meaningful(value: str) -> list[str]:
+                        return [line.strip() for line in str(value or "").splitlines()
+                                if line.strip() and not line.lstrip().startswith(("#", "//"))]
+                    if meaningful(live or "") != meaningful(generated):
+                        changed_paths.append(path)
+            if not changed_paths:
+                raise ValueError(f"MULTI_ENVIRONMENT_NO_EFFECT: {root} has no actual Terraform delta.")
+        statuses[root] = "changed" if changed_paths else "already_satisfied"
+        covered_files[root] = changed_paths
+
+    for path in explicit:
+        matched_scopes = [root for root in scopes if path.startswith(root + "/")]
+        path_desired = {}
+        for root in matched_scopes:
+            path_desired.update(exp_by_scope.get(root, {}))
+        if require_live and require_content and path_desired:
+            # An explicitly named file is authoritative. A matching flag in
+            # some other file in the same environment cannot satisfy it.
+            effective = paths.get(path) if path in paths else get_live(path)
+            for flag, desired_value in path_desired.items():
+                if _teams_round1_boolean_values(effective or "", flag) != [desired_value]:
+                    raise ValueError(f"EXPLICIT_FLAG_VALUE_MISMATCH: {path} requires {flag} = {desired_value}.")
+        if path in paths:
+            continue
+        if not require_live or not path_desired or not all(
+            statuses.get(root) == "already_satisfied" for root in matched_scopes
+        ):
+            raise ValueError(f"EXPLICIT_TARGET_NOT_GENERATED: requested {path} missing from files[].")
+    if require_live and require_content:
+        # A returned file outside an explicit env is allowed for shared
+        # module/definition changes but cannot substitute for env-specific edits.
+        for path, content in paths.items():
+            if any(path.startswith(root + "/") for root in scopes):
+                continue
+            if content is None:
+                raise ValueError(f"TARGET_CONTENT_MISSING: {path}")
+    return {"paths": list(paths), "environment_roots": scopes, "explicit_files": explicit,
+            "flags": contract.get("flags") or {}, "assignments": expectations,
+            "target_statuses": statuses, "changed_files_by_environment": covered_files}
 
 
 def _teams_remove_legacy_analysis(analysis: str) -> str:
@@ -5405,12 +5658,20 @@ def build_agent_input_for_infra(
         return raw
     contract = _teams_request_target_contract(prompt, selected_cloud or "")
     payload["teams_requested_target_contract"] = {
-        key: value for key, value in contract.items() if key in {"cloud", "targets", "files", "flags", "error"}
+        key: value for key, value in contract.items() if key in {"cloud", "targets", "files", "flags", "assignments", "error"}
     }
+    # The compatibility flags{} view has a single value per name and cannot
+    # represent different values for the same flag across environments. Remove
+    # only this lossy view when it conflicts; assignments[] remains authoritative.
+    values_by_flag: dict[str, set[str]] = {}
+    for assignment in contract.get("assignments") or []:
+        values_by_flag.setdefault(str(assignment["flag"]).lower(), set()).add(assignment["desired_value"])
+    if any(len(values) > 1 for values in values_by_flag.values()):
+        payload["teams_requested_target_contract"].pop("flags", None)
     payload["instructions"] = list(payload.get("instructions") or []) + [
         "EXPLICIT FILE MUTATION (HARD): if the user supplied an existing .tf/.tfvars path and Boolean assignments, modify that exact file; do not perform module discovery or ask for the feature name/path.",
         "MULTIPLE TARGETS (HARD): implement every entry in teams_requested_target_contract.targets and return all environment-specific write files together. One matching environment is not successful completion of a multi-environment request.",
-        "If requested flags are explicit, preserve all other live file lines and implement every requested flag value in the specified file(s). For a multi-flag request, never implement just one flag.",
+        "For explicit Boolean assignments, teams_requested_target_contract.assignments is authoritative: each environment_path/flag/desired_value is an independent expectation. The same flag may have opposite values in different environments. Preserve every unrelated existing line and do not omit an environment. If the current live target already has the desired value, omit that unchanged file and report its already-satisfied status.",
         "PRE-PUSH ANALYSIS (HARD): report the Terraform paths actually inspected, the repository convention observed, the exact file/flag/resource changes, origins of values, preservation of unrelated code, repository/environment decision and the next branch action. Never report stateless request resolution, GitHub authentication, or backend routing mechanics as the Terraform change analysis.",
     ]
     # The live contents, not the model's prior knowledge, are authoritative.
@@ -5555,7 +5816,7 @@ def handle_teams_chat_request(data: dict):
         }, 409
     if not action and str(result.get("mode") or "").lower() == "infra_preview":
         try:
-            _teams_validate_target_coverage(result.get("files") or [], prompt, result.get("cloud") or request_data.get("cloud") or "")
+            _teams_validate_target_coverage(result.get("files") or [], prompt, result.get("cloud") or request_data.get("cloud") or "", require_content=bool(result.get("files") and all(isinstance(f, dict) and isinstance(f.get("content"), str) for f in result.get("files") or [])), require_live=bool(result.get("files") and all(isinstance(f, dict) and isinstance(f.get("content"), str) for f in result.get("files") or [])), workflow=result.get("workflow") or request_data.get("workflow") or "")
         except ValueError as exc:
             _teams_diag_log("teams_preview_target_coverage_blocked", level="warning", code=str(exc).split(":", 1)[0])
             # Never advertise an incomplete plan as a prepared infrastructure change.

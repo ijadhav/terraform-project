@@ -1,4 +1,6 @@
 from __future__ import annotations
+import base64
+from urllib.parse import quote
 from typing import TYPE_CHECKING , Optional
 
 if TYPE_CHECKING:
@@ -1137,6 +1139,98 @@ def github_authenticated_login() -> str:
     return re.sub(r"[^A-Za-z0-9-]+", "-", login).strip("-").lower()
 
 
+def _teams_round1_github_json(method: str, url: str, **kwargs) -> dict:
+    """Execute one GitHub Git-Database request through the existing app identity."""
+    response = requests.request(method, url, headers=github_headers(), timeout=30, **kwargs)
+    if not response.ok:
+        request_id = str(response.headers.get("X-GitHub-Request-Id") or "")[:80]
+        raise RuntimeError(
+            f"ATOMIC_GITHUB_TRANSACTION_FAILED: operation={method} status={response.status_code} request_id={request_id}"
+        )
+    return response.json() if response.content else {}
+
+
+def _teams_round1_atomic_write_files(
+    cloud: str, repo_target: str, workflow: str, branch: str,
+    planned: list[dict], head_sha: str, *, validation_ref: str,
+    create_new_branch: bool = False,
+) -> dict:
+    """Stage all content as Git blobs, then move one branch ref atomically.
+
+    No branch ref changes until every file has passed preservation checks and
+    the new tree/commit exists. The ref update is non-force and cannot clobber
+    a concurrent writer. Blob/tree/commit objects are unreferenced on failure.
+    """
+    repo = github_repo_for_cloud(cloud, repo_target=repo_target, workflow=workflow)
+    root = f"{GITHUB_API}/repos/{GITHUB_OWNER}/{repo}/git"
+    staged = []
+    seen: set[str] = set()
+    for item in planned:
+        path = str(item.get("path") or "").strip("/")
+        if not path or path in seen:
+            raise ValueError(f"DUPLICATE_GENERATED_TARGET: {path}")
+        seen.add(path)
+        new_content = item.get("content")
+        if not isinstance(new_content, str):
+            raise ValueError(f"TARGET_CONTENT_MISSING: {path}")
+        existing = github_get_file_content(
+            cloud, path, validation_ref, repo_target=repo_target, workflow=workflow,
+        )
+        if existing == new_content:
+            continue
+        if path.endswith((".tf", ".tfvars")):
+            _validate_hcl_content_complete(path, new_content)
+            if _has_git_conflict_markers(new_content):
+                raise ValueError(f"Generated {path} contains Git conflict markers.")
+        _teams_minimal_existing_file_write_safety(existing, new_content, path)
+        staged.append({"path": path, "content": new_content})
+    if not staged:
+        return {"files": [], "commit_sha": head_sha, "action": "noop"}
+    # Every remote API call up to the final PATCH creates immutable Git objects.
+    # A failure cannot leave one environment committed but another missing.
+    parent = _teams_round1_github_json("GET", f"{root}/commits/{head_sha}")
+    base_tree = str((parent.get("tree") or {}).get("sha") or "")
+    if not base_tree:
+        raise RuntimeError("ATOMIC_GITHUB_TRANSACTION_FAILED: missing base tree SHA")
+    tree_entries = []
+    for item in staged:
+        encoded = base64.b64encode(item["content"].encode("utf-8")).decode("ascii")
+        blob = _teams_round1_github_json(
+            "POST", f"{root}/blobs", json={"content": encoded, "encoding": "base64"},
+        )
+        blob_sha = str(blob.get("sha") or "")
+        if not blob_sha:
+            raise RuntimeError("ATOMIC_GITHUB_TRANSACTION_FAILED: missing staged blob SHA")
+        tree_entries.append({"path": item["path"], "mode": "100644", "type": "blob", "sha": blob_sha})
+    tree = _teams_round1_github_json("POST", f"{root}/trees", json={"base_tree": base_tree, "tree": tree_entries})
+    tree_sha = str(tree.get("sha") or "")
+    if not tree_sha:
+        raise RuntimeError("ATOMIC_GITHUB_TRANSACTION_FAILED: missing new tree SHA")
+    commit = _teams_round1_github_json(
+        "POST", f"{root}/commits",
+        json={"message": f"[{cloud.upper()}] Terrabot infrastructure changes ({len(staged)} files)",
+              "tree": tree_sha, "parents": [head_sha]},
+    )
+    commit_sha = str(commit.get("sha") or "")
+    if not commit_sha:
+        raise RuntimeError("ATOMIC_GITHUB_TRANSACTION_FAILED: missing new commit SHA")
+    if create_new_branch:
+        # All objects are staged successfully before even creating the branch.
+        github_create_branch(cloud, branch, head_sha, repo_target=repo_target, workflow=workflow)
+    _teams_round1_github_json(
+        "PATCH", f"{root}/refs/heads/{quote(branch, safe='/')}",
+        json={"sha": commit_sha, "force": False},
+    )
+    actual_sha = github_get_base_branch_sha(cloud, branch, repo_target=repo_target, workflow=workflow)
+    if actual_sha != commit_sha:
+        raise RuntimeError("ATOMIC_COMMIT_VERIFICATION_FAILED: remote branch head does not match the new commit")
+    for item in staged:
+        actual = github_get_file_content(cloud, item["path"], commit_sha, repo_target=repo_target, workflow=workflow)
+        if actual != item["content"]:
+            raise RuntimeError(f"ATOMIC_COMMIT_VERIFICATION_FAILED: content mismatch in {item['path']}")
+    return {"files": [item["path"] for item in staged], "commit_sha": commit_sha, "action": "committed"}
+
+
 def _commit_terraform_files_to_branch_for_teams_base(
     agent_result: dict,
     prompt: str,
@@ -1228,15 +1322,15 @@ def _commit_terraform_files_to_branch_for_teams_base(
             state["cycle"] = cycle
         state["branch"] = branch_name
 
-    seed_branch = base_branch
-
-    if not github_branch_exists(cloud, branch_name, repo_target=repo_target, workflow=workflow):
-        base_sha = github_get_base_branch_sha(
-            cloud, seed_branch, repo_target=repo_target, workflow=workflow
-        )
-        github_create_branch(
-            cloud, branch_name, base_sha, repo_target=repo_target, workflow=workflow
-        )
+    # Stage against an immutable source SHA. For new branches no Git ref is
+    # created until the whole batch has been validated against this exact SHA.
+    branch_already_exists = github_branch_exists(
+        cloud, branch_name, repo_target=repo_target, workflow=workflow
+    )
+    source_ref = branch_name if branch_already_exists else base_branch
+    source_sha = github_get_base_branch_sha(
+        cloud, source_ref, repo_target=repo_target, workflow=workflow
+    )
 
     if cloud == "aws" and not state.get("environment_path"):
         aws_env_path, aws_env_error = resolve_aws_environment_path(
@@ -1247,33 +1341,59 @@ def _commit_terraform_files_to_branch_for_teams_base(
         if aws_env_path:
             state["environment_path"] = aws_env_path
 
-    committed_files = []
+    planned = []
     for file_data in agent_result.get("files") or []:
         relative_path = normalize_agent_relative_tf_path(file_data["filename"], cloud)
-        if relative_path.startswith("terraform/"):
+        if relative_path.startswith(("terraform/", "vars/")):
             repo_path = relative_path
         elif cloud == "aws" and state.get("environment_path"):
             repo_path = safe_join_under_folder(state["environment_path"], relative_path)
         else:
             repo_path = safe_join_under_folder(folder, relative_path)
+        planned.append({"path": repo_path, "content": file_data["content"]})
 
-        write_result = github_put_file_if_changed(
-            cloud=cloud,
-            path=repo_path,
-            content=file_data["content"],
-            branch=branch_name,
-            commit_message=f"[{cloud.upper()}] Update Terraform file {repo_path}",
-            repo_target=repo_target,
-            workflow=workflow,
+    # Validate all named environments against the precise tree that we intend
+    # to modify. A target whose flags are already correct may be omitted from
+    # files[]; only a verified live assignment can grant already_satisfied.
+    coverage = _teams_validate_target_coverage(
+        [{"filename": item["path"], "content": item["content"]} for item in planned],
+        prompt, cloud, require_content=True, require_live=True,
+        branch=source_sha, workflow=workflow or "",
+    )
+    # Preflight EVERY file, including files outside environment-specific roots,
+    # before creating a Git ref. No partial writes on a failed second file.
+    prepared = []
+    for item in planned:
+        current = github_get_file_content(
+            cloud, item["path"], source_sha, repo_target=repo_target, workflow=workflow,
         )
-        if write_result["changed"]:
-            committed_files.append(repo_path)
+        if current == item["content"]:
+            continue
+        if item["path"].endswith((".tf", ".tfvars")):
+            _validate_hcl_content_complete(item["path"], item["content"])
+            if _has_git_conflict_markers(item["content"]):
+                raise ValueError(f"Generated {item['path']} contains Git conflict markers.")
+        _teams_minimal_existing_file_write_safety(current, item["content"], item["path"])
+        prepared.append(item)
+    if prepared:
+        transaction = _teams_round1_atomic_write_files(
+            cloud, repo_target, workflow, branch_name, planned, source_sha,
+            validation_ref=source_sha, create_new_branch=not branch_already_exists,
+        )
+    else:
+        transaction = {"files": [], "commit_sha": source_sha, "action": "noop"}
+    committed_files = transaction["files"]
+    state["environment_target_statuses"] = dict(coverage.get("target_statuses") or {})
+    state["committed_head_sha"] = transaction.get("commit_sha")
+    for repo_path in committed_files:
         if cloud == "aws" and repo_path.startswith("terraform/") and not repo_path.startswith(f"{AWS_MODULES_ROOT}/"):
             state["environment_path"] = repo_path.rsplit("/", 1)[0]
 
+    if not committed_files and not branch_already_exists:
+        state["branch"] = ""
     repo = github_repo_for_cloud(cloud, repo_target=repo_target, workflow=workflow)
-    branch_url = f"https://github.com/{GITHUB_OWNER}/{repo}/tree/{branch_name}"
-    compare_url = f"https://github.com/{GITHUB_OWNER}/{repo}/compare/{base_branch}...{branch_name}"
+    branch_url = f"https://github.com/{GITHUB_OWNER}/{repo}/tree/{branch_name}" if state.get("branch") else ""
+    compare_url = f"https://github.com/{GITHUB_OWNER}/{repo}/compare/{base_branch}...{branch_name}" if state.get("branch") else ""
     state.update({
         "workflow": workflow,
         "repo_target": repo_target,
@@ -1285,7 +1405,7 @@ def _commit_terraform_files_to_branch_for_teams_base(
         "teams_requester": _ACTIVE_TEAMS_REQUESTER_DISPLAY.get(),
         "branch_url": branch_url,
         "compare_url": compare_url,
-        "has_open_pr": False,
+        "has_open_pr": bool(state.get("has_open_pr")) if branch_already_exists and reuse_branch else False,
     })
     set_last_selected_cloud(thread_id, cloud)
     return {
@@ -1294,7 +1414,7 @@ def _commit_terraform_files_to_branch_for_teams_base(
         "repo_target": repo_target,
         "workflow": workflow,
         "folder": state.get("environment_path") if cloud == "aws" and state.get("environment_path") else folder,
-        "branch": branch_name,
+        "branch": state.get("branch") or "",
         "base_branch": base_branch,
         "branch_url": branch_url,
         "compare_url": compare_url,
@@ -1302,7 +1422,17 @@ def _commit_terraform_files_to_branch_for_teams_base(
         "title": state["title"],
         "summary": state["summary"],
         "state": state,
-        "message": "Terraform changes were committed to a new GitHub branch.",
+        "message": (
+            "Terraform files committed atomically to the GitHub branch."
+            if committed_files else "All requested Terraform values are already satisfied; no new commit was created."
+        ),
+        "action": transaction.get("action"),
+        "commit_sha": transaction.get("commit_sha"),
+        "environment_target_statuses": dict(coverage.get("target_statuses") or {}),
+        "already_satisfied_environments": [
+            root for root, status in (coverage.get("target_statuses") or {}).items()
+            if status == "already_satisfied"
+        ],
     }
 
 
