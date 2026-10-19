@@ -1703,3 +1703,66 @@ def _get_verified_azure_module_source_url(retrieved_module_context: list) -> str
     return ""
 
 
+
+
+# Read-only branch-preparation contract. This is not a Terraform generator and
+# does not replace the strict live-file checks in the atomic GitHub writer.
+def _teams_validate_branch_preparation(prompt: str, cloud: str, repo_target: str,
+                                       state: dict | None = None) -> dict:
+    """Validate scope before offering a branch decision, retaining resolved evidence.
+
+    Only the repository's existing cloud mapping may supply a repo name. Target
+    paths and environment assignments are retained only when previously resolved
+    for the same cloud; they are not inferred from an unrelated prior request.
+    """
+    request = str(prompt or "").strip()
+    chosen_cloud = safe_normalize_cloud(str(cloud or "")) or ""
+    source = dict(state or {})
+    repo = str(repo_target or "").strip()
+    if not request or chosen_cloud not in {"aws", "azure"} or not repo:
+        return {"validated": False, "reason": "unresolved infrastructure request/cloud/repository"}
+    # The repository must be one actually configured for the selected cloud.
+    # This is repository identity validation, not resource/flag inference.
+    try:
+        resolved_repo = github_repo_for_cloud(chosen_cloud, repo_target=repo)
+    except Exception:
+        # Azure module-population has a dynamic GitHub repository. Its existing
+        # workflow resolves that repository later from live module discovery;
+        # the consumer-repo lookup intentionally rejects the dynamic target.
+        dynamic_module_target = str(globals().get("AZURE_MODULE_REPO_TARGET") or "")
+        if chosen_cloud == "azure" and dynamic_module_target and repo == dynamic_module_target:
+            resolved_repo = repo
+        else:
+            return {"validated": False, "reason": "repository target is not supported for this cloud"}
+    if not str(resolved_repo or "").strip():
+        return {"validated": False, "reason": "repository target could not be verified"}
+    from hashlib import sha256
+    identity = sha256(request.encode("utf-8")).hexdigest()
+    prior = source.get("infrastructure_intent") or {}
+    scoped = (str(prior.get("cloud") or "").strip() == chosen_cloud
+              and str(prior.get("original_prompt") or "").strip() == request)
+    return {
+        "validated": True,
+        "validation_level": "intent_cloud_repository_scope",
+        "request_sha256": identity,
+        "cloud": chosen_cloud,
+        "repo_target": repo,
+        "environment": str(prior.get("environment") or "") if scoped else "",
+        "environments": list(prior.get("environments") or []) if scoped else [],
+        "resolved_targets": list(prior.get("resolved_targets") or []) if scoped else [],
+        "selected_file_paths": list(prior.get("selected_file_paths") or []) if scoped else [],
+        "boolean_assignments": (prior.get("boolean_assignments")
+                                if scoped and isinstance(prior.get("boolean_assignments"), (dict, list)) else {}),
+    }
+
+
+def _teams_merge_prepared_evidence(before: dict | None, after: dict | None) -> dict:
+    """Preserve verified target information when branch/UI patches are sparse."""
+    old, current = dict(before or {}), dict(after or {})
+    if (old.get("cloud") and current.get("cloud")
+            and old["cloud"] != current["cloud"]):
+        return current
+    for key in ("environment", "environments", "resolved_targets", "selected_file_paths", "boolean_assignments"):
+        if current.get(key) in (None, "", [], {}) and old.get(key) not in (None, "", [], {}):
+            current[key] = old[key]
+    return current

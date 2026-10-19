@@ -145,3 +145,98 @@ def purge_expired() -> int:
         for cid in stale:
             _STORE.pop(cid, None)
     return len(stale)
+
+# Structured infrastructure continuity is serialized by the Teams durable state
+# writer. These helpers deliberately perform no persistence or resource routing.
+# Keeping an original prompt separate from clarified fields prevents the latest
+# one-word answer from replacing the Terraform operation being prepared.
+_INFRA_FIELDS = frozenset({
+    "cloud", "repo_target", "workflow", "environment", "environments",
+    "resolved_targets", "selected_file_paths", "boolean_assignments",
+    "branch_preference", "existing_branch", "target_resource", "target_scope",
+})
+
+
+def merge_infrastructure_intent(
+    existing: dict | None,
+    original_prompt: str = "",
+    *,
+    clarified_fields: dict | None = None,
+    clarification: str = "",
+    new_request: bool = False,
+) -> dict:
+    """Merge only explicitly clarified attributes; never discard other targets.
+
+    The caller must supply field names established by backend/Foundry evidence.
+    A free-text answer is retained verbatim but cannot silently rewrite cloud,
+    environments, Boolean assignments or target paths.
+    """
+    previous = {} if new_request else dict(existing or {})
+    source = str(original_prompt or "").strip()
+    if source and (new_request or not previous.get("original_prompt")):
+        previous["original_prompt"] = source
+    previous.setdefault("clarifications", [])
+    clarifications = list(previous.get("clarifications") or [])
+    clarification = str(clarification or "").strip()
+    if clarification and clarification not in clarifications:
+        clarifications.append(clarification)
+    previous["clarifications"] = clarifications[-12:]
+    for key, value in (clarified_fields or {}).items():
+        if key not in _INFRA_FIELDS or value is None or value == "":
+            continue
+        if key in {"resolved_targets", "selected_file_paths", "environments"}:
+            # Multi-target requests are additive unless a specific target was
+            # explicitly corrected by its stable id/path.
+            original = list(previous.get(key) or [])
+            updates = list(value) if isinstance(value, (list, tuple)) else [value]
+            for item in updates:
+                if isinstance(item, dict):
+                    identity = str(item.get("path") or item.get("id") or "").strip()
+                    idx = next((i for i, old in enumerate(original) if isinstance(old, dict)
+                                and str(old.get("path") or old.get("id") or "").strip() == identity), -1) if identity else -1
+                    if idx >= 0:
+                        original[idx] = {**original[idx], **item}
+                    elif item not in original:
+                        original.append(item)
+                elif item not in original:
+                    original.append(item)
+            previous[key] = original
+        elif key == "boolean_assignments":
+            # A Boolean flag can legitimately require different values in
+            # different environments. Preserve the per-target tuple, rather
+            # than collapsing everything to the last flag name seen.
+            if isinstance(value, dict):
+                previous[key] = {**(previous.get(key) if isinstance(previous.get(key), dict) else {}), **value}
+            elif isinstance(value, (list, tuple)):
+                assignments = list(previous.get(key) or []) if isinstance(previous.get(key), (list, tuple)) else []
+                for assignment in value:
+                    if not isinstance(assignment, dict):
+                        continue
+                    identity = (str(assignment.get("environment_path") or assignment.get("path") or ""),
+                                str(assignment.get("flag") or ""))
+                    at = next((i for i, old in enumerate(assignments)
+                               if isinstance(old, dict) and
+                               (str(old.get("environment_path") or old.get("path") or ""),
+                                str(old.get("flag") or "")) == identity), -1)
+                    if at >= 0:
+                        assignments[at] = {**assignments[at], **assignment}
+                    else:
+                        assignments.append(assignment)
+                previous[key] = assignments
+        else:
+            previous[key] = value
+    return previous
+
+
+def infrastructure_prompt(intent: dict | None) -> str:
+    """Keep the original infrastructure instruction and bounded corrections."""
+    value = dict(intent or {})
+    original = str(value.get("original_prompt") or "").strip()
+    corrections = [str(item).strip() for item in (value.get("clarifications") or []) if str(item).strip()]
+    if not original:
+        return ""
+    if not corrections:
+        return original
+    return (original + "\nClarifications (newer corrections override only their specific fields; "
+            "preserve all other targets, paths, and Boolean assignments):\n" +
+            "\n".join(f"- {item}" for item in corrections[-8:]))[-6500:]

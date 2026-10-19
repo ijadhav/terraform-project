@@ -5828,3 +5828,60 @@ def handle_teams_chat_request(data: dict):
                 "thread_id": result.get("thread_id") or "", "state_patch": result.get("state_patch") or {},
             }, 422
     return result, code
+
+
+# Persistent request-intent continuity overlay. The previous handler remains
+# authoritative for generation, target selection, validation, branch reuse and
+# PR commits; this wrapper only carries structured, non-secret request state.
+_TEAMS_STRUCTURED_INTENT_PREVIOUS_HANDLE = handle_teams_chat_request
+
+
+def handle_teams_chat_request(data: dict):
+    request_data = dict(data or {})
+    conversation_id = str(request_data.get("teams_conversation_id") or request_data.get("conversation_id") or "").strip()
+    prior_state = load_teams_conversation_state(conversation_id) if conversation_id else {}
+    result, status = _TEAMS_STRUCTURED_INTENT_PREVIOUS_HANDLE(request_data)
+    result = dict(result or {})
+    mode = str(result.get("mode") or "").strip().lower()
+    router = result.get("router") if isinstance(result.get("router"), dict) else {}
+    is_infra = (mode in {"infra_preview", "branch_choice_required", "branch_created"}
+                or str(router.get("request_type") or "") == "infra"
+                or str(request_data.get("mode") or "").strip() == "infra"
+                or (mode == "clarification" and str(result.get("decision_state") or "")
+                    in {"awaiting_cloud_clarification", "infra_modification_target_selection", "aws_module_selection"}))
+    if not conversation_id or not is_infra or request_data.get("action"):
+        return result, status
+    from shared_code.teams_conversation_memory import merge_infrastructure_intent
+    source = str(result.get("request_prompt") or request_data.get("original_prompt")
+                 or request_data.get("prompt") or "").strip()
+    previous = prior_state.get("infrastructure_intent") or {}
+    continuing = bool(request_data.get("infra_clarification") or request_data.get("pending_branch_choice_reply")
+                      or request_data.get("pending_target_selection_reply") or request_data.get("pending_cloud_clarification_reply")
+                      or request_data.get("pending_branch_choice_resolved")
+                      or str(prior_state.get("stage") or "") in {"awaiting_cloud_clarification", "infra_modification_target_selection"})
+    clarified = {
+        "cloud": result.get("cloud") or request_data.get("requested_cloud") or request_data.get("cloud"),
+        "repo_target": result.get("repo_target"),
+        "workflow": result.get("workflow"),
+        "resolved_targets": result.get("resolved_targets"),
+        "selected_file_paths": result.get("resolved_target_files"),
+        "environment": result.get("environment_path"),
+        "branch_preference": request_data.get("branch_choice"),
+        "existing_branch": request_data.get("existing_branch"),
+    }
+    prepared = request_data.get("infrastructure_preparation") or (result.get("state_patch") or {}).get("infrastructure_preparation") or {}
+    if isinstance(prepared, dict) and prepared.get("validated"):
+        clarified = _teams_merge_prepared_evidence(prepared, clarified)
+    structured = merge_infrastructure_intent(
+        previous, source,
+        new_request=bool(not continuing and source != str(previous.get("original_prompt") or "").strip()),
+        clarified_fields={key: value for key, value in clarified.items() if value not in (None, "")},
+    )
+    patch = dict(result.get("state_patch") or {})
+    patch["infrastructure_intent"] = structured
+    if isinstance(prepared, dict) and prepared.get("validated"):
+        patch["infrastructure_preparation"] = prepared
+    result["state_patch"] = patch
+    # Durable state must precede the Teams response/branch yes-no delivery.
+    _teams_save_ui_state(conversation_id, patch)
+    return result, status

@@ -1010,21 +1010,9 @@ def _canonical_infrastructure_follow_up(prior: str, clarification: str) -> str:
         return answer
     if not answer:
         return original
-    # An environment-only answer CORRECTS a previous target; it must not
-    # accidentally become an instruction to modify both environments. Avoid
-    # touching resource identifiers or repository names while removing older
-    # provider-environment clauses from the current captured request.
-    environment_correction = re.fullmatch(
-        r"(?i)(?:for|in|within)\s+(?:the\s+)?((?:(?:npr|sbx|prd|prod)[_-][a-z0-9_-]+)|"
-        r"(?:minidev|dev|devops|sandbox|staging|production))\s*(?:env|environment)?",
-        answer,
-    )
-    if environment_correction:
-        older_env_clause = re.compile(
-            r"(?i)\b(?:for|in|within)\s+(?:the\s+)?(?:(?:npr|sbx|prd|prod)[_-][a-z0-9_-]+|"
-            r"minidev|dev|devops|sandbox|staging|production)(?:\s+(?:env|environment))?\b"
-        )
-        original = older_env_clause.sub("", original).strip()
+    # Never remove earlier environment clauses from an original multi-target
+    # request. A clarification updates its own field in the durable structured
+    # intent; the original resources and other environments remain in scope.
     # Avoid an unbounded chain of nested 'Continue previous request' wrappers.
     if original.lower().endswith("user clarification: " + answer.lower()):
         return original
@@ -1033,6 +1021,9 @@ def _canonical_infrastructure_follow_up(prior: str, clarification: str) -> str:
 
 
 def _infrastructure_intent_source(state: Dict[str, Any]) -> str:
+    structured = teams_conversation_memory.infrastructure_prompt(state.get("infrastructure_intent"))
+    if _branch_prompt_candidate_is_usable(structured):
+        return structured
     for name in ("active_infra_intent", "pending_follow_up_prompt", "last_infra_prompt"):
         value = str((state or {}).get(name) or "").strip()
         if _branch_prompt_candidate_is_usable(value):
@@ -1272,7 +1263,12 @@ class TerrabotTeamsBot(ActivityHandler):
                 # fresh request and not a yes/no branch decision.
                 await _send(turn_context, "Terrabot is processing your request...")
                 pending_intent = _infrastructure_intent_source(state) or _resolve_pending_branch_infra_prompt(state, fallback=state.get("last_infra_prompt", ""))
-                merged_intent = _canonical_infrastructure_follow_up(pending_intent, prompt)
+                structured = teams_conversation_memory.merge_infrastructure_intent(
+                    state.get("infrastructure_intent"), pending_intent,
+                    clarification=prompt,
+                )
+                state["infrastructure_intent"] = structured
+                merged_intent = teams_conversation_memory.infrastructure_prompt(structured)
                 request = {
                     "prompt": merged_intent,
                     "original_prompt": merged_intent,
@@ -1392,6 +1388,21 @@ class TerrabotTeamsBot(ActivityHandler):
                     "supersede_pending_request": True,
                     "state_patch": branch_decision_patch,
                 }
+        elif workflow_stage == "aws_module_selection" and _is_freeform_user_message(prompt) and not _is_infra_target_selection_reply(prompt):
+            # A full sentence is not a deterministic module-picker answer.
+            # Route it through Foundry again: repository questions stay
+            # read-only, while genuinely new infra requests can supersede the
+            # abandoned picker without resetting other GitHub/PR state.
+            await _send(turn_context, "Terrabot is processing your request...")
+            request = {
+                "prompt": prompt,
+                "original_prompt": prompt,
+                "thread_id": workflow_thread_id,
+                "teams_conversation_id": thread_id,
+                "source": "teams",
+                "fresh_infra_generation": True,
+                "supersede_pending_request": True,
+            }
         elif workflow_stage == "aws_module_selection":
             # AWS module-choice replies are protocol control, not new chat and
             # not generic Terraform target selection. Pin the request to AWS and
@@ -1777,6 +1788,41 @@ class TerrabotTeamsBot(ActivityHandler):
             or (mode == "clarification" and str(result.get("workflow") or "").endswith("_infra_modification"))
         )
         if routed_infra and request.get("prompt"):
+            previously_structured = state.get("infrastructure_intent") or {}
+            short_clarification = bool(
+                previously_structured.get("original_prompt")
+                and (_is_short_contextual_follow_up(prompt, local_state_before_backend)
+                     or (workflow_stage == "awaiting_cloud_clarification"
+                         and _is_cloud_only_protocol_reply(prompt)))
+            )
+            continuing = bool(short_clarification or request.get("infra_clarification")
+                              or request.get("pending_branch_choice_reply")
+                              or request.get("pending_target_selection_reply")
+                              or request.get("pending_aws_module_selection_reply")
+                              or request.get("pending_cloud_clarification_reply"))
+            source_intent = str(
+                (previously_structured.get("original_prompt") if continuing else "")
+                or request.get("original_prompt") or request.get("prompt") or ""
+            ).strip()
+            state["infrastructure_intent"] = teams_conversation_memory.merge_infrastructure_intent(
+                previously_structured,
+                source_intent,
+                clarification=prompt if short_clarification else "",
+                new_request=bool(not continuing and not request.get("pending_branch_choice_resolved")
+                                 and source_intent != str(previously_structured.get("original_prompt") or "").strip()),
+                clarified_fields={
+                    key: value for key, value in {
+                        "cloud": result.get("cloud") or request.get("requested_cloud") or request.get("cloud"),
+                        "repo_target": result.get("repo_target"),
+                        "workflow": result.get("workflow"),
+                        "selected_file_paths": result.get("resolved_target_files"),
+                        "resolved_targets": result.get("resolved_targets"),
+                        "environment": result.get("environment_path"),
+                        "branch_preference": request.get("branch_choice"),
+                        "existing_branch": request.get("existing_branch"),
+                    }.items() if value not in (None, "")
+                },
+            )
             # Clarification failures must preserve the pending infrastructure
             # request just as successful previews do. A previous implementation
             # skipped 'clarification' and lost the user's exact file/flag details.
@@ -2046,3 +2092,116 @@ async def handle_teams_bot_activity(
         )
 
     return {}, 200
+
+# Activity-id idempotency is separate from conversation state: the conversation
+# snapshot uses last-writer-wins and cannot safely deduplicate concurrent webhook
+# deliveries. An Azure Table create_entity is an atomic claim across workers.
+import threading as _teams_activity_threading
+import time as _teams_activity_time
+
+_TEAMS_ACTIVITY_LOCK = _teams_activity_threading.RLock()
+_TEAMS_ACTIVITY_LOCAL: Dict[str, dict] = {}
+_TEAMS_ACTIVITY_PARTITION = "teams-activity-processing"
+_TEAMS_ACTIVITY_LEASE_SECONDS = 15 * 60
+
+
+def _teams_activity_store():
+    try:
+        from shared_code.terrabot_service import _github_state_table
+        return _github_state_table()
+    except Exception:
+        LOGGER.warning("Teams activity durable processing table unavailable", exc_info=True)
+        return None
+
+
+def _claim_teams_activity(thread_id: str, activity_id: str) -> tuple[bool, str]:
+    if not activity_id:
+        LOGGER.warning("Teams message missing activity.id; durable deduplication unavailable")
+        return True, ""
+    key = hashlib.sha256(f"{thread_id}::{activity_id}".encode("utf-8")).hexdigest()
+    now = int(_teams_activity_time.time())
+    row = {"PartitionKey": _TEAMS_ACTIVITY_PARTITION, "RowKey": key,
+           "claimed_at": now, "status": "processing"}
+    table = _teams_activity_store()
+    if table is not None:
+        try:
+            from azure.core.exceptions import ResourceExistsError
+            from azure.core import MatchConditions
+            from azure.data.tables import UpdateMode
+            try:
+                table.create_entity(entity=row)
+                return True, key
+            except ResourceExistsError:
+                recorded = table.get_entity(_TEAMS_ACTIVITY_PARTITION, key)
+                if str(recorded.get("status") or "") == "completed":
+                    return False, key
+                if now - int(recorded.get("claimed_at") or now) < _TEAMS_ACTIVITY_LEASE_SECONDS:
+                    return False, key
+                # Claim only when the old lease has expired. ETag protects
+                # against another worker stealing the same expired activity.
+                etag = (getattr(recorded, "metadata", {}) or {}).get("etag")
+                if not etag:
+                    return False, key
+                table.update_entity(entity=row, mode=UpdateMode.REPLACE,
+                                    etag=etag, match_condition=MatchConditions.IfNotModified)
+                return True, key
+        except Exception:
+            LOGGER.exception("Durable activity claim failed: activity_hash=%s", key[:12])
+            # Failing closed prevents an unprotected duplicate GitHub write.
+            return False, "error:" + key
+    with _TEAMS_ACTIVITY_LOCK:
+        for old, item in list(_TEAMS_ACTIVITY_LOCAL.items()):
+            if now - int(item.get("claimed_at") or now) > _TEAMS_ACTIVITY_LEASE_SECONDS:
+                _TEAMS_ACTIVITY_LOCAL.pop(old, None)
+        if key in _TEAMS_ACTIVITY_LOCAL:
+            return False, key
+        LOGGER.warning("Teams deduplication using process-local fallback; configure Azure Table state for scale-out safety")
+        _TEAMS_ACTIVITY_LOCAL[key] = dict(row)
+        return True, key
+
+
+def _finish_teams_activity(key: str) -> None:
+    if not key:
+        return
+    table = _teams_activity_store()
+    if table is not None:
+        try:
+            table.update_entity(entity={"PartitionKey": _TEAMS_ACTIVITY_PARTITION,
+                                        "RowKey": key, "status": "completed",
+                                        "claimed_at": int(_teams_activity_time.time())},
+                                mode="MERGE")
+            return
+        except Exception:
+            LOGGER.exception("Unable to complete Teams activity claim: activity_hash=%s", key[:12])
+    with _TEAMS_ACTIVITY_LOCK:
+        if key in _TEAMS_ACTIVITY_LOCAL:
+            _TEAMS_ACTIVITY_LOCAL[key]["status"] = "completed"
+
+
+_TEAMS_ORIGINAL_ON_MESSAGE_ACTIVITY = TerrabotTeamsBot.on_message_activity
+
+
+async def _teams_idempotent_on_message_activity(self, turn_context: TurnContext):
+    activity = turn_context.activity
+    allowed, key = await asyncio.to_thread(
+        _claim_teams_activity, _get_thread_id(activity), str(getattr(activity, "id", "") or "").strip()
+    )
+    if not allowed:
+        if key.startswith("error:"):
+            await turn_context.send_activity(
+                "Terrabot could not verify the Teams activity processing state. "
+                "No new infrastructure change was started; please retry shortly."
+            )
+        else:
+            LOGGER.info("Duplicate Teams activity suppressed: activity_hash=%s", key[:12])
+        return
+    try:
+        await _TEAMS_ORIGINAL_ON_MESSAGE_ACTIVITY(self, turn_context)
+    except Exception:
+        # Let the lease expire so a failed transport delivery can be retried.
+        raise
+    else:
+        await asyncio.to_thread(_finish_teams_activity, key)
+
+
+TerrabotTeamsBot.on_message_activity = _teams_idempotent_on_message_activity

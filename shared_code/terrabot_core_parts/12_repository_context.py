@@ -61,6 +61,27 @@ def build_backend_existing_infra_modification_context_stage3(
         retrieved_value_context=retrieved_value_context,
     )
     active = _ACTIVE_TEAMS_FLOW_CONTEXT.get() or {}
+    preparation = active.get("infrastructure_preparation") or {}
+    # Core's long-lived generation wrapper passes the Teams conversation key,
+    # but older wrappers don't forward the preparation object itself. Retrieve
+    # it read-only from durable state instead of changing those working flows.
+    if not preparation and active.get("active") and active.get("teams_conversation_id"):
+        try:
+            preparation = (load_teams_conversation_state(
+                str(active["teams_conversation_id"])
+            ) or {}).get("infrastructure_preparation") or {}
+        except Exception:
+            LOGGER.debug("Prepared Teams scope unavailable from durable state", exc_info=True)
+    if active.get("active") and isinstance(preparation, dict) and preparation.get("validated"):
+        context = dict(context or {})
+        # Supplement Foundry's live evidence with validated target metadata;
+        # repository context never overrides exact live file contents.
+        context["teams_infrastructure_preparation"] = {
+            key: preparation.get(key) for key in (
+                "cloud", "repo_target", "environment", "environments",
+                "resolved_targets", "selected_file_paths", "boolean_assignments",
+            ) if preparation.get(key) not in (None, "", [], {})
+        }
     if active.get("active") and _teams_feature_flag_intent(prompt) in {"enable", "disable"}:
         context = dict(context or {})
         # Prevent the generic backend file-picker from intercepting the turn.

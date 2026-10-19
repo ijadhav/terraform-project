@@ -1830,10 +1830,10 @@ def _teams_foundry_classify_and_resolve_request(prompt: str) -> dict:
     request = {
         "task": "CLASSIFY CURRENT TEAMS USER INTENT AND, FOR INFRA ONLY, RESOLVE THE MOST LIKELY CLOUD. Return JSON only.",
         "user_request": text,
-        "allowed_intents": ["chat", "repo_qna", "infra"],
+        "allowed_intents": ["chat", "repo_qna", "infra", "out_of_scope"],
         "allowed_clouds": ["aws", "azure", "unresolved"],
         "required_output": {
-            "intent": "chat|repo_qna|infra",
+            "intent": "chat|repo_qna|infra|out_of_scope",
             "cloud": "aws|azure|unresolved",
             "reason": "one short sentence",
         },
@@ -1845,6 +1845,7 @@ def _teams_foundry_classify_and_resolve_request(prompt: str) -> dict:
             "Return cloud=unresolved when the request could reasonably apply to either AWS or Azure and there is not enough evidence to choose safely.",
             "Do not invent an environment. Environment selection/defaulting is backend-owned after cloud is resolved.",
             "Chat and repository Q&A must not be converted to infrastructure merely because prior thread state exists.",
+            "out_of_scope is for actionable requests unrelated to Terraform, infrastructure operations, or supported repository analysis; greetings and general Terraform questions remain chat.",
             "This is classification/routing only: do not generate Terraform, files, questions, or implementation plans.",
         ],
     }
@@ -1854,7 +1855,7 @@ def _teams_foundry_classify_and_resolve_request(prompt: str) -> dict:
         intent = str(parsed.get("intent") or "").strip().lower()
         cloud = safe_normalize_cloud(str(parsed.get("cloud") or "")) or ""
         reason = str(parsed.get("reason") or "").strip()
-        if intent in {"chat", "repo_qna", "infra"}:
+        if intent in {"chat", "repo_qna", "infra", "out_of_scope"}:
             if intent != "infra":
                 cloud = ""
             LOGGER.info("Foundry Teams intent: %s cloud=%s", intent, cloud or "unresolved")
@@ -4249,7 +4250,8 @@ def _handle_teams_chat_request_multicloud(data: dict):
     # Do not classify deterministic protocol continuations (branch yes/no,
     # target-picker replies, Jira/PR actions) as fresh infrastructure requests.
     pre_branch_protocol_reply = bool(
-        action
+        _teams_message_is_protocol_control(request_data, state, prompt)
+        or action
         or _teams_truthy(request_data.get("pending_target_selection_reply"))
         or _teams_truthy(request_data.get("pending_branch_choice_reply"))
         or _teams_truthy(request_data.get("pending_branch_choice_resolved"))
@@ -4259,12 +4261,21 @@ def _handle_teams_chat_request_multicloud(data: dict):
             and bool(_teams_branch_choice_from_reply(prompt))
         )
     )
-    if (
-        not explicit_infra
-        and prompt
-        and not pre_branch_protocol_reply
+    # Even when a Teams caller supplied mode=infra, validate a genuinely
+    # fresh semantic turn against Foundry. Only deterministic continuations
+    # and explicitly isolated test-harness requests retain their mode pin.
+    classify_fresh_turn = bool(
+        prompt and not pre_branch_protocol_reply
         and not _teams_prompt_requests_pr(prompt)
-    ):
+        and str(request_data.get("mode") or "").strip().lower() != "repo_qna"
+        and (not explicit_infra or (
+            str(request_data.get("source") or "").strip().lower() == "teams"
+            and not _teams_truthy(request_data.get("test_mode"))
+            and not _teams_truthy(request_data.get("infra_clarification"))
+            and not _teams_truthy(request_data.get("pending_cloud_clarification_reply"))
+        ))
+    )
+    if classify_fresh_turn:
         foundry_route = _teams_foundry_classify_and_resolve_request(prompt)
         explicit_infra = str(foundry_route.get("intent") or "").strip().lower() == "infra"
         if explicit_infra:
@@ -4276,6 +4287,34 @@ def _handle_teams_chat_request_multicloud(data: dict):
                 str(foundry_route.get("cloud") or "unresolved"),
                 stage or "idle",
             )
+
+    # Explicit Q&A and Foundry-classified non-mutations must bypass *all*
+    # branch/target/PR machinery, even if an older infrastructure decision is
+    # still pending in durable state. Reading repositories is allowed here;
+    # GitHub mutations, Terraform generation, and branch prompts are not.
+    resolved_intent = str(foundry_route.get("intent") or "").strip().lower()
+    if str(request_data.get("mode") or "").strip().lower() == "repo_qna":
+        resolved_intent = "repo_qna"
+    if not pre_branch_protocol_reply and not action:
+        if resolved_intent in {"chat", "repo_qna"}:
+            return _teams_plain_chat_reply(
+                prompt, teams_conversation_id=memory_conversation_id,
+                cloud_hint=str(state.get("cloud") or "").strip(),
+                repo_target_hint=str(state.get("repo_target") or "").strip(),
+                requester=str(request_data.get("teams_requester") or "").strip(),
+            )
+        if resolved_intent == "out_of_scope":
+            return {
+                "ok": True, "mode": "chat", "foundry_intent": "out_of_scope",
+                "reply": "Terrabot handles Terraform infrastructure changes and Terraform/repository questions. This request is outside that scope.",
+                "source_paths_used": [], "files": [], "repository_qna": False,
+            }, 200
+        if resolved_intent == "unknown" and classify_fresh_turn:
+            return {
+                "ok": False, "mode": "clarification", "foundry_intent": "unknown",
+                "reply": "I couldn't validate whether this is a Terraform change or a repository question. Please restate the request; no GitHub changes were made.",
+                "files": [], "diagnostic_code": "TEAMS_INTENT_CLASSIFICATION_UNAVAILABLE",
+            }, 503
 
     # Automated E2E runs must never reuse a production/user branch or open PR.
     # Keep their historical always-new-branch transport semantics even when a
@@ -4373,6 +4412,22 @@ def _handle_teams_chat_request_multicloud(data: dict):
                 "reason": str(foundry_route.get("reason") or "Foundry could not resolve the target cloud safely."),
             },
         }, 400
+
+    # Validated scope is a prerequisite for showing branch options. The
+    # subsequent generation and precommit validators still verify all live
+    # Terraform files before performing any GitHub write.
+    preparation = {}
+    if explicit_infra and requested_cloud and not action:
+        expected_repo = (str(request_data.get("repo_target") or "").strip()
+                         or (GITHUB_AWS_REPO if requested_cloud == "aws" else GITHUB_AZURE_REPO))
+        preparation = _teams_validate_branch_preparation(prompt, requested_cloud, expected_repo, state)
+        if not preparation.get("validated"):
+            return {
+                "ok": False, "mode": "clarification", "files": [],
+                "reply": "Terrabot could not validate the infrastructure repository scope. No branch was selected or changed.",
+                "diagnostic_code": "TEAMS_INFRA_PREPARATION_INCOMPLETE",
+            }, 400
+        request_data["infrastructure_preparation"] = preparation
 
     active_cloud = safe_normalize_cloud(str(state.get("cloud") or "")) or ""
     target_cloud_state = _teams_best_cloud_state(state, requested_cloud) if requested_cloud else {}
@@ -4483,6 +4538,7 @@ def _handle_teams_chat_request_multicloud(data: dict):
                 patch = {
                     "stage": "awaiting_branch_reuse_decision",
                     "pending_follow_up_prompt": prompt,
+                    "infrastructure_preparation": preparation,
                     "pending_follow_up_cloud": requested_cloud,
                     "pending_follow_up_has_pr": has_pr,
                     "pending_follow_up_branch": branch,
