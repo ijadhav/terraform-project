@@ -1845,7 +1845,7 @@ def _teams_foundry_classify_and_resolve_request(prompt: str) -> dict:
             "Return cloud=unresolved when the request could reasonably apply to either AWS or Azure and there is not enough evidence to choose safely.",
             "Do not invent an environment. Environment selection/defaulting is backend-owned after cloud is resolved.",
             "Chat and repository Q&A must not be converted to infrastructure merely because prior thread state exists.",
-            "out_of_scope is for actionable requests unrelated to Terraform, infrastructure operations, or supported repository analysis; greetings and general Terraform questions remain chat.",
+            "Apply the Terrabot Vena-only scope gate to the actual user_request before deciding chat/repo_qna/infra. Classify any unrelated knowledge, history, people, entertainment, or non-Vena infrastructure question as out_of_scope, including non-actionable questions. Only Vena Terraform infrastructure requests, Vena Terraform repository/workflow Q&A, and brief Terrabot greetings/capability questions are supported. Do not classify an unrelated question as chat merely because it is phrased as a question. Preserve validated Terraform workflow control follow-ups.",
             "This is classification/routing only: do not generate Terraform, files, questions, or implementation plans.",
         ],
     }
@@ -4306,7 +4306,7 @@ def _handle_teams_chat_request_multicloud(data: dict):
         if resolved_intent == "out_of_scope":
             return {
                 "ok": True, "mode": "chat", "foundry_intent": "out_of_scope",
-                "reply": "Terrabot handles Terraform infrastructure changes and Terraform/repository questions. This request is outside that scope.",
+                "reply": "Terrabot is designed exclusively to support Vena's Terraform infrastructure. Please submit a request related to Vena's Terraform infrastructure management, changes, or repository-specific questions.",
                 "source_paths_used": [], "files": [], "repository_qna": False,
             }, 200
         if resolved_intent == "unknown" and classify_fresh_turn:
@@ -4698,5 +4698,3 @@ def _handle_teams_chat_request_multicloud(data: dict):
 # allowed to replay files from an earlier request.
 
 _TEAMS_NEW_BRANCH_PREVIOUS_HANDLE_CHAT = _handle_teams_chat_request_multicloud
-
-
