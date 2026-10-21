@@ -5885,3 +5885,504 @@ def handle_teams_chat_request(data: dict):
     # Durable state must precede the Teams response/branch yes-no delivery.
     _teams_save_ui_state(conversation_id, patch)
     return result, status
+# =============================================================================
+# 2026-10-21 Teams iterative, approval-gated Terraform draft lifecycle
+# =============================================================================
+# This is deliberately a terminal Teams-only overlay. All existing generation,
+# repair, validation, atomic branch-write, Jira and PR handlers remain intact.
+# VS Code and automated test harness calls are not rerouted.
+import contextvars as _draft_contextvars
+import posixpath as _draft_posixpath
+
+_TEAMS_DRAFT_PREVIOUS_HANDLE = handle_teams_chat_request
+_TEAMS_DRAFT_PREVIOUS_BUILD_INPUT = build_agent_input_for_infra
+_TEAMS_DRAFT_CONTEXT = _draft_contextvars.ContextVar('teams_iterative_draft_context', default={})
+_TEAMS_DRAFT_PATH_RE = re.compile(
+    r'(?<![A-Za-z0-9_./-])(?:(?P<repo>tf-devops|tf-azure-hub|tf-dns|tf-aws-sso|tf-network-resources|terraform-aws-vpc|vena_repos)/)?'
+    r'(?P<path>(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.(?:tf|tfvars|hcl))(?![A-Za-z0-9_./-])', re.I
+)
+
+
+def _teams_draft_paths(prompt: str) -> list[dict]:
+    """Parse only explicit repository-relative paths; never guess a target."""
+    paths = []
+    seen = set()
+    # GitHub links are equally valid user-supplied exact paths; do not infer
+    # targets from a similar file elsewhere in the same repository.
+    url_pattern = re.compile(
+        r'https?://github\.com/[A-Za-z0-9_.-]+/'
+        r'(?P<repo>tf-devops|tf-azure-hub|tf-dns|tf-aws-sso|tf-network-resources|terraform-aws-vpc|vena_repos)'
+        r'/blob/(?P<ref_and_path>[^\s?#]+)', re.I
+    )
+    text = str(prompt or '')
+    for match in url_pattern.finditer(text):
+        tail = match.group('ref_and_path')
+        # GitHub's /blob/<ref>/<path> syntax. Use the first ref component;
+        # the contents API below is still authoritative about existence.
+        candidate = re.fullmatch(r'[^/]+/((?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.(?:tf|tfvars|hcl))', tail)
+        if candidate:
+            record = (match.group('repo').lower(), candidate.group(1))
+            if record not in seen:
+                paths.append({'repo': record[0], 'path': record[1]})
+                seen.add(record)
+    for match in _TEAMS_DRAFT_PATH_RE.finditer(text):
+        repo = str(match.group('repo') or '').lower()
+        path = str(match.group('path') or '').replace('\\', '/')
+        if any(part in ('', '.', '..') for part in path.split('/')):
+            continue
+        if (repo, path) not in seen:
+            paths.append({'repo': repo, 'path': path})
+            seen.add((repo, path))
+    return paths
+
+
+def _teams_draft_verify_exact_paths(prompt: str, request: dict, current: dict) -> dict:
+    """Read explicit user paths from live GitHub before the model edits them.
+
+    The caller runs this inside a GitHub App token context. A specified path
+    that is inaccessible/absent must not silently become a generated new file.
+    """
+    path_refs = _teams_draft_paths(prompt)
+    if not path_refs:
+        return {}
+    named_repos = {ref['repo'] for ref in path_refs if ref['repo']}
+    if len(named_repos) > 1:
+        raise ValueError('Specify paths from one GitHub repository at a time.')
+    repo = next(iter(named_repos), '')
+    current_repo = str(current.get('repo_target') or request.get('repo_target') or '').strip()
+    if repo and current_repo and repo != current_repo and current.get('stage') in {'awaiting_branch_commit', 'infra_preview'}:
+        raise ValueError('The requested repository differs from the current Terraform draft. Finish or discard that draft first.')
+    cloud = ('aws' if repo in {'tf-devops', 'tf-dns', 'tf-aws-sso', 'tf-network-resources', 'terraform-aws-vpc'}
+             else 'azure' if repo in {'tf-azure-hub', 'vena_repos'} else
+             safe_normalize_cloud(request.get('cloud') or current.get('cloud') or '') or '')
+    if not cloud:
+        cloud = safe_normalize_cloud(_teams_safe_request_cloud(prompt)) or ''
+    if not cloud:
+        raise ValueError('Specify tf-devops or tf-azure-hub with an exact file path so the repository can be verified.')
+    repo_target = repo or ('tf-devops' if cloud == 'aws' else 'tf-azure-hub')
+    default_workflow = ('aws_repository_native_change' if repo in {'tf-dns', 'tf-aws-sso', 'tf-network-resources', 'terraform-aws-vpc'}
+                        else 'azure_module_repo_population' if repo == 'vena_repos' else
+                        'aws_infra_modification' if cloud == 'aws' else 'azure_infra_modification')
+    workflow = str(request.get('workflow') or current.get('workflow') or default_workflow)
+    branch = str(current.get('selected_draft_branch') or current.get('resolved_existing_branch') or '').strip()
+    if not branch:
+        branch = github_resolve_base_branch_for_cloud(cloud, repo_target=repo_target, workflow=workflow)
+    evidence = []
+    for ref in path_refs:
+        if ref['repo'] and ref['repo'] != repo_target:
+            raise ValueError('Explicit Terraform paths must belong to the selected repository.')
+        path = ref['path']
+        content = github_get_file_content(cloud, path, branch, repo_target=repo_target, workflow=workflow)
+        if content is None:
+            raise ValueError(f'The specified Terraform file was not found in {repo_target}@{branch}: {path}.')
+        evidence.append({'path': path, 'content': str(content), 'ref': branch, 'repo_target': repo_target})
+    return {'cloud': cloud, 'repo_target': repo_target, 'workflow': workflow,
+            'branch': branch, 'files': evidence, 'verified': True}
+
+
+def _teams_draft_classify_followup(latest: dict, prompt: str) -> str:
+    """Foundry decides if new speech edits a draft, asks Q&A, or starts anew."""
+    if not prompt.strip():
+        return 'other'
+    payload = {
+        'task': 'Classify the current Teams user message relative to an uncommitted Terraform draft.',
+        'original_request': str(latest.get('original_prompt') or ''),
+        'draft_summary': str(latest.get('summary') or ''),
+        'draft_paths': [str(f.get('filename') or '') for f in latest.get('files') or [] if isinstance(f, dict)],
+        'user_message': prompt,
+        'classes': ['draft_edit', 'terraform_qna', 'unrelated', 'new_infrastructure_request'],
+        'rules': [
+            'draft_edit includes changing an environment, a resource name or size, a flag, a path, adding another resource, correcting generated code, or extending the existing change.',
+            'A terse environment reply such as in npr-int is draft_edit when referring to the current request.',
+            'A request for an explanation with no modification is terraform_qna and must remain read-only.',
+            'Do not treat general unrelated questions as edits.',
+            'Return exactly one JSON object with class and reason. No Terraform code.'
+        ],
+    }
+    try:
+        response = call_named_agent(json.dumps(payload, ensure_ascii=False), AGENT_NAME)
+        parsed = extract_json_from_text(response)
+        classification = str(parsed.get('class') or '').strip().lower()
+        return classification if classification in set(payload['classes']) else 'other'
+    except Exception as exc:
+        LOGGER.warning('Teams draft follow-up classification unavailable: %s', type(exc).__name__)
+        return 'other'
+
+
+def _teams_draft_plan_analysis(agent_result: dict, *, revision: int = 1) -> str:
+    """Reviewable *proposed* change analysis, not a fabricated terraform plan."""
+    files = [str(f.get('filename') or f.get('path') or '') for f in agent_result.get('files') or [] if isinstance(f, dict)]
+    validation = 'Generation preview produced; final commit-time backend validation and Terraform plan have not been executed.'
+    commands = agent_result.get('validation_commands') or ['terraform fmt -check -recursive', 'terraform validate']
+    if not isinstance(commands, list):
+        commands = []
+    notes = str(agent_result.get('analysis') or '').strip()
+    return '\n'.join([
+        f'Draft revision: {revision} (not committed).',
+        f'Change: {str(agent_result.get("summary") or "Terraform infrastructure modification").strip()}',
+        f'Cloud/repository: {agent_result.get("cloud") or "not resolved"} / {agent_result.get("repo_target") or "not resolved"}.',
+        'Files proposed: ' + (', '.join(files) if files else 'none'),
+        f'Validation: {validation}',
+        'Validation commands: ' + (', '.join(str(c) for c in commands) if commands else 'not supplied'),
+        'Plan risks: Terraform may create, change, or destroy infrastructure; inspect the actual CI terraform plan before applying.',
+        'Terraform plan status: not executed by this draft-preview workflow.',
+        *([notes] if notes else []),
+    ])
+
+
+def _teams_draft_merge_files(previous: dict, refreshed: dict, user_prompt: str) -> dict:
+    """Keep accepted draft bytes unless Foundry explicitly replaces/removes them."""
+    result = dict(refreshed or {})
+    older_files = [dict(f) for f in previous.get('files') or [] if isinstance(f, dict)]
+    new_files = [dict(f) for f in result.get('files') or [] if isinstance(f, dict)]
+    allowed_removals = {str(path).strip() for path in result.get('removed_draft_paths') or [] if isinstance(path, str)}
+    previous_paths = {str(f.get('filename') or f.get('path') or '').strip() for f in older_files}
+    # A model cannot remove prior environment edits by silently omitting files.
+    if not allowed_removals.issubset(previous_paths):
+        raise ValueError('Foundry requested removal of a path that is not in the existing draft.')
+    combined = {str(f.get('filename') or f.get('path') or '').strip(): f
+                for f in older_files if str(f.get('filename') or f.get('path') or '').strip() and
+                str(f.get('filename') or f.get('path') or '').strip() not in allowed_removals}
+    for file_data in new_files:
+        path = str(file_data.get('filename') or file_data.get('path') or '').strip()
+        if path:
+            combined[path] = file_data
+    if not combined:
+        raise ValueError('The revised Terraform draft contains no generated files.')
+    for path, file_data in combined.items():
+        content = file_data.get('content')
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError(f'Pending Terraform draft file is missing complete contents: {path}')
+        if path.endswith(('.tf', '.tfvars')):
+            _validate_hcl_content_complete(path, content)
+            if _has_git_conflict_markers(content):
+                raise ValueError(f'Pending draft has conflict markers: {path}')
+    result['files'] = list(combined.values())
+    original_paths = set(previous_paths)
+    result['draft_revision_paths_retained'] = sorted(original_paths & set(combined))
+    result['draft_latest_follow_up'] = user_prompt
+    return result
+
+
+def build_agent_input_for_infra(prompt: str, thread_id: str, selected_cloud=None, workflow=None,
+                                retrieved_module_context=None, retrieved_value_context=None) -> str:
+    """Attach the complete draft and verified exact paths only for Teams turns."""
+    raw = _TEAMS_DRAFT_PREVIOUS_BUILD_INPUT(prompt, thread_id, selected_cloud=selected_cloud,
+                                           workflow=workflow, retrieved_module_context=retrieved_module_context,
+                                           retrieved_value_context=retrieved_value_context)
+    extra = _TEAMS_DRAFT_CONTEXT.get() or {}
+    if not extra:
+        return raw
+    try:
+        payload = json.loads(raw)
+        if not isinstance(payload, dict):
+            return raw
+    except Exception:
+        return raw
+    draft = extra.get('draft') or {}
+    explicit = extra.get('exact') or {}
+    if draft:
+        # Full contents deliberately bypass generic excerpt-trimming. If they do
+        # not fit, fail closed rather than send incomplete generated Terraform.
+        payload['teams_pending_generated_draft'] = {
+            'original_request': draft.get('original_prompt'),
+            'latest_user_request': extra.get('user_prompt'),
+            'revision': draft.get('revision'),
+            'cloud': draft.get('cloud'),
+            'repo_target': draft.get('repo_target'),
+            'workflow': draft.get('workflow'),
+            'files': draft.get('files'),
+            'prior_analysis': draft.get('analysis'),
+        }
+        payload.setdefault('instructions', []).extend([
+            'DRAFT FOLLOW-UP (HARD): this is an edit to teams_pending_generated_draft, NOT a new unrelated Terraform project. Use its complete generated contents as the current working draft.',
+            'NEVER edit the live GitHub baseline to apply a draft follow-up. Read GitHub as evidence and construct complete FINAL FILES by editing the pending generated draft; no GitHub write occurs until explicit approval.',
+            'For a new environment, read the complete live destination environment file; reproduce the requested semantic change in that environment instead of copying the prior environment file. Keep earlier target-environment draft files unless explicitly told to replace them.',
+            'Return all newly edited complete files. You may return removed_draft_paths only when user explicitly requests replacement/removal of those earlier draft targets. Do not remove a path silently.',
+            'Follow-up changes include renaming/reconfiguring a resource, changing flag values/sizes, fixing generated code, adding other resources, and switching or adding environments. Respect repository naming/placement patterns.',
+            'Every file must meet the same repository change, HCL completeness, Boolean, and preservation validations as first-pass generation.',
+        ])
+    if explicit:
+        payload['backend_verified_exact_repository_paths'] = explicit
+        payload.setdefault('instructions', []).extend([
+            'EXACT FILE TARGET (HARD): the user explicitly provided backend_verified_exact_repository_paths. Prefer these verified repo-relative paths and the complete live contents, not fuzzy matching or a different environment.',
+            'Do not invent a file or switch repositories. Only alter explicitly requested content while preserving all unrelated live lines.',
+        ])
+    serialized = json.dumps(payload, ensure_ascii=False, separators=(',', ':'))
+    if draft and len(serialized) > _teams_foundry_input_budget_chars():
+        raise ValueError('The complete pending Terraform draft exceeds the configured Foundry input budget. Refusing to truncate generated file bytes; split the requested change into a smaller reviewable draft.')
+    return serialized
+
+
+def _teams_draft_preview_details(result: dict, record: dict, revision: int) -> dict:
+    result = dict(result)
+    result['mode'] = 'infra_preview'
+    result['files'] = [str(f.get('filename') or f.get('path') or '') for f in record.get('files') or [] if isinstance(f, dict)]
+    result['analysis'] = _teams_draft_plan_analysis(record, revision=revision)
+    result['approval_required_before_branch_push'] = True
+    result['draft_revision'] = revision
+    result['summary'] = str(record.get('summary') or result.get('summary') or '')
+    result['reply'] = 'Terraform draft is ready for review. No files were pushed. You can request further changes or explicitly approve the branch push.'
+    return result
+
+
+def _teams_draft_restore_pending_record(conversation_id: str, draft_state: dict, pending_record: dict) -> dict:
+    """Re-register a prior draft if lower routing cleared its workflow state.
+
+    Earlier stateless wrappers intentionally clear stale pending generation for
+    *new* requests. An editable draft is not stale: a failed revision or a Q&A
+    turn must restore the old full generated files even after a worker restart.
+    """
+    patched = dict(draft_state or {})
+    thread = str(pending_record.get('thread_id') or patched.get('thread_id') or '').strip()
+    if not thread:
+        raise ValueError('The pending Terraform draft is missing its workflow thread.')
+    prior_id = str(patched.get('pending_change_id') or '')
+    if get_pending_infra_change_by_id(prior_id) is None:
+        restored_id = store_pending_infra_change(
+            thread, str(pending_record.get('ticket_number') or ''),
+            str(pending_record.get('prompt') or patched.get('original_prompt') or ''),
+            dict(pending_record.get('agent_result') or {}),
+            ticket_link=str(pending_record.get('ticket_link') or ''),
+            ticket_title=str(pending_record.get('ticket_title') or ''),
+        )
+        patched['pending_change_id'] = restored_id
+    if not persist_teams_workflow_state(thread):
+        raise RuntimeError('The pending draft could not be durably persisted.')
+    _teams_save_ui_state(conversation_id, {'active_generated_draft': patched,
+                         'pending_change_id': patched['pending_change_id'],
+                         'stage': 'awaiting_branch_commit'})
+    return patched
+
+
+def handle_teams_chat_request(data: dict):
+    """Terminal Teams-only draft controller, delegating GitHub writes unchanged."""
+    request = dict(data or {})
+    if str(request.get('source') or 'teams').strip().lower() not in {'', 'teams'} or request.get('test_mode'):
+        return _TEAMS_DRAFT_PREVIOUS_HANDLE(request)
+    conversation_id = str(request.get('teams_conversation_id') or request.get('conversation_id') or '').strip()
+    if not conversation_id:
+        return _TEAMS_DRAFT_PREVIOUS_HANDLE(request)
+    state = load_teams_conversation_state(conversation_id) or {}
+    prompt = str(request.get('prompt') or request.get('message') or '').strip()
+    action = str(request.get('action') or '').strip().lower()
+    pending_id = str(state.get('pending_change_id') or '').strip()
+    draft_state = dict(state.get('active_generated_draft') or {})
+    active = bool(draft_state.get('pending_change_id') and draft_state.get('status') == 'awaiting_approval')
+    if active:
+        # Restore the *complete* prior generated Terraform files after an Azure
+        # Functions worker change before resolving their pending_change_id.
+        persisted_thread = str(draft_state.get('thread_id') or state.get('workflow_thread_id')
+                               or state.get('foundry_conversation_id') or request.get('thread_id') or '').strip()
+        if persisted_thread:
+            restore_teams_workflow_state(persisted_thread)
+    if active and pending_id and pending_id != draft_state['pending_change_id']:
+        active = False  # Never accidentally combine different request identities.
+    pending = get_pending_infra_change_by_id(draft_state['pending_change_id']) if active else None
+    if active and not pending:
+        _teams_save_ui_state(conversation_id, {'active_generated_draft': None})
+        return {'ok': False, 'mode': 'clarification', 'reply': 'The saved Terraform draft is unavailable. No GitHub changes were written. Please regenerate it.'}, 409
+
+    # Explicit approval may arrive as a bare yes or as the transport's action.
+    approving = bool(active and (action == 'commit_branch' or
+                  (not action and (normalize_yes_no_reply(prompt) in AFFIRMATIVE_REPLIES or re.fullmatch(r'(?:push|push branch|push changes|commit changes|approve and push)(?: now)?', prompt.strip().lower())))))
+    if approving:
+        request.update({'action': 'commit_branch', 'pending_change_id': draft_state['pending_change_id'],
+                        'thread_id': str(pending.get('thread_id') or state.get('workflow_thread_id') or request.get('thread_id') or ''),
+                        'prompt': str(pending.get('prompt') or ''), 'mode': 'infra'})
+        # Retain the prior branch decision; the existing commit pipeline owns
+        # SHA validation, atomic ref writes, repair, branch reuse, and PR state.
+        if draft_state.get('existing_branch'):
+            request.update({'reuse_branch': True, 'existing_branch': draft_state['existing_branch'],
+                            'force_new_branch': False})
+        result, status = _TEAMS_DRAFT_PREVIOUS_HANDLE(request)
+        if status < 400 and result.get('mode') == 'branch_created':
+            _teams_save_ui_state(conversation_id, {'active_generated_draft': None})
+        return result, status
+
+    if action in {'discard_pending', 'create_pr_from_branch', 'refresh_pr_status'}:
+        result, status = _TEAMS_DRAFT_PREVIOUS_HANDLE(request)
+        if action == 'discard_pending' and status < 400:
+            _teams_save_ui_state(conversation_id, {'active_generated_draft': None})
+        return result, status
+
+    # Let the original route handle all Jira/branch/module/target protocol state,
+    # and all read-only Q&A. Only real Terraform draft revisions enter this path.
+    is_revision = False
+    if active and not action and prompt and normalize_yes_no_reply(prompt) not in NEGATIVE_REPLIES:
+        kind = _teams_draft_classify_followup({**pending.get('agent_result', {}),
+                 'original_prompt': draft_state.get('original_prompt')}, prompt)
+        if kind == 'unrelated':
+            return {'ok': True, 'mode': 'out_of_scope',
+                    'reply': 'I can help only with Terraform infrastructure provisioning, changes, and infrastructure-related questions. Please ask a Terraform or infrastructure question.'}, 200
+        if kind == 'terraform_qna':
+            request['mode'] = 'repo_qna'
+            request['foundry_intent'] = 'repo_qna'
+        elif kind == 'other':
+            return {'ok': True, 'mode': 'clarification',
+                    'reply': 'Your existing Terraform draft is preserved. Please specify whether you want to change the pending Terraform files or ask a read-only infrastructure question.'}, 200
+        # Any additional infrastructure operation becomes another draft edit,
+        # rather than dropping the earlier pending files.
+        is_revision = kind in {'draft_edit', 'new_infrastructure_request'}
+
+    exact_prompt = prompt
+    # Backend verification happens with the short-lived GitHub App credential.
+    exact_evidence = {}
+    if _teams_draft_paths(exact_prompt) and (is_revision or not action) and (
+        is_revision or str(request.get('mode') or '').lower() == 'infra'
+        or _teams_foundry_classify_request(exact_prompt) == 'infra'
+    ):
+        try:
+            token = get_github_app_installation_token()
+            with github_token_context(token):
+                exact_evidence = _teams_draft_verify_exact_paths(exact_prompt, request, state)
+        except Exception as exc:
+            return {'ok': False, 'mode': 'clarification',
+                    'reply': f'Cannot verify the exact Terraform repository/file target: {exc}. No files were pushed.',
+                    'diagnostic_code': 'EXPLICIT_TARGET_NOT_VERIFIED'}, 422
+        request['cloud'] = exact_evidence['cloud']
+        request['requested_cloud'] = exact_evidence['cloud']
+        request['repo_target'] = exact_evidence['repo_target']
+        request['workflow'] = exact_evidence['workflow']
+        request['mode'] = 'infra'
+
+    prior_record = dict(pending.get('agent_result') or {}) if is_revision and pending else {}
+    if is_revision:
+        origin = str(draft_state.get('original_prompt') or pending.get('prompt') or '').strip()
+        prior_followups = list(draft_state.get('follow_ups') or [])
+        if prompt not in prior_followups:
+            prior_followups.append(prompt)
+        request['prompt'] = ('Original infrastructure request:\n' + origin + '\n'
+                             + '\n'.join('Prior approved draft edit: ' + step for step in prior_followups[:-1])
+                             + '\nCurrent requested draft edit: ' + prompt)
+        request['original_prompt'] = origin
+        request['mode'] = 'infra'
+        request['foundry_intent'] = 'infra'
+        request['infra_clarification'] = True
+        request['pending_branch_choice_resolved'] = True
+        request['fresh_infra_generation'] = False
+        request['thread_id'] = str(pending.get('thread_id') or request.get('thread_id') or '')
+        if draft_state.get('existing_branch'):
+            request.update({'reuse_branch': True, 'existing_branch': draft_state['existing_branch'],
+                            'force_new_branch': False})
+    token = _TEAMS_DRAFT_CONTEXT.set({'draft': {**prior_record, **draft_state} if is_revision else {},
+                                      'exact': exact_evidence, 'user_prompt': prompt})
+    try:
+        result, status = _TEAMS_DRAFT_PREVIOUS_HANDLE(request)
+    finally:
+        _TEAMS_DRAFT_CONTEXT.reset(token)
+    result = dict(result or {})
+    if status >= 400 or result.get('mode') != 'infra_preview' or not result.get('pending_change_id'):
+        if active and not action:
+            try:
+                restored = _teams_draft_restore_pending_record(conversation_id, draft_state, pending)
+                result['pending_change_id'] = restored['pending_change_id']
+            except Exception as exc:
+                return {'ok': False, 'mode': 'clarification',
+                        'reply': f'Terrabot could not preserve the previous draft after this request: {exc}. No files were pushed.'}, 503
+        if is_revision:
+            result['analysis'] = '\n'.join(filter(None, [str(result.get('analysis') or ''),
+                'Previous generated Terraform draft is preserved; no GitHub write was attempted.']))
+        return result, status
+
+    new_id = str(result['pending_change_id'])
+    new_pending = get_pending_infra_change_by_id(new_id)
+    if not new_pending or not isinstance(new_pending.get('agent_result'), dict):
+        if is_revision:
+            try:
+                _teams_draft_restore_pending_record(conversation_id, draft_state, pending)
+            except Exception:
+                LOGGER.exception('Failed to restore prior Terraform draft after pending-record failure')
+        return {'ok': False, 'mode': 'clarification', 'reply': 'The generated Terraform files could not be recovered from durable pending state. No commit was made.'}, 409
+    latest = dict(new_pending['agent_result'])
+    if is_revision:
+        try:
+            latest = _teams_draft_merge_files(prior_record, latest, prompt)
+            # Preserve durable metadata and re-register the *complete* combined
+            # files. The unaltered commit pipeline will still validate all of them.
+            combined_id = store_pending_infra_change(
+                str(new_pending.get('thread_id') or request.get('thread_id') or ''),
+                str(new_pending.get('ticket_number') or request.get('jira_ticket') or ''),
+                str(new_pending.get('prompt') or request['prompt']), latest,
+                ticket_link=str(new_pending.get('ticket_link') or request.get('ticket_link') or ''),
+                ticket_title=str(new_pending.get('ticket_title') or request.get('ticket_title') or ''),
+            )
+            persist_teams_workflow_state(str(new_pending.get('thread_id') or request.get('thread_id') or ''))
+            new_id = combined_id
+            result['pending_change_id'] = combined_id
+        except Exception as exc:
+            try:
+                _teams_draft_restore_pending_record(conversation_id, draft_state, pending)
+            except Exception:
+                LOGGER.exception('Unable to restore previous durable Terraform draft after a failed merge')
+                return {'ok': False, 'mode': 'clarification',
+                        'reply': 'The revision failed and the previous draft could not be safely restored. No files were pushed; regenerate before approving.'}, 503
+            return {'ok': False, 'mode': 'clarification', 'reply':
+                    f'The requested revision did not produce a complete validated draft: {exc}. The previous draft remains available; no files were pushed.'}, 422
+    revision = int(draft_state.get('revision') or 0) + 1 if is_revision else 1
+    existing_branch = str(request.get('existing_branch') or draft_state.get('existing_branch') or state.get('resolved_existing_branch') or '').strip()
+    follow_ups = (list(draft_state.get('follow_ups') or []) + [prompt]) if is_revision else []
+    pending_thread = str(new_pending.get('thread_id') or result.get('thread_id') or request.get('thread_id') or '').strip()
+    if not pending_thread or not persist_teams_workflow_state(pending_thread):
+        return {'ok': False, 'mode': 'clarification', 'reply':
+                'Terrabot could not persist the generated Terraform draft. No GitHub changes were written; please retry before approving.'}, 503
+    fresh_state = {
+        'pending_change_id': new_id, 'status': 'awaiting_approval', 'thread_id': pending_thread,
+        'original_prompt': str(draft_state.get('original_prompt') or request.get('original_prompt') or prompt).strip(),
+        'follow_ups': follow_ups[-24:], 'revision': revision,
+        'existing_branch': existing_branch, 'cloud': latest.get('cloud'),
+        'repo_target': latest.get('repo_target'), 'workflow': latest.get('workflow'),
+        'summary': latest.get('summary'),
+    }
+    # Never keep the multi-megabyte draft in Teams UI state: the pending-change
+    # store holds the complete files and survives worker restarts.
+    _teams_save_ui_state(conversation_id, {'active_generated_draft': fresh_state,
+                   'pending_change_id': new_id, 'stage': 'awaiting_branch_commit'})
+    result = _teams_draft_preview_details(result, latest, revision)
+    result['pending_change_id'] = new_id
+    patch = dict(result.get('state_patch') or {})
+    patch.update({'active_generated_draft': fresh_state, 'pending_change_id': new_id,
+                  'stage': 'awaiting_branch_commit'})
+    result['state_patch'] = patch
+    return result, status
+
+# Backend discovery stays unchanged. Foundry makes the *final* relevance choice;
+# no unreviewed lexical shortlist is surfaced to Teams as a related PR.
+_TEAMS_DRAFT_PREVIOUS_PR_ATTACHMENT = _teams_attach_related_pull_requests
+
+
+def _teams_attach_related_pull_requests(result: dict, prompt: str, cloud: str) -> dict:
+    discovered = _TEAMS_DRAFT_PREVIOUS_PR_ATTACHMENT(result, prompt, cloud)
+    candidates = [dict(item) for item in discovered.get('related_pull_requests') or [] if isinstance(item, dict)]
+    if not candidates:
+        return discovered
+    task = {
+        'task': 'Determine which already-discovered GitHub pull requests genuinely concern the same Terraform infrastructure resource/change as the current request.',
+        'user_request': prompt,
+        'cloud': cloud,
+        'generated_change_summary': discovered.get('summary') or '',
+        'generated_changed_paths': discovered.get('files') or [],
+        'candidate_pull_requests': candidates,
+        'rules': [
+            'Consider target environment, resource identity, Terraform flag/module, and changed-path evidence together.',
+            'Do not accept merely shared cloud, subscription, environment, SQL, DR, create, enable, or generic resource words.',
+            'An existing PR may be related but not identical; distinguish a duplicate from merely overlapping work.',
+            'Never invent a PR. Choose only numbers in candidate_pull_requests. An empty selection is valid.',
+            'Return JSON with related_pr_numbers, each an integer, and optionally reason. No additional prose.'
+        ],
+    }
+    try:
+        judged = extract_json_from_text(call_named_agent(json.dumps(task, ensure_ascii=False), AGENT_NAME))
+        allowed_numbers = {int(item['number']) for item in candidates if isinstance(item.get('number'), int)}
+        selected = {int(value) for value in (judged.get('related_pr_numbers') or [])
+                    if isinstance(value, int) and not isinstance(value, bool) and value in allowed_numbers}
+        result = dict(discovered)
+        result['related_pull_requests'] = [item for item in candidates if item.get('number') in selected]
+        result['related_prs_reviewed_by_foundry'] = True
+        return result
+    except Exception as exc:
+        LOGGER.warning('Foundry related PR relevance review failed; suppressing unverified suggestions: %s', type(exc).__name__)
+        result = dict(discovered)
+        result['related_pull_requests'] = []
+        result['related_prs_reviewed_by_foundry'] = False
+        return result

@@ -596,11 +596,14 @@ def _format_reply(result: Dict[str, Any]) -> str:
                 or "Terrabot could not complete this request.",
             ])
 
-        # Preserve the existing infra-preview behavior. This patch only reduces
-        # clarification verbosity/questions and does not change branch/PR flow.
+        # Every Terraform preview must show a reviewable analysis before push.
+        # This is proposed impact unless an actual terraform plan was executed.
         lines = ["**Infrastructure change prepared**", visible_reply]
-        if analysis:
-            lines.extend(["", *_format_analysis_block(analysis)])
+        if not analysis:
+            analysis = ("Proposed files: " + (", ".join(files) if files else "not resolved")
+                        + ". Validation: see backend preview status. "
+                        "Terraform plan: not executed; review CI plan before apply.")
+        lines.extend(["", *_format_analysis_block(analysis)])
         related_pr_lines = _format_related_pull_requests(result)
         if related_pr_lines:
             lines.extend(["", *related_pr_lines])
@@ -613,7 +616,9 @@ def _format_reply(result: Dict[str, Any]) -> str:
             lines.extend(["", "**Values to fill after branch creation**", *fillable])
         lines.extend([
             "",
-            "Reply `yes` to create the Terrabot branch and push the generated changes. "
+            "Would you like any further Terraform changes to this generated draft? "
+            "Describe the edits (environment, flags, resource properties, names, paths, or additional resources), "
+            "or reply `yes` / `push branch` to commit the latest validated draft to the selected branch. "
             "A pull request is created only when you explicitly ask for one.",
         ])
         return "\n".join(line for line in lines if line is not None)
@@ -1594,7 +1599,7 @@ class TerrabotTeamsBot(ActivityHandler):
         elif (
             pending_change_id
             and workflow_stage in {"awaiting_branch_commit", "awaiting_pr_confirmation", "infra_preview"}
-            and AFFIRMATIVE_RE.match(normalized)
+            and (AFFIRMATIVE_RE.match(normalized) or re.fullmatch(r"(?:push|push branch|push changes|commit changes|approve and push)(?: now)?", normalized))
         ):
             # Legacy preview compatibility. Teams is branch-first, therefore a
             # preview approval commits to the branch instead of opening a PR.
@@ -1624,7 +1629,12 @@ class TerrabotTeamsBot(ActivityHandler):
         else:
             await _send(turn_context, "Terrabot is processing your request...")
             request = {
-                "prompt": effective_prompt,
+                # While an approved-to-edit draft exists, the backend receives the
+                # literal follow-up. Its Foundry draft classifier, not transport
+                # concatenation, decides whether this edits the pending files.
+                "prompt": (prompt if isinstance(state.get("active_generated_draft"), dict)
+                           and state["active_generated_draft"].get("status") == "awaiting_approval"
+                           else effective_prompt),
                 "original_prompt": prompt,
                 "thread_id": workflow_thread_id,
                 "teams_conversation_id": thread_id,
