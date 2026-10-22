@@ -46,6 +46,65 @@ def _terrabot_explicit_provider_from_prompt(prompt: str) -> str:
     return ""
 
 
+def _terrabot_live_aws_environment_matches(prompt: str) -> list[dict]:
+    """Discover AWS environment folders outside the static dev/prod catalog.
+
+    Only names actually present in the user's request and confirmed by live
+    GitHub listings are eligible. No default or guessed folder is permitted.
+    This supports separate Terraform trees such as terraform/<tenant>/<env>.
+    """
+    text = _terrabot_env_text(prompt)
+    if not text:
+        return []
+    try:
+        ref = github_branch_seed_for_cloud(
+            "aws", repo_target="tf-devops", workflow="aws_infra_modification"
+        )
+        root_items = github_get_directory_listing(
+            "aws", "terraform", ref, repo_target="tf-devops", workflow="aws_infra_modification"
+        ) or []
+    except Exception:
+        # Do not mask actual repository connectivity errors with a fallback
+        # when a custom environment is explicitly requested.
+        return []
+    found = []
+    excluded = {"modules", "dev_aws", "prod_aws", "dev_services_aws", "root"}
+    for parent in root_items:
+        if parent.get("type") != "dir":
+            continue
+        parent_path = str(parent.get("path") or "").strip("/")
+        parent_name = parent_path.rsplit("/", 1)[-1]
+        if parent_name.lower() in excluded or not _terrabot_prompt_has_name(text, parent_name):
+            continue
+        try:
+            children = github_get_directory_listing(
+                "aws", parent_path, ref, repo_target="tf-devops", workflow="aws_infra_modification"
+            ) or []
+        except Exception:
+            continue
+        candidates = [entry for entry in children if entry.get("type") == "dir"
+                      and _terrabot_prompt_has_name(text, str(entry.get("path") or "").rsplit("/", 1)[-1])]
+        if candidates:
+            longest = max(len(str(entry.get("path") or "").rsplit("/", 1)[-1]) for entry in candidates)
+            candidates = [entry for entry in candidates if len(str(entry.get("path") or "").rsplit("/", 1)[-1]) == longest]
+        for entry in candidates:
+            path = str(entry.get("path") or "").strip("/")
+            name = path.rsplit("/", 1)[-1]
+            if not path.startswith(parent_path + "/"):
+                continue
+            try:
+                contents = github_get_directory_listing(
+                    "aws", path, ref, repo_target="tf-devops", workflow="aws_infra_modification"
+                ) or []
+            except Exception:
+                continue
+            if not any(item.get("type") == "file" and str(item.get("path") or "").endswith(".tf") for item in contents):
+                continue
+            found.append({"cloud": "aws", "tier": "custom", "environment": name,
+                          "path": path, "alias": name, "repo_target": "tf-devops"})
+    return found
+
+
 def _terrabot_environment_matches(prompt: str) -> list[dict]:
     """Return every explicit environment named by the user, without collapsing tiers.
 
@@ -145,6 +204,12 @@ def _terrabot_environment_matches(prompt: str) -> list[dict]:
         and not any(item.get("cloud") == "aws" for item in matches)
     ):
         add("aws", "nonprod", "dev", TERRABOT_ENVIRONMENT_CATALOG["aws"]["nonprod"]["dev"], alias="dev")
+
+    # Static catalog is deliberately not exhaustive: consult the live tf-devops
+    # tree for explicit, independently hosted AWS environment names before
+    # allowing the minidev default. Preserve the existing catalog behavior.
+    if not matches:
+        matches.extend(_terrabot_live_aws_environment_matches(prompt))
 
     return matches
 
@@ -500,7 +565,9 @@ def build_agent_input_for_infra(
         "AWS non-prod targets are under terraform/dev_aws; AWS prod targets are under terraform/prod_aws (plus terraform/root/global where explicitly named).",
         "If the user names multiple environments, files[] must contain the complete valid change for every backend_environment_resolution.targets entry. Never collapse the set to the first target.",
         "If the user says all/every prod or all/every non-prod for the resolved cloud, apply the request to every target in backend_environment_resolution.targets.",
-        "If no environment was named after cloud resolution, use the backend default target: AWS minidev; Azure sbx-infra. Do not ask the user to confirm these defaults.",
+        "If no environment was named after cloud resolution AND live repository discovery found no explicit environment, use the backend default target: AWS minidev; Azure sbx-infra.",
+        "ENVIRONMENT TARGET HARD GATE: For an explicitly named environment, every generated file path MUST reside under one of backend_environment_resolution.target_paths. A different environment is never a valid substitute or repair target.",
+        "For a noncatalog AWS environment use the exact live verified terraform/<tenant>/<environment> target path, not terraform/dev_aws/minidev or terraform/prod_aws guesses.",
         "Do not ask which repository or environment to use when backend_environment_resolution has one or more targets and no error. Ask only when backend_environment_resolution.error is non-empty or repository evidence reveals a genuine target ambiguity inside those environments.",
     ]
     return json.dumps(payload, separators=(",", ":"), ensure_ascii=False)

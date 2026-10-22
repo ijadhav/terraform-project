@@ -1137,6 +1137,8 @@ def _teams_backend_error_is_nonrepairable(error: Exception | str) -> bool:
         "generated modification path",
         "is not present in the live repository evidence for this request",
         "cross-environment",
+        "environment_target_mismatch",
+        "environment_target_conflict",
         "repository mismatch",
     )
     return any(marker in text for marker in markers)

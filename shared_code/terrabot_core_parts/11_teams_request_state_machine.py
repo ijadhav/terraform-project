@@ -5477,6 +5477,17 @@ def _teams_validate_target_coverage(
     explicit = contract.get("files") or []
     scopes = list(dict.fromkeys(str(t.get("path") or "").strip("/") for t in contract.get("targets") or [] if t.get("path")))
     expectations = contract.get("assignments") or []
+    # Explicit environment identity is a deterministic backend invariant, not
+    # an LLM semantic judgment. Reject wrong-scope edits before any repair,
+    # preview, or branch operation can accept them.
+    if scopes and contract.get("basis") == "explicit environment-to-repository mapping":
+        in_scope = [path for path in paths if any(path.startswith(root + "/") for root in scopes)]
+        if not in_scope and paths:
+            raise ValueError(
+                "ENVIRONMENT_TARGET_MISMATCH: user requested " + ", ".join(scopes)
+                + "; generated files target " + ", ".join(sorted(paths))
+                + ". Rediscover live files for the requested environment instead of repairing an unrelated file."
+            )
     exp_by_scope: dict[str, dict[str, str]] = {}
     for entry in expectations:
         root = entry["environment_path"]
