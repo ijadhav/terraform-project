@@ -6198,6 +6198,9 @@ def handle_teams_chat_request(data: dict):
     approving = bool(active and (action == 'commit_branch' or
                   (not action and (normalize_yes_no_reply(prompt) in AFFIRMATIVE_REPLIES or re.fullmatch(r'(?:push|push branch|push changes|commit changes|approve and push)(?: now)?', prompt.strip().lower())))))
     if approving:
+        # An approved draft is a frozen artifact, not a new generation request.
+        # A failed GitHub preservation guard must fail once, without Foundry repairs.
+        request['commit_prepared_draft_only'] = True
         request.update({'action': 'commit_branch', 'pending_change_id': draft_state['pending_change_id'],
                         'thread_id': str(pending.get('thread_id') or state.get('workflow_thread_id') or request.get('thread_id') or ''),
                         'prompt': str(pending.get('prompt') or ''), 'mode': 'infra'})

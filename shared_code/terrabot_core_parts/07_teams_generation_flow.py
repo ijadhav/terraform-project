@@ -2075,9 +2075,36 @@ def handle_chat_request(data: dict):
                 return {"ok": False, "mode": "github_auth_required", "reply": "Connect GitHub before Terrabot creates the branch."}, 401
             with github_token_context(token):
                 try:
-                    branch_result = commit_terraform_files_to_branch_for_teams_with_self_correction(
-                        pending["agent_result"], pending["prompt"], conversation_id
-                    )
+                    if data.get("commit_prepared_draft_only"):
+                        # User approval must use the saved candidate byte-for-byte.
+                        # This executes existing precommit + GitHub safety guards once;
+                        # it deliberately cannot call the Foundry repair/generation loop.
+                        _terrabot_draft_files = (pending.get("agent_result") or {}).get("files") or []
+                        if not _terrabot_draft_files or any(
+                            not isinstance(f, dict) or not str(f.get("content") or "").strip()
+                            for f in _terrabot_draft_files
+                        ):
+                            return {"ok": False, "mode": "clarification",
+                                    "reply": "The prepared Terraform draft is incomplete. No files were pushed. Revise the draft before approving.",
+                                    "diagnostic_code": "PREPARED_DRAFT_INCOMPLETE"}, 422
+                        try:
+                            branch_result = commit_terraform_files_to_branch_for_teams(
+                                pending["agent_result"], pending["prompt"], conversation_id
+                            )
+                        except ValueError as prepared_error:
+                            LOGGER.warning("[TerrabotDiag] event=prepared_draft_commit_rejected_no_regeneration thread=%s error=%s",
+                                           conversation_id, str(prepared_error)[:500])
+                            return {"ok": False, "mode": "clarification",
+                                    "reply": ("The prepared Terraform draft failed the final GitHub preservation check. "
+                                              "No files were pushed and generation was not restarted. "
+                                              "Request a draft correction before approving again. Details: "
+                                              + str(prepared_error)[:350]),
+                                    "pending_change_id": pending_change_id,
+                                    "diagnostic_code": "PREPARED_DRAFT_COMMIT_REJECTED"}, 422
+                    else:
+                        branch_result = commit_terraform_files_to_branch_for_teams_with_self_correction(
+                            pending["agent_result"], pending["prompt"], conversation_id
+                        )
                 except UnsafeGeneratedChangeError as _preserve_err:
                     # The commit pipeline exhausted all repair attempts due to the
                     # agent removing too many existing lines. Return a structured
